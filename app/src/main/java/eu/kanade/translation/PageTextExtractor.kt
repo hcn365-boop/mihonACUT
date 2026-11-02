@@ -1,3 +1,4 @@
+
 package eu.kanade.translation
 
 import android.graphics.Bitmap
@@ -461,5 +462,13 @@ internal object TextBlockMerger {
         return TranslationBlock(
             text = joinedText,
             translation = joinedTranslation,
-            width = maxX - minX, height = maxY - minY, x = minX, y = minY,
-            angle = 
+            width = maxX - minX, 
+            height = maxY - minY, 
+            x = minX, 
+            y = minY,
+            angle = if (a.text.length >= b.text.length) a.angle else b.angle,
+            symWidth = (a.symWidth * a.text.length + b.symWidth * b.text.length) / totalLen,
+            symHeight = (a.symHeight * a.text.length + b.symHeight * b.text.length) / totalLen,
+        )
+    }
+}
