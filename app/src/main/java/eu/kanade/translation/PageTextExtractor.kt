@@ -1,4 +1,3 @@
-
 package eu.kanade.translation
 
 import android.graphics.Bitmap
@@ -71,7 +70,7 @@ class PageTextExtractor(
         val recognize = mlKit ?: return emptyList()
         return recognize(image).textBlocks.mapNotNull { block ->
             val bounds = block.boundingBox ?: return@mapNotNull null
-            if (block.text.length <= 1) return@mapNotNull null
+            // تم إزالة شرط الحذف القديم (block.text.length <= 1) لكي لا يتم تجاهل الحروف المفردة
             val line = block.lines.firstOrNull()
             val symbol = line?.elements?.firstOrNull()?.symbols?.firstOrNull()?.boundingBox
             OcrBox(
@@ -173,7 +172,8 @@ internal object TextBlockMerger {
 
         val mergedBlocks = currentBlocks.mapNotNull { block ->
             val text = block.text.trim()
-            if (text.isBlank() || text.length < 2) {
+            // السماح بالنصوص التي طولها حرف واحد (text.length < 1 بدلاً من < 2) لعدم حذف الحروف المهمة
+            if (text.isBlank() || text.length < 1) {
                 null
             } else {
                 block
