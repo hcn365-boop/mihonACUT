@@ -1,4 +1,5 @@
 name: Release
+
 on:
   workflow_dispatch:
   push:
@@ -11,6 +12,10 @@ env:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+# 1. إضافة صلاحيات الكتابة لمنع خطأ 403
+permissions:
+  contents: write
 
 jobs:
   get_tag:
@@ -67,16 +72,11 @@ jobs:
           [ -f app/build/outputs/apk/release/app-x86-release.apk ] && mv app/build/outputs/apk/release/app-x86-release.apk mihonACUT-x86-${{ needs.get_tag.outputs.tag }}.apk || true
           [ -f app/build/outputs/apk/release/app-x86_64-release.apk ] && mv app/build/outputs/apk/release/app-x86_64-release.apk mihonACUT-x86_64-${{ needs.get_tag.outputs.tag }}.apk || true
 
-      - name: Upload APK
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Upload APK Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: mihonACUT
-          path: |
-            mihonACUT-${{ needs.get_tag.outputs.tag }}.apk
-            mihonACUT-arm64-v8a-${{ needs.get_tag.outputs.tag }}.apk
-            mihonACUT-armeabi-v7a-${{ needs.get_tag.outputs.tag }}.apk
-            mihonACUT-x86-${{ needs.get_tag.outputs.tag }}.apk
-            mihonACUT-x86_64-${{ needs.get_tag.outputs.tag }}.apk
+          name: mihonACUT-apks
+          path: mihonACUT-*.apk
 
   build_foss:
     name: Build (FOSS)
@@ -116,11 +116,11 @@ jobs:
           set -e
           [ -f app/build/outputs/apk/foss/app-universal-foss.apk ] && mv app/build/outputs/apk/foss/app-universal-foss.apk mihonACUT-${{ needs.get_tag.outputs.tag }}-foss.apk || true
 
-      - name: Upload APK
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Upload FOSS APK Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: mihonACUT-foss
-          path: mihonACUT-${{ needs.get_tag.outputs.tag }}-foss.apk
+          name: mihonACUT-foss-apk
+          path: mihonACUT-*-foss.apk
 
   release:
     name: Create GitHub Release
@@ -129,20 +129,12 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@v4
         with:
           merge-multiple: true
 
-      - name: Delete all artifacts
-        uses: geekyeggo/delete-artifact@176a747ab7e287e3ff4787bf8a148716375ca118 # v6.0.0
-        with:
-          failOnError: false
-          name: |
-            mihonACUT
-            mihonACUT-foss
-
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.get_tag.outputs.tag }}
           name: mihonACUT ${{ needs.get_tag.outputs.tag }}
@@ -153,12 +145,7 @@ jobs:
             >
             > ### If you are unsure which version to download then go with `mihonACUT-${{ needs.get_tag.outputs.tag }}.apk`
           files: |
-            mihonACUT-${{ needs.get_tag.outputs.tag }}.apk
-            mihonACUT-${{ needs.get_tag.outputs.tag }}-foss.apk
-            mihonACUT-arm64-v8a-${{ needs.get_tag.outputs.tag }}.apk
-            mihonACUT-armeabi-v7a-${{ needs.get_tag.outputs.tag }}.apk
-            mihonACUT-x86-${{ needs.get_tag.outputs.tag }}.apk
-            mihonACUT-x86_64-${{ needs.get_tag.outputs.tag }}.apk
+            mihonACUT-*.apk
           draft: true
           prerelease: false
           token: ${{ secrets.GITHUB_TOKEN }}
