@@ -44,18 +44,18 @@ jobs:
         with:
           cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
 
-      - name: Decode signing keystore
-        run: echo "$SIGNING_KEY" | base64 -d > "${{ runner.temp }}/antsy.keystore"
+      - name: Decode Keystore
+        run: echo "$SIGNING_KEY" | base64 -d > app/release.jks
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
 
       - name: Build
         run: ./gradlew assembleRelease -Pdist=github
         env:
-          storeFile: ${{ runner.temp }}/antsy.keystore
-          storePassword: ${{ secrets.KEY_STORE_PASSWORD }}
-          keyAlias: ${{ secrets.KEY_ALIAS }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
+          KEYSTORE_FILE: release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
       - name: Rename APK
         run: |
@@ -98,18 +98,18 @@ jobs:
         with:
           cache-disabled: true
 
-      - name: Decode signing keystore
-        run: echo "$SIGNING_KEY" | base64 -d > "${{ runner.temp }}/antsy.keystore"
+      - name: Decode Keystore
+        run: echo "$SIGNING_KEY" | base64 -d > app/release.jks
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
 
       - name: Build
         run: ./gradlew assembleFoss -Pdist=foss
         env:
-          storeFile: ${{ runner.temp }}/antsy.keystore
-          storePassword: ${{ secrets.KEY_STORE_PASSWORD }}
-          keyAlias: ${{ secrets.KEY_ALIAS }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
+          KEYSTORE_FILE: release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
       - name: Rename APK
         run: |
