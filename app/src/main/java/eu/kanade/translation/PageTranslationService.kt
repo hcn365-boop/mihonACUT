@@ -142,9 +142,13 @@ object PageTranslationService {
         val ocrName = "${imageHash}_${TranslationStore.key(settings.from.name, ocrMode.name)}"
         val filter = AiConfig.translation?.filter
         val skipSame = filter?.skipSameLanguage == true && !AiConfig.forceTranslate(MangaTranslationContext.mangaId)
+        
         // The page is already in the target language, and nobody asked for a translation.
         if (skipSame && settings.from.name.equals(settings.to.name, ignoreCase = true)) return Prepared.Ready(null)
-        val translationName = "${ocrName}_${TranslationStore.key(settings.to.name, settings.engine.name, settings.model, filter?.signature.orEmpty())}"
+        
+        // [تعديل هنا]: ربط مفتاح الكاش صراحةً بلغة الهدف (Target Language) لضمان عدم تداخل الترجمات القديمة عند تغيير اللغة
+        val targetLangCode = settings.to.name
+        val translationName = "${ocrName}_lang_${targetLangCode}_${TranslationStore.key(settings.to.name, settings.engine.name, settings.model, filter?.signature.orEmpty())}"
 
         TranslationStore.load(context, Kind.TRANSLATED, translationName)?.let {
             return Prepared.Ready(it.takeIf { page -> page.blocks.isNotEmpty() })
@@ -184,8 +188,10 @@ object PageTranslationService {
         val usedName = TranslationStore.loadText(context, Kind.LANGUAGE, ocrName)
         val used = TextRecognizerLanguage.entries.firstOrNull { it.name == usedName } ?: settings.from
         val effective = if (used == settings.from) settings else settings.copy(from = used)
+        
         // The language check after OCR may have found that the page is already in the target language.
         if (skipSame && effective.from.name.equals(effective.to.name, ignoreCase = true)) return Prepared.Ready(null)
+        
         val entry = synchronized(pendingLock) {
             pending.getOrPut(translationName) { Pending(context, translationName, page, effective) }
         }
