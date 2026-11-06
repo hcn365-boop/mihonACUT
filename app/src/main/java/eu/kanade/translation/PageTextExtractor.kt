@@ -7,6 +7,7 @@ import com.google.mlkit.vision.text.Text
 import eu.kanade.translation.model.PageTranslation
 import eu.kanade.translation.model.TranslationBlock
 import eu.kanade.translation.recognizer.HybridTextRecognizer
+import eu.kanade.translation.recognizer.PaddleTextRecognizer
 import eu.kanade.translation.recognizer.TextRecognizerLanguage
 import kotlin.math.abs
 import kotlin.math.cos
@@ -17,8 +18,6 @@ import kotlin.math.sqrt
 import tachiyomi.core.common.util.system.logcat
 import logcat.LogPriority
 import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
-import eu.kanade.translation.recognizer.PaddleTextRecognizer
-
 
 enum class OcrMode { MLKIT, PADDLE, HYBRID }
 
@@ -118,7 +117,7 @@ class PageTextExtractor(
                                 }
 
                                 val croppedInput = InputImage.fromBitmap(rotatedBitmap, 0)
-                                // استخراج النص بـ PaddleOCR داخل الصندوق المدمج بدقة
+                                // استخدام PaddleTextRecognizer بشكل صحيح هنا بعد إضافة الـ import
                                 val paddleRecognizer = PaddleTextRecognizer(ctx, recognizerLanguage, forceHorizontal = true)
                                 val paddleText = paddleRecognizer.recognize(croppedInput)
                                 paddleRecognizer.close()
@@ -197,7 +196,6 @@ class PageTextExtractor(
 }
 
 internal object TextBlockMerger {
-    // كود دمج الفقاعات المعتاد و resolveCollisions يبقى كما هو تماماً دون تغيير
     private val urlPattern = Regex("(?i)(https?://\\S+|www\\.\\S+|\\S+\\.(com|net|org|io|me|cc|tv|info))")
     private val symbolsFilterPattern = Regex("""[_~•°^@#$&|\\-]""")
 
