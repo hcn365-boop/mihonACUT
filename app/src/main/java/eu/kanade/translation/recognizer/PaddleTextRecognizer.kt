@@ -26,8 +26,6 @@ import tachiyomi.core.common.util.system.logcat
 import logcat.LogPriority
 import eu.kanade.translation.PaddleSupport
 
-
-
 data class PaddleTextBlock(
     val text: String,
     val confidence: Float = 1f,
@@ -46,7 +44,8 @@ data class TextBox(
 
 class PaddleTextRecognizer(
     private val context: Context,
-    override val language: TextRecognizerLanguage
+    override val language: TextRecognizerLanguage,
+    private val forceHorizontal: Boolean = false // إذا كانت true (عبر Hybrid)، نجبرها أفقياً، وإلا فنعتمد على اللغة
 ) : TextRecognizer {
 
     private val TAG = "PaddleTextRecognizer"
@@ -60,7 +59,7 @@ class PaddleTextRecognizer(
             language != TextRecognizerLanguage.CHINESE
 
     init {
-        Log.d(TAG, "Initializing PaddleTextRecognizer for language: $language")
+        Log.d(TAG, "Initializing PaddleTextRecognizer for language: $language, forceHorizontal: $forceHorizontal")
         try {
             ortEnvironment = OrtEnvironment.getEnvironment()
 
@@ -92,7 +91,7 @@ class PaddleTextRecognizer(
             }
             Log.d(TAG, "Dictionary loaded with ${dictionary.size} entries.")
 
-            Log.i(TAG, "تم تهيئة PaddleOCR بنجاح للغة: ${language.name} باستخدام القاموس الشامل")
+            Log.i(TAG, "تم تهيئة PaddleOCR بنجاح للغة: ${language.name}")
             logcat(LogPriority.INFO) { "تم تهيئة PaddleOCR بنجاح للغة: ${language.name}" }
 
         } catch (e: Exception) {
@@ -213,7 +212,6 @@ class PaddleTextRecognizer(
             val inputName = detSession?.inputNames?.first() ?: "x"
             result = detSession?.run(mapOf(inputName to tensor))
 
-            // القراءة الآمنة للـ Tensor
             val outputValue = result?.get(0) ?: return emptyList()
             val outputTensor = outputValue as? OnnxTensor ?: return emptyList()
             
@@ -542,7 +540,6 @@ class PaddleTextRecognizer(
             val inputName = recSession?.inputNames?.first() ?: "x"
             result = recSession?.run(mapOf(inputName to inputTensor))
 
-            // القراءة الآمنة للـ Recognition Tensor
             val outputValue = result?.get(0) ?: return Pair("", 0f)
             val outputTensor = outputValue as? OnnxTensor ?: return Pair("", 0f)
             
@@ -601,19 +598,16 @@ class PaddleTextRecognizer(
     private fun mergeBlocksIntelligently(blocks: List<PaddleTextBlock>): List<PaddleTextBlock> {
         if (blocks.isEmpty()) return emptyList()
 
-        return if (usesWordSpaces) {
+        // إذا كان forceHorizontal مفعل (عبر وضع Hybrid) أو كانت اللغة تستخدم مسافات، ندمج أفقياً
+        // وإلا فنحن نعتمد على لغة التطبيق الأصلية لتحديد الاتجاه (أفقي أو عمودي)
+        return if (forceHorizontal || usesWordSpaces) {
             mergeHorizontalText(blocks)
         } else {
             mergeVerticalText(blocks)
         }
     }
 
-    /**
-     * معالجة النصوص الأفقية (مثل الإنجليزية)
-     * تضمن دمج الكلمات على نفس السطر فقط وتمنع الاندماج مع الفقاعات المجاورة
-     */
     private fun mergeHorizontalText(blocks: List<PaddleTextBlock>): List<PaddleTextBlock> {
-        // 1. الترتيب من الأعلى إلى الأسفل لتشكيل الأسطر
         val sortedBlocks = blocks.sortedBy { it.y }
         val lines = mutableListOf<MutableList<PaddleTextBlock>>()
 
@@ -623,7 +617,6 @@ class PaddleTextRecognizer(
                 val leader = line.first()
                 val currentLineCenter = line.map { it.y + it.height / 2f }.average().toFloat()
                 val blockCenter = block.y + block.height / 2f
-                // السماح فقط بتداخل رأسي محكم للسطر الواحد
                 val allowedOverlap = min(leader.height, block.height) * 0.35f
 
                 if (abs(blockCenter - currentLineCenter) < allowedOverlap) {
@@ -637,7 +630,6 @@ class PaddleTextRecognizer(
             }
         }
 
-        // 2. الدمج الأفقي داخل كل سطر بشكل صارم
         val result = mutableListOf<PaddleTextBlock>()
         for (line in lines) {
             line.sortBy { it.x }
@@ -652,7 +644,6 @@ class PaddleTextRecognizer(
                     current.height * 0.5f
                 }
 
-                // عتبة صارمة للمسافة بين الكلمات (تمنع القفز للفقاعات المجاورة)
                 val spaceThreshold = estimatedCharWidth * 1.6f
 
                 if (horizontalGap <= spaceThreshold && horizontalGap >= -estimatedCharWidth) {
@@ -668,12 +659,7 @@ class PaddleTextRecognizer(
         return result
     }
 
-    /**
-     * معالجة النصوص العمودية (مثل اليابانية والصينية)
-     * تجمع الحروف داخل الأعمدة رأسياً لمنع تداخل الأعمدة المتجاورات
-     */
     private fun mergeVerticalText(blocks: List<PaddleTextBlock>): List<PaddleTextBlock> {
-        // 1. الترتيب حسب المكان الأفقي (الأعمدة)
         val sortedBlocks = blocks.sortedBy { it.x }
         val columns = mutableListOf<MutableList<PaddleTextBlock>>()
 
@@ -695,7 +681,6 @@ class PaddleTextRecognizer(
             }
         }
 
-        // 2. الدمج الرأسي داخل كل عمود
         val result = mutableListOf<PaddleTextBlock>()
         for (col in columns) {
             col.sortBy { it.y }
@@ -724,7 +709,6 @@ class PaddleTextRecognizer(
 
         return result
     }
-
 
     private fun mergeTwoBlocks(a: PaddleTextBlock, b: PaddleTextBlock, separator: String): PaddleTextBlock {
         val newX = min(a.x, b.x)
