@@ -38,7 +38,7 @@ class HybridTextRecognizer(
         return results.joinToString("\n") { it.text }
     }
 
-    // ✅ إرجاع الصناديق الخام مباشرة بدون أي دمج مشوّه
+    // استخراج الصناديق بدقة باستخدام ML Kit ثم قراءة النصوص الداخلية عبر PaddleOCR
     fun recognizeWithBoxes(image: InputImage): List<HybridResult> {
         val bitmap = image.bitmapInternal ?: return emptyList()
         val results = mutableListOf<HybridResult>()
@@ -63,8 +63,7 @@ class HybridTextRecognizer(
                 )
             }
 
-            // ❌ تم إزالة mergeBoxesIntelligently نهائياً
-            // واستخدام rawBoxes مباشرة لقص الصور وإرسالها لـ PaddleOCR
+            // معالجة القص والتدوير لكل صندوق وقراءته بواسطة PaddleOCR مباشرة
             for (box in rawBoxes) {
                 val startX = max(0, box.x)
                 val startY = max(0, box.y)
