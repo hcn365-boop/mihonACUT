@@ -58,10 +58,10 @@ class PageTextExtractor(
         if (boxes.isEmpty()) return null
 
         val page = PageTranslation(imgWidth = bitmap.width.toFloat(), imgHeight = bitmap.height.toFloat())
-        
+
         // جلب قيمة التكبير/التوسيع المخصصة من الإعدادات عبر AiConfig (القيمة الافتراضية 1.3f)
         val paddingFactor = AiConfig.translateCollisionPadding
-        
+
         // الدمج + التوسيع بناءً على الإعداد + منع تصادم الفقاعات
         page.blocks = TextBlockMerger.merge(
             blocks = boxes.map { it.toBlock() }, 
@@ -96,43 +96,38 @@ class PageTextExtractor(
         return recognize(image).filter { it.text.isNotBlank() }
     }
 
+    // ✅ دالة hybridBoxes المعدلة: تستخدم recognizeWithBoxes مباشرة
     private suspend fun hybridBoxes(image: InputImage, bitmap: Bitmap): List<OcrBox> {
         val ctx = context ?: return mlKitBoxes(image)
         return try {
-            // تنفيذ الخطوات الـ 5 بوضوح تام عبر HybridTextRecognizer الذي ينفذ:
-            // 1. استلام الصورة -> 2. ML Kit -> 3. دمج الصناديق هندسياً -> 4. قص الأجزاء وإرسالها لـ PaddleOCR -> 5. إعادة نصوص Paddle حصرياً
             val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
-            val recognizedTextResult = hybridRecognizer.recognize(image)
+
+            // ✅ استخدام الدالة الجديدة التي تعيد النص + الإحداثيات معاً
+            val hybridResults = hybridRecognizer.recognizeWithBoxes(image)
             hybridRecognizer.close()
 
-            val textLines = recognizedTextResult.lines().filter { it.isNotBlank() }
-            if (textLines.isEmpty()) return emptyList()
+            if (hybridResults.isEmpty()) {
+                logcat(LogPriority.ERROR) { ">>> Hybrid OCR returned empty, falling back to ML Kit <<<" }
+                return mlKitBoxes(image)
+            }
 
-            // للحفاظ على الإحداثيات والبيانات الهندسية بدقة مع نصوص Paddle المستخرجة:
-            val mlKitRecognize = mlKit ?: return emptyList()
-            val mlKitResult = mlKitRecognize(image)
-            
-            var textIndex = 0
-            mlKitResult.textBlocks.mapNotNull { block ->
-                val bounds = block.boundingBox ?: return@mapNotNull null
-                if (textIndex >= textLines.size) return@mapNotNull null // التوقف فور انتهاء نصوص Paddle لمنع أي تداخل
-                
-                val line = block.lines.firstOrNull()
-                val symbol = line?.elements?.firstOrNull()?.symbols?.firstOrNull()?.boundingBox
+            logcat(LogPriority.ERROR) { ">>> Hybrid OCR returned ${hybridResults.size} results with coordinates <<<" }
 
+            // ✅ تحويل النتائج مباشرة إلى OcrBox - لا حاجة لإعادة استدعاء ML Kit
+            hybridResults.map { result ->
                 OcrBox(
-                    text = textLines[textIndex++], // الاعتماد حصرياً على نصوص Paddle المرتجعة
-                    x = bounds.left.toFloat(),
-                    y = bounds.top.toFloat(),
-                    width = bounds.width().toFloat(),
-                    height = bounds.height().toFloat(),
-                    symWidth = symbol?.width()?.toFloat() ?: DEFAULT_SYMBOL,
-                    symHeight = symbol?.height()?.toFloat() ?: DEFAULT_SYMBOL,
-                    angle = line?.angle ?: 0f,
+                    text = result.text,
+                    x = result.box.x.toFloat(),
+                    y = result.box.y.toFloat(),
+                    width = result.box.width.toFloat(),
+                    height = result.box.height.toFloat(),
+                    symWidth = DEFAULT_SYMBOL,
+                    symHeight = DEFAULT_SYMBOL,
+                    angle = result.box.angle
                 )
             }
         } catch (e: Exception) {
-            logcat(LogPriority.ERROR, e) { "فشل في تنفيذ محرك Hybrid OCR، جاري العودة إلى ML Kit" }
+            logcat(LogPriority.ERROR, e) { "Hybrid OCR failed, falling back to ML Kit" }
             mlKitBoxes(image)
         }
     }
@@ -191,7 +186,7 @@ internal object TextBlockMerger {
 
         var currentBlocks = filteredBlocks.toMutableList()
         var mergedAny: Boolean
-        
+
         do {
             mergedAny = false
             val nextPassBlocks = mutableListOf<TranslationBlock>()
@@ -203,7 +198,7 @@ internal object TextBlockMerger {
 
                 for (j in i + 1 until currentBlocks.size) {
                     if (visited[j]) continue
-                    
+
                     if (shouldMergeTextBlock(currentMerged, currentBlocks[j])) {
                         currentMerged = mergeTextBlock(currentMerged, currentBlocks[j], isWebtoon)
                         visited[j] = true
@@ -493,7 +488,7 @@ internal object TextBlockMerger {
                 else { if (a.x > b.x) listOf(a, b) else listOf(b, a) }
             }
         }
-        
+
         val totalLen = (a.text.length + b.text.length).coerceAtLeast(1)
         val joinedText = if (ordered.any { it.text.any { c -> c.code in 0x4E00..0x9FFF || c.code in 0x3040..0x309F || c.code in 0x30A0..0x30FF } }) {
             ordered.joinToString("") { it.text.trim() }
