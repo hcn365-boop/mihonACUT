@@ -18,10 +18,8 @@ import tachiyomi.core.common.util.system.logcat
 import logcat.LogPriority
 import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
 
-/** Which OCR engine reads the page. */
 enum class OcrMode { MLKIT, PADDLE, HYBRID }
 
-/** A text box found by an OCR engine, in image pixels. */
 class OcrBox(
     val text: String,
     val x: Float,
@@ -33,10 +31,6 @@ class OcrBox(
     val angle: Float = 0f,
 )
 
-/**
- * Finds and merges the text of one page. It knows nothing about queues, files or chapters:
- * the caller gives it a bitmap and gets back the page's text blocks (or null if there is no text).
- */
 class PageTextExtractor(
     private val mode: OcrMode,
     private val isRtl: Boolean,
@@ -49,26 +43,110 @@ class PageTextExtractor(
     suspend fun extract(bitmap: Bitmap): PageTranslation? {
         val image = InputImage.fromBitmap(bitmap, 0)
         logcat(LogPriority.ERROR) { ">>> OCR branch selected: mode=$mode <<<" }
-        val boxes = when (mode) {
-            OcrMode.MLKIT -> mlKitBoxes(image)
-            OcrMode.PADDLE -> paddleBoxes(image)
-            OcrMode.HYBRID -> hybridBoxes(image, bitmap)
-        }
-        logcat(LogPriority.ERROR) { ">>> OCR $mode found ${boxes.size} boxes <<<" }
-        if (boxes.isEmpty()) return null
 
+        val paddingFactor = AiConfig.translateCollisionPadding
         val page = PageTranslation(imgWidth = bitmap.width.toFloat(), imgHeight = bitmap.height.toFloat())
 
-        // جلب قيمة التكبير/التوسيع المخصصة من الإعدادات عبر AiConfig (القيمة الافتراضية 1.3f)
-        val paddingFactor = AiConfig.translateCollisionPadding
+        when (mode) {
+            OcrMode.MLKIT -> {
+                val boxes = mlKitBoxes(image)
+                if (boxes.isEmpty()) return null
+                page.blocks = TextBlockMerger.merge(
+                    blocks = boxes.map { it.toBlock() },
+                    imgWidth = bitmap.width.toFloat(),
+                    imgHeight = bitmap.height.toFloat(),
+                    collisionPaddingFactor = paddingFactor
+                )
+            }
+            OcrMode.PADDLE -> {
+                val boxes = paddleBoxes(image)
+                if (boxes.isEmpty()) return null
+                page.blocks = TextBlockMerger.merge(
+                    blocks = boxes.map { it.toBlock() },
+                    imgWidth = bitmap.width.toFloat(),
+                    imgHeight = bitmap.height.toFloat(),
+                    collisionPaddingFactor = paddingFactor
+                )
+            }
+            OcrMode.HYBRID -> {
+                // 1. استخراج ML Kit الأولية والدمج المثالي عبر TextBlockMerger أولاً
+                val mlKitRaw = mlKitBoxes(image)
+                if (mlKitRaw.isEmpty()) return null
 
-        // الدمج + التوسيع بناءً على الإعداد + منع تصادم الفقاعات
-        page.blocks = TextBlockMerger.merge(
-            blocks = boxes.map { it.toBlock() }, 
-            imgWidth = bitmap.width.toFloat(), 
-            imgHeight = bitmap.height.toFloat(),
-            collisionPaddingFactor = paddingFactor
-        )
+                val mergedBlocks = TextBlockMerger.merge(
+                    blocks = mlKitRaw.map { it.toBlock() },
+                    imgWidth = bitmap.width.toFloat(),
+                    imgHeight = bitmap.height.toFloat(),
+                    collisionPaddingFactor = paddingFactor
+                )
+
+                if (mergedBlocks.isEmpty()) return null
+
+                // 2. إذا وجدنا السياق، نقوم بإرسال هذه الحدود المدمجة بدقة إلى PaddleOCR لقراءة النص الداخلي
+                val ctx = context
+                if (ctx != null) {
+                    try {
+                        val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
+                        val updatedBlocks = mutableListOf<TranslationBlock>()
+
+                        for (block in mergedBlocks) {
+                            val startX = max(0, block.x.toInt())
+                            val startY = max(0, block.y.toInt())
+                            val endX = min(bitmap.width, (block.x + block.width).toInt())
+                            val endY = min(bitmap.height, (block.y + block.height).toInt())
+
+                            val cropW = endX - startX
+                            val cropH = endY - startY
+                            if (cropW < 10 || cropH < 10) {
+                                updatedBlocks.add(block)
+                                continue
+                            }
+
+                            var croppedBitmap: Bitmap? = null
+                            var rotatedBitmap: Bitmap? = null
+                            try {
+                                croppedBitmap = Bitmap.createBitmap(bitmap, startX, startY, cropW, cropH)
+                                rotatedBitmap = if (abs(block.angle) > 1f) {
+                                    val matrix = android.graphics.Matrix().apply {
+                                        postRotate(-block.angle, cropW / 2f, cropH / 2f)
+                                    }
+                                    Bitmap.createBitmap(croppedBitmap, 0, 0, cropW, cropH, matrix, true)
+                                } else {
+                                    croppedBitmap
+                                }
+
+                                val croppedInput = InputImage.fromBitmap(rotatedBitmap, 0)
+                                // استخراج النص بـ PaddleOCR داخل الصندوق المدمج بدقة
+                                val paddleRecognizer = PaddleTextRecognizer(ctx, recognizerLanguage, forceHorizontal = true)
+                                val paddleText = paddleRecognizer.recognize(croppedInput)
+                                paddleRecognizer.close()
+
+                                if (paddleText.isNotBlank()) {
+                                    updatedBlocks.add(block.copy(text = paddleText.trim()))
+                                } else {
+                                    updatedBlocks.add(block)
+                                }
+                            } catch (e: Exception) {
+                                logcat(LogPriority.ERROR, e) { "Failed to OCR hybrid block" }
+                                updatedBlocks.add(block)
+                            } finally {
+                                if (rotatedBitmap != croppedBitmap) rotatedBitmap?.recycle()
+                                croppedBitmap?.recycle()
+                            }
+                        }
+
+                        hybridRecognizer.close()
+                        page.blocks = updatedBlocks
+                    } catch (e: Exception) {
+                        logcat(LogPriority.ERROR, e) { "Hybrid processing failed, falling back to merged ML Kit blocks" }
+                        page.blocks = mergedBlocks
+                    }
+                } else {
+                    page.blocks = mergedBlocks
+                }
+            }
+        }
+
         return page.takeIf { it.blocks.isNotEmpty() }
     }
 
@@ -96,42 +174,6 @@ class PageTextExtractor(
         return recognize(image).filter { it.text.isNotBlank() }
     }
 
-    // ✅ دالة hybridBoxes المعدلة: تستخدم recognizeWithBoxes مباشرة
-    private suspend fun hybridBoxes(image: InputImage, bitmap: Bitmap): List<OcrBox> {
-        val ctx = context ?: return mlKitBoxes(image)
-        return try {
-            val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
-
-            // ✅ استخدام الدالة الجديدة التي تعيد النص + الإحداثيات معاً
-            val hybridResults = hybridRecognizer.recognizeWithBoxes(image)
-            hybridRecognizer.close()
-
-            if (hybridResults.isEmpty()) {
-                logcat(LogPriority.ERROR) { ">>> Hybrid OCR returned empty, falling back to ML Kit <<<" }
-                return mlKitBoxes(image)
-            }
-
-            logcat(LogPriority.ERROR) { ">>> Hybrid OCR returned ${hybridResults.size} results with coordinates <<<" }
-
-            // ✅ تحويل النتائج مباشرة إلى OcrBox - لا حاجة لإعادة استدعاء ML Kit
-            hybridResults.map { result ->
-                OcrBox(
-                    text = result.text,
-                    x = result.box.x.toFloat(),
-                    y = result.box.y.toFloat(),
-                    width = result.box.width.toFloat(),
-                    height = result.box.height.toFloat(),
-                    symWidth = DEFAULT_SYMBOL,
-                    symHeight = DEFAULT_SYMBOL,
-                    angle = result.box.angle
-                )
-            }
-        } catch (e: Exception) {
-            logcat(LogPriority.ERROR, e) { "Hybrid OCR failed, falling back to ML Kit" }
-            mlKitBoxes(image)
-        }
-    }
-
     private fun OcrBox.toBlock() = TranslationBlock(
         text = text,
         width = width,
@@ -152,9 +194,8 @@ class PageTextExtractor(
     }
 }
 
-
 internal object TextBlockMerger {
-
+    // كود دمج الفقاعات المعتاد و resolveCollisions يبقى كما هو تماماً دون تغيير
     private val urlPattern = Regex("(?i)(https?://\\S+|www\\.\\S+|\\S+\\.(com|net|org|io|me|cc|tv|info))")
     private val symbolsFilterPattern = Regex("""[_~•°^@#$&|\\-]""")
 
@@ -173,17 +214,12 @@ internal object TextBlockMerger {
                 .replace(Regex("\\s+"), " ")
                 .trim()
 
-            if (cleanedText.isBlank()) {
-                null
-            } else {
-                block.copy(text = cleanedText)
-            }
+            if (cleanedText.isBlank()) null else block.copy(text = cleanedText)
         }
 
         if (filteredBlocks.isEmpty()) return mutableListOf()
 
         val isWebtoon = imgHeight > (imgWidth * 2.0f)
-
         var currentBlocks = filteredBlocks.toMutableList()
         var mergedAny: Boolean
 
@@ -198,7 +234,6 @@ internal object TextBlockMerger {
 
                 for (j in i + 1 until currentBlocks.size) {
                     if (visited[j]) continue
-
                     if (shouldMergeTextBlock(currentMerged, currentBlocks[j])) {
                         currentMerged = mergeTextBlock(currentMerged, currentBlocks[j], isWebtoon)
                         visited[j] = true
@@ -211,12 +246,7 @@ internal object TextBlockMerger {
         } while (mergedAny && currentBlocks.size > 1)
 
         val mergedBlocks = currentBlocks.mapNotNull { block ->
-            val text = block.text.trim()
-            if (text.isBlank() || text.length < 1) {
-                null
-            } else {
-                block
-            }
+            if (block.text.trim().isBlank()) null else block
         }.toMutableList()
 
         if (mergedBlocks.isEmpty()) return mutableListOf()
@@ -401,22 +431,15 @@ internal object TextBlockMerger {
             return distance <= (radiusA + radiusB)
         }
 
-        return testAxis(cosA, sinA) && 
-               testAxis(-sinA, cosA) && 
-               testAxis(cosB, sinB) && 
-               testAxis(-sinB, cosB)
+        return testAxis(cosA, sinA) && testAxis(-sinA, cosA) && testAxis(cosB, sinB) && testAxis(-sinB, cosB)
     }
 
-    private fun shouldMergeTextBlock(
-        r1: TranslationBlock,
-        r2: TranslationBlock,
-    ): Boolean {
+    private fun shouldMergeTextBlock(r1: TranslationBlock, r2: TranslationBlock): Boolean {
         val angleDiff = abs(r1.angle - r2.angle)
         val angleSimilar = angleDiff < 15 || abs(angleDiff - 180) < 15
         if (!angleSimilar) return false
 
         val isVertical = abs(r1.angle) in 70.0..110.0
-
         val r1Right = r1.x + r1.width
         val r1Bottom = r1.y + r1.height
         val r2Right = r2.x + r2.width
@@ -475,8 +498,10 @@ internal object TextBlockMerger {
     }
 
     private fun mergeTextBlock(a: TranslationBlock, b: TranslationBlock, isWebtoon: Boolean): TranslationBlock {
-        val minX = min(a.x, b.x); val minY = min(a.y, b.y)
-        val maxX = max(a.x + a.width, b.x + b.width); val maxY = max(a.y + a.height, b.y + b.height)
+        val minX = min(a.x, b.x)
+        val minY = min(a.y, b.y)
+        val maxX = max(a.x + a.width, b.x + b.width)
+        val maxY = max(a.y + a.height, b.y + b.height)
         val isVertical = abs(a.angle) in 70.0..110.0
         val ordered = if (isVertical) {
             if (a.x > b.x) listOf(a, b) else listOf(b, a)
