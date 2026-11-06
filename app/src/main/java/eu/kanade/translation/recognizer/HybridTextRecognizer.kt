@@ -17,10 +17,10 @@ class HybridTextRecognizer(
 
     private val TAG = "HybridTextRecognizer"
     
-    // محرك ML Kit لاستخراج الصناديق، الإحداثيات وزوايا الميل بدقة عالية
+    // محرك ML Kit لاستخراج الصناديق، الإحداثيات وزوايا الميل بدقة عالية فقط
     private val mlKitRecognizer = MlKitTextRecognizer(language)
     
-    // محرك PaddleOCR للتعرف الفعلي، مع تمرير forceHorizontal = true لأنه يعمل ضمن النظام الهجين
+    // محرك PaddleOCR للتعرف الفعلي على النص، مع تمرير forceHorizontal = true لأنه يعمل ضمن النظام الهجين
     private val paddleRecognizer = PaddleTextRecognizer(context, language, forceHorizontal = true)
 
     data class HybridBox(
@@ -36,7 +36,7 @@ class HybridTextRecognizer(
         val bitmap = image.bitmapInternal ?: return mlKitRecognizer.recognize(image)
         
         try {
-            // 1. استخراج الصناديق والمواقع والزوايا باستخدام ML Kit
+            // 1. استخراج الصناديق والمواقع والزوايا باستخدام ML Kit (لتحديد الأماكن فقط)
             val mlKitResult: Text = mlKitRecognizer.process(image)
             val rawBoxes = mutableListOf<HybridBox>()
 
@@ -48,7 +48,7 @@ class HybridTextRecognizer(
 
                 rawBoxes.add(
                     HybridBox(
-                        text = block.text.trim(),
+                        text = "", // لم نعد بحاجة لنص ML Kit، الاكتفاء والإحداثيات فقط
                         x = box.left,
                         y = box.top,
                         width = box.width(),
@@ -58,7 +58,7 @@ class HybridTextRecognizer(
                 )
             }
 
-            // 2. دمج الفقاعات والصناديق هندسياً أولاً للحصول على فقاعة متكاملة
+            // 2. دمج الفقاعات والصناديق هندسياً للحصول على فقاعة متكاملة
             val mergedBoxes = mergeBoxesIntelligently(rawBoxes)
             val extractedBlocks = mutableListOf<String>()
 
@@ -71,14 +71,13 @@ class HybridTextRecognizer(
                 val cropW = endX - startX
                 val cropH = endY - startY
                 if (cropW < 10 || cropH < 10) {
-                    extractedBlocks.add(box.text)
-                    continue
+                    continue // تخطي الصناديق الصغيرة جداً بدلاً من جلب نص ML Kit
                 }
 
                 var croppedBitmap: Bitmap? = null
                 var rotatedBitmap: Bitmap? = null
                 try {
-                    // قص مساحة الفقاعة المدمجة بدقة من الصورة الأصلية (بدون إزاحة اصتدام)
+                    // قص مساحة الفقاعة المدمجة بدقة من الصورة الأصلية
                     croppedBitmap = Bitmap.createBitmap(bitmap, startX, startY, cropW, cropH)
 
                     // 3. تصحيح الدوران بناءً على زاوية ML Kit لضمان قراءة أفقية سليمة عبر PaddleOCR
@@ -92,18 +91,16 @@ class HybridTextRecognizer(
                     }
 
                     val croppedInput = InputImage.fromBitmap(rotatedBitmap, 0)
-                    // 4. تمرير الفقاعة المدمجة والمصححة إلى PaddleOCR للتعرف على النص
+                    // 4. تمرير الفقاعة المدمجة والمصححة إلى PaddleOCR للتعرف على النص حصرياً
                     val paddleText = paddleRecognizer.recognize(croppedInput)
 
+                    // اعتماد نص PaddleOCR فقط، وإذا لم يتعرف عليه يتم تجاهله تماماً دون اللجوء لـ ML Kit
                     if (paddleText.isNotBlank()) {
                         extractedBlocks.add(paddleText.trim())
-                    } else {
-                        // العودة للنص الأصلي لـ ML Kit في حال لم يتعرف Paddle على النص
-                        extractedBlocks.add(box.text)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "خطأ أثناء معالجة القصه الهجينة للصندوق", e)
-                    extractedBlocks.add(box.text)
+                    // عدم إضافة أي شيء في حال حدوث خطأ، لضمان الاعتماد الكلي على Paddle فقط
                 } finally {
                     if (rotatedBitmap != croppedBitmap) rotatedBitmap?.recycle()
                     croppedBitmap?.recycle()
@@ -142,7 +139,7 @@ class HybridTextRecognizer(
                     val maxY = max(current.y + current.height, other.y + other.height)
                     
                     current = HybridBox(
-                        text = "${current.text} ${other.text}",
+                        text = "",
                         x = minX,
                         y = minY,
                         width = maxX - minX,
