@@ -100,19 +100,31 @@ class PageTextExtractor(
         val ctx = context ?: return mlKitBoxes(image)
         return try {
             val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
+            // 1. استخراج النصوص الدقيقة عبر النظام الهجين (PaddleOCR + تصحيح الدوران)
             val recognizedTextResult = hybridRecognizer.recognize(image)
             hybridRecognizer.close()
 
-            // الاعتماد على صناديق ML Kit مع تحديث النص المستخرج بالدقة العالية للمحرك الهجين
+            val textBlocksList = recognizedTextResult.lines().filter { it.isNotBlank() }
+            var textIndex = 0
+
+            // 2. الحصول على الإحداثيات الهندسية الدقيقة للصناديق من ML Kit
             val mlKitRecognize = mlKit ?: return emptyList()
             val mlKitResult = mlKitRecognize(image)
 
+            // 3. ربط إحداثيات الصناديق بالنصوص الدقيقة المستخرجة عبر Paddle
             mlKitResult.textBlocks.mapNotNull { block ->
                 val bounds = block.boundingBox ?: return@mapNotNull null
                 val line = block.lines.firstOrNull()
                 val symbol = line?.elements?.firstOrNull()?.symbols?.firstOrNull()?.boundingBox
+
+                val assignedText = if (textIndex < textBlocksList.size) {
+                    textBlocksList[textIndex++]
+                } else {
+                    block.text
+                }
+
                 OcrBox(
-                    text = block.text,
+                    text = assignedText,
                     x = bounds.left.toFloat(),
                     y = bounds.top.toFloat(),
                     width = bounds.width().toFloat(),
