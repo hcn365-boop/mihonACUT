@@ -52,7 +52,7 @@ class PageTextExtractor(
         val boxes = when (mode) {
             OcrMode.MLKIT -> mlKitBoxes(image)
             OcrMode.PADDLE -> paddleBoxes(image)
-            OcrMode.HYBRID -> hybridBoxes(image)
+            OcrMode.HYBRID -> hybridBoxes(image, bitmap)
         }
         logcat(LogPriority.ERROR) { ">>> OCR $mode found ${boxes.size} boxes <<<" }
         if (boxes.isEmpty()) return null
@@ -96,19 +96,22 @@ class PageTextExtractor(
         return recognize(image).filter { it.text.isNotBlank() }
     }
 
-    private suspend fun hybridBoxes(image: InputImage): List<OcrBox> {
+    private suspend fun hybridBoxes(image: InputImage, bitmap: Bitmap): List<OcrBox> {
         val ctx = context ?: return mlKitBoxes(image)
         return try {
+            val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
+            
+            // 1. استخراج الإحداثيات عبر ML Kit والنصوص المقابلة حصرياً عبر PaddleOCR من خلال HybridTextRecognizer
+            // وللحفاظ على دقة الإحداثيات الأصلية وصناديقها، سنستخرج مساحة كل صندوق مع نص Paddle الخاص به
             val mlKitRecognize = mlKit ?: return emptyList()
             val mlKitResult = mlKitRecognize(image)
             
-            // استخدام محرك HybridTextRecognizer مباشرة للحصول على الصناديق مع نصوص Paddle المخصصة لكل قصة
-            val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
-            // بما أن HybridTextRecognizer يقبل InputImage ويقوم بعملية القص والتعرف الداخلي،
-            // يمكننا استغلال إحداثيات ML Kit وتطبيق معالجة Paddle عليها كما هو معتاد في الكلاس الخاص به،
-            // أو الاعتماد على طريقة مباشرة تأخذ الإحداثيات من ML Kit وتستخرج النص من Paddle لكل صندوق على حدة.
-            
             val resultBoxes = mutableListOf<OcrBox>()
+            
+            // استدعاء الهجين للحصول على النصوص المعالجة بالترتيب أو عبر معالجة الصناديق
+            // الطريقة الأضمن والأدق هنا هي الاعتماد على دمج الصناديق هندسياً تماماً كما يحدث داخل HybridTextRecognizer
+            // أو تشغيل الـ HybridTextRecognizer لاستخراج النتائج المباشرة.
+            // بما أننا نريد ربط إحداثيات ML Kit الدقيقة بنصوص Paddle المعالجة:
             
             for (block in mlKitResult.textBlocks) {
                 val bounds = block.boundingBox ?: continue
@@ -117,22 +120,61 @@ class PageTextExtractor(
                 val symbol = line?.elements?.firstOrNull()?.symbols?.firstOrNull()?.boundingBox
                 val angle = line?.angle ?: 0f
 
-                // هنا نحصل على النص المستخرج من Paddle مباشرة لنفس مساحة الصندوق الكتشوف بواسطة ML Kit
-                // (يمكنك الاعتماد على الآلية الموجودة في HybridTextRecognizer أو تمرير الصندوق مباشرة)
-                resultBoxes.add(
-                    OcrBox(
-                        text = block.text, // سيتم استبداله بنص Paddle الصحيح إذا نظمنا استدعاء القص لكل صندوق
-                        x = bounds.left.toFloat(),
-                        y = bounds.top.toFloat(),
-                        width = bounds.width().toFloat(),
-                        height = bounds.height().toFloat(),
-                        symWidth = symbol?.width()?.toFloat() ?: DEFAULT_SYMBOL,
-                        symHeight = symbol?.height()?.toFloat() ?: DEFAULT_SYMBOL,
-                        angle = angle,
+                // قص الصورة لهذا الصندوق تحديداً وتمريرها لـ PaddleOCR عبر أداة مساعدة أو منطق مشابه للـ Hybrid
+                // لتسهيل الأمر وضمان عدم اللجوء لـ ML Kit، سنقوم بتنفيذ عملية القص السريع والتعرف بـ Paddle لهذا البلوك:
+                val startX = max(0, bounds.left)
+                val startY = max(0, bounds.top)
+                val endX = min(bitmap.width, bounds.right)
+                val endY = min(bitmap.height, bounds.bottom)
+                val cropW = endX - startX
+                val cropH = endY - startY
+                
+                if (cropW < 10 || cropH < 10) continue
+
+                // استخدام محرك Paddle مباشرة على هذه الإحداثيات المستخرجة من ML Kit
+                // (أو الاعتماد على الكلاس الهجين)
+                val croppedBitmap = Bitmap.createBitmap(bitmap, startX, startY, cropW, cropH)
+                val rotatedBitmap = if (abs(angle) > 1f) {
+                    val matrix = android.graphics.Matrix().apply {
+                        postRotate(-angle, cropW / 2f, cropH / 2f)
+                    }
+                    Bitmap.createBitmap(croppedBitmap, 0, 0, cropW, cropH, matrix, true)
+                } else {
+                    croppedBitmap
+                }
+
+                // استخراج النص حصرياً عبر PaddleOCR الممرر في النظام أو عبر مكوناته
+                // بما أن HybridTextRecognizer يدير الـ Paddle داخلياً، يمكننا استخدامه مباشرة أو استخلاص نصه:
+                // دعنا نعتمد على محرك الـ Paddle الموجود في PageTextExtractor إن وجد، أو استدعاء معالجة نظيفة:
+                
+                val paddleRecognizeFn = paddle
+                val paddleText = if (paddleRecognizeFn != null) {
+                    val croppedInput = InputImage.fromBitmap(rotatedBitmap, 0)
+                    paddleRecognizeFn(croppedInput).joinToString(" ") { it.text }.trim()
+                } else {
+                    ""
+                }
+
+                if (rotatedBitmap != croppedBitmap) rotatedBitmap.recycle()
+                croppedBitmap.recycle()
+
+                // إذا نجح Paddle في قراءة النص، نضيف الصندوق بالنص الجديد. إذا فشل، نتخطى الصندوق تماماً ولا نضع نص ML Kit!
+                if (paddleText.isNotBlank()) {
+                    resultBoxes.add(
+                        OcrBox(
+                            text = paddleText,
+                            x = bounds.left.toFloat(),
+                            y = bounds.top.toFloat(),
+                            width = bounds.width().toFloat(),
+                            height = bounds.height().toFloat(),
+                            symWidth = symbol?.width()?.toFloat() ?: DEFAULT_SYMBOL,
+                            symHeight = symbol?.height()?.toFloat() ?: DEFAULT_SYMBOL,
+                            angle = angle,
+                        )
                     )
-                )
+                }
             }
-            
+
             hybridRecognizer.close()
             resultBoxes
         } catch (e: Exception) {
@@ -163,7 +205,7 @@ class PageTextExtractor(
 
 
 internal object TextBlockMerger {
-
+    // (باقي كود الدمج وإدارة التصادمات يبقى كما هو دون أي تغيير)
     private val urlPattern = Regex("(?i)(https?://\\S+|www\\.\\S+|\\S+\\.(com|net|org|io|me|cc|tv|info))")
     private val symbolsFilterPattern = Regex("""[_~•°^@#$&|\\-]""")
 
