@@ -17,6 +17,8 @@ import kotlin.math.sqrt
 import tachiyomi.core.common.util.system.logcat
 import logcat.LogPriority
 import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
+import eu.kanade.translation.recognizer.PaddleTextRecognizer
+
 
 enum class OcrMode { MLKIT, PADDLE, HYBRID }
 
