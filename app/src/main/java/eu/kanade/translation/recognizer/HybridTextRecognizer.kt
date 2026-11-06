@@ -15,17 +15,17 @@ class HybridTextRecognizer(
 
     private val TAG = "HybridTextRecognizer"
     
-    // نعتمد على ML Kit لاستخراج الصناديق والإحداثيات بدقة فائقة
+    // محرك ML Kit لاستخراج الصناديق، الإحداثيات وزوايا الميل بدقة عالية
     private val mlKitRecognizer = MlKitTextRecognizer(language)
     
-    // نعتمد على نموذج PaddleOCR للتعرف الفعلي على النصوص (قراءة الحروف)
+    // محرك PaddleOCR للتعرف الفعلي على محتوى الحروف داخل الصناديق المقصوصة
     private val paddleRecognizer = PaddleTextRecognizer(context, language)
 
     override fun recognize(image: InputImage): String {
         val bitmap = image.bitmapInternal ?: return mlKitRecognizer.recognize(image)
         
         try {
-            // 1. الخطوة الأولى: استخدام ML Kit للحصول على الصناديق (Bounding Boxes) بدقة
+            // 1. استخراج الصناديق والمواقع باستخدام ML Kit
             val mlKitResult: Text = mlKitRecognizer.process(image)
             val extractedBlocks = mutableListOf<String>()
 
@@ -44,22 +44,21 @@ class HybridTextRecognizer(
 
                 var croppedBitmap: Bitmap? = null
                 try {
-                    // 2. قص الجزء الخاص بالنص بدقة بناءً على إحداثيات ML Kit
+                    // 2. قص مساحة الصندوق بدقة من الصورة الأصلية
                     croppedBitmap = Bitmap.createBitmap(bitmap, startX, startY, cropW, cropH)
                     val croppedInput = InputImage.fromBitmap(croppedBitmap, 0)
 
-                    // 3. تمرير الصورة المقصوصة إلى PaddleOCR للتعرف على النص بداخله
-                    // (ملاحظة: سنستدعي دالة التعرف المباشرة من Paddle على الكوب المقتص)
+                    // 3. محاولة قراءة النص المقصوص بواسطة نموذج PaddleOCR
                     val paddleText = paddleRecognizer.recognize(croppedInput)
 
                     if (paddleText.isNotBlank()) {
                         extractedBlocks.add(paddleText.trim())
                     } else {
-                        // كخطوة احتياطية: إذا فشل Paddle في قراءة النص المقصوص، نلجأ لنص ML Kit الأصلي
+                        // العودة للنص الأصلي لـ ML Kit في حال لم يتعرف Paddle على النص
                         extractedBlocks.add(block.text.trim())
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "خطأ أثناء معالجة الصندوق الهجين", e)
+                    Log.e(TAG, "خطأ أثناء معالجة القصه الهجينة للصندوق", e)
                     extractedBlocks.add(block.text.trim())
                 } finally {
                     croppedBitmap?.recycle()
@@ -68,13 +67,17 @@ class HybridTextRecognizer(
 
             return extractedBlocks.joinToString("\n")
         } catch (e: Exception) {
-            Log.e(TAG, "فشل في تشغيل Hybrid OCR، الرجوع إلى ML Kit العادي", e)
+            Log.e(TAG, "فشل في تشغيل النظام الهجين، الرجوع إلى ML Kit", e)
             return mlKitRecognizer.recognize(image)
         }
     }
 
     override fun close() {
-        mlKitRecognizer.close()
-        paddleRecognizer.close()
+        try {
+            mlKitRecognizer.close()
+            paddleRecognizer.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "خطأ أثناء إغلاق محركات HybridTextRecognizer", e)
+        }
     }
 }
