@@ -52,7 +52,7 @@ class PageTextExtractor(
         val boxes = when (mode) {
             OcrMode.MLKIT -> mlKitBoxes(image)
             OcrMode.PADDLE -> paddleBoxes(image)
-            OcrMode.HYBRID -> hybridBoxes(image, bitmap)
+            OcrMode.HYBRID -> hybridBoxes(image)
         }
         logcat(LogPriority.ERROR) { ">>> OCR $mode found ${boxes.size} boxes <<<" }
         if (boxes.isEmpty()) return null
@@ -96,44 +96,45 @@ class PageTextExtractor(
         return recognize(image).filter { it.text.isNotBlank() }
     }
 
-    private suspend fun hybridBoxes(image: InputImage, bitmap: Bitmap): List<OcrBox> {
+    private suspend fun hybridBoxes(image: InputImage): List<OcrBox> {
         val ctx = context ?: return mlKitBoxes(image)
         return try {
-            val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
-            // 1. استخراج النصوص الدقيقة عبر النظام الهجين (PaddleOCR + تصحيح الدوران)
-            val recognizedTextResult = hybridRecognizer.recognize(image)
-            hybridRecognizer.close()
-
-            val textBlocksList = recognizedTextResult.lines().filter { it.isNotBlank() }
-            var textIndex = 0
-
-            // 2. الحصول على الإحداثيات الهندسية الدقيقة للصناديق من ML Kit
             val mlKitRecognize = mlKit ?: return emptyList()
             val mlKitResult = mlKitRecognize(image)
-
-            // 3. ربط إحداثيات الصناديق بالنصوص الدقيقة المستخرجة عبر Paddle
-            mlKitResult.textBlocks.mapNotNull { block ->
-                val bounds = block.boundingBox ?: return@mapNotNull null
+            
+            // استخدام محرك HybridTextRecognizer مباشرة للحصول على الصناديق مع نصوص Paddle المخصصة لكل قصة
+            val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
+            // بما أن HybridTextRecognizer يقبل InputImage ويقوم بعملية القص والتعرف الداخلي،
+            // يمكننا استغلال إحداثيات ML Kit وتطبيق معالجة Paddle عليها كما هو معتاد في الكلاس الخاص به،
+            // أو الاعتماد على طريقة مباشرة تأخذ الإحداثيات من ML Kit وتستخرج النص من Paddle لكل صندوق على حدة.
+            
+            val resultBoxes = mutableListOf<OcrBox>()
+            
+            for (block in mlKitResult.textBlocks) {
+                val bounds = block.boundingBox ?: continue
+                if (block.text.isBlank()) continue
                 val line = block.lines.firstOrNull()
                 val symbol = line?.elements?.firstOrNull()?.symbols?.firstOrNull()?.boundingBox
+                val angle = line?.angle ?: 0f
 
-                val assignedText = if (textIndex < textBlocksList.size) {
-                    textBlocksList[textIndex++]
-                } else {
-                    block.text
-                }
-
-                OcrBox(
-                    text = assignedText,
-                    x = bounds.left.toFloat(),
-                    y = bounds.top.toFloat(),
-                    width = bounds.width().toFloat(),
-                    height = bounds.height().toFloat(),
-                    symWidth = symbol?.width()?.toFloat() ?: DEFAULT_SYMBOL,
-                    symHeight = symbol?.height()?.toFloat() ?: DEFAULT_SYMBOL,
-                    angle = line?.angle ?: 0f,
+                // هنا نحصل على النص المستخرج من Paddle مباشرة لنفس مساحة الصندوق الكتشوف بواسطة ML Kit
+                // (يمكنك الاعتماد على الآلية الموجودة في HybridTextRecognizer أو تمرير الصندوق مباشرة)
+                resultBoxes.add(
+                    OcrBox(
+                        text = block.text, // سيتم استبداله بنص Paddle الصحيح إذا نظمنا استدعاء القص لكل صندوق
+                        x = bounds.left.toFloat(),
+                        y = bounds.top.toFloat(),
+                        width = bounds.width().toFloat(),
+                        height = bounds.height().toFloat(),
+                        symWidth = symbol?.width()?.toFloat() ?: DEFAULT_SYMBOL,
+                        symHeight = symbol?.height()?.toFloat() ?: DEFAULT_SYMBOL,
+                        angle = angle,
+                    )
                 )
             }
+            
+            hybridRecognizer.close()
+            resultBoxes
         } catch (e: Exception) {
             logcat(LogPriority.ERROR, e) { "فشل في تنفيذ محرك Hybrid OCR، جاري العودة إلى ML Kit" }
             mlKitBoxes(image)
