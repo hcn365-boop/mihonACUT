@@ -20,8 +20,8 @@ class HybridTextRecognizer(
     // محرك ML Kit لاستخراج الصناديق، الإحداثيات وزوايا الميل بدقة عالية
     private val mlKitRecognizer = MlKitTextRecognizer(language)
     
-    // محرك PaddleOCR للتعرف الفعلي على محتوى الحروف داخل الصناديق المقصوصة
-    private val paddleRecognizer = PaddleTextRecognizer(context, language)
+    // محرك PaddleOCR للتعرف الفعلي، مع تمرير forceHorizontal = true لأنه يعمل ضمن النظام الهجين
+    private val paddleRecognizer = PaddleTextRecognizer(context, language, forceHorizontal = true)
 
     data class HybridBox(
         val text: String,
@@ -142,7 +142,7 @@ class HybridTextRecognizer(
                     val maxY = max(current.y + current.height, other.y + other.height)
                     
                     current = HybridBox(
-                        text = "${current.text}${other.text}",
+                        text = "${current.text} ${other.text}",
                         x = minX,
                         y = minY,
                         width = maxX - minX,
@@ -159,3 +159,10 @@ class HybridTextRecognizer(
 
     override fun close() {
         try {
+            mlKitRecognizer.close()
+            paddleRecognizer.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "خطأ أثناء إغلاق محركات HybridTextRecognizer", e)
+        }
+    }
+}
