@@ -47,6 +47,9 @@ class PageTextExtractor(
         val paddingFactor = AiConfig.translateCollisionPadding
         val page = PageTranslation(imgWidth = bitmap.width.toFloat(), imgHeight = bitmap.height.toFloat())
 
+        // تحديد ما إذا كان الوضع الحالي هو Hybrid لزيادة معامل السماحية للدمج
+        val isHybridMode = (mode == OcrMode.HYBRID)
+
         when (mode) {
             OcrMode.MLKIT -> {
                 val boxes = mlKitBoxes(image)
@@ -55,7 +58,8 @@ class PageTextExtractor(
                     blocks = boxes.map { it.toBlock() },
                     imgWidth = bitmap.width.toFloat(),
                     imgHeight = bitmap.height.toFloat(),
-                    collisionPaddingFactor = paddingFactor
+                    collisionPaddingFactor = paddingFactor,
+                    isHybrid = isHybridMode
                 )
             }
             OcrMode.PADDLE -> {
@@ -65,7 +69,8 @@ class PageTextExtractor(
                     blocks = boxes.map { it.toBlock() },
                     imgWidth = bitmap.width.toFloat(),
                     imgHeight = bitmap.height.toFloat(),
-                    collisionPaddingFactor = paddingFactor
+                    collisionPaddingFactor = paddingFactor,
+                    isHybrid = isHybridMode
                 )
             }
             OcrMode.HYBRID -> {
@@ -95,7 +100,8 @@ class PageTextExtractor(
                             blocks = rawTranslationBlocks,
                             imgWidth = bitmap.width.toFloat(),
                             imgHeight = bitmap.height.toFloat(),
-                            collisionPaddingFactor = paddingFactor
+                            collisionPaddingFactor = paddingFactor,
+                            isHybrid = isHybridMode
                         )
                     } catch (e: Exception) {
                         logcat(LogPriority.ERROR, e) { "Hybrid processing failed, falling back to ML Kit" }
@@ -105,7 +111,8 @@ class PageTextExtractor(
                             blocks = boxes.map { it.toBlock() },
                             imgWidth = bitmap.width.toFloat(),
                             imgHeight = bitmap.height.toFloat(),
-                            collisionPaddingFactor = paddingFactor
+                            collisionPaddingFactor = paddingFactor,
+                            isHybrid = isHybridMode
                         )
                     }
                 } else {
@@ -115,7 +122,8 @@ class PageTextExtractor(
                         blocks = boxes.map { it.toBlock() },
                         imgWidth = bitmap.width.toFloat(),
                         imgHeight = bitmap.height.toFloat(),
-                        collisionPaddingFactor = paddingFactor
+                        collisionPaddingFactor = paddingFactor,
+                        isHybrid = isHybridMode
                     )
                 }
             }
@@ -176,7 +184,8 @@ internal object TextBlockMerger {
         blocks: List<TranslationBlock>, 
         imgWidth: Float, 
         imgHeight: Float, 
-        collisionPaddingFactor: Float = 1.3f
+        collisionPaddingFactor: Float = 1.3f,
+        isHybrid: Boolean = false
     ): MutableList<TranslationBlock> {
         if (blocks.isEmpty()) return mutableListOf()
 
@@ -207,7 +216,8 @@ internal object TextBlockMerger {
 
                 for (j in i + 1 until currentBlocks.size) {
                     if (visited[j]) continue
-                    if (shouldMergeTextBlock(currentMerged, currentBlocks[j])) {
+                    // تمرير مؤشر الـ Hybrid لدالة الفحص والدمج
+                    if (shouldMergeTextBlock(currentMerged, currentBlocks[j], isHybrid)) {
                         currentMerged = mergeTextBlock(currentMerged, currentBlocks[j], isWebtoon)
                         visited[j] = true
                         mergedAny = true
@@ -407,7 +417,7 @@ internal object TextBlockMerger {
         return testAxis(cosA, sinA) && testAxis(-sinA, cosA) && testAxis(cosB, sinB) && testAxis(-sinB, cosB)
     }
 
-    private fun shouldMergeTextBlock(r1: TranslationBlock, r2: TranslationBlock): Boolean {
+    private fun shouldMergeTextBlock(r1: TranslationBlock, r2: TranslationBlock, isHybrid: Boolean): Boolean {
         val angleDiff = abs(r1.angle - r2.angle)
         val angleSimilar = angleDiff < 15 || abs(angleDiff - 180) < 15
         if (!angleSimilar) return false
@@ -421,8 +431,10 @@ internal object TextBlockMerger {
         val sH = max(r1.symHeight, max(r2.symHeight, 12f))
         val sW = max(r1.symWidth, max(r2.symWidth, 12f))
 
-        val maxAllowedGapX = sW * 1.2f
-        val maxAllowedGapY = sH * 1.2f
+        // زيادة معاملات السماحية للمسافات (الفجوات) إذا كان وضع الـ Hybrid مفعلاً
+        val gapMultiplier = if (isHybrid) 1.8f else 1.2f
+        val maxAllowedGapX = sW * gapMultiplier
+        val maxAllowedGapY = sH * gapMultiplier
 
         val yOverlap = max(0f, min(r1Bottom, r2Bottom) - max(r1.y, r2.y))
         val xOverlap = max(0f, min(r1Right, r2Right) - max(r1.x, r2.x))
@@ -443,15 +455,15 @@ internal object TextBlockMerger {
             val vertGap = if (r1.y < r2.y) r2.y - r1Bottom else r1.y - r2Bottom
             if (vertGap > maxAllowedGapY) return false
 
-            val isTouchingOrClose = sideGap <= (sW * 1.2f) && vertGap <= (sH * 1.2f)
+            val isTouchingOrClose = sideGap <= maxAllowedGapX && vertGap <= maxAllowedGapY
             if (!isTouchingOrClose) return false
 
             val dy = abs(r1.y - r2.y)
             val dx = abs(r1.x - r2.x)
-            val isOriginsClose = dy < (sH * 1.2f) && dx < (sW * 1.2f)
-            val isSideBySide = sideGap < (sW * 1.2f) && dy < (sH * 1.2f)
+            val isOriginsClose = dy < maxAllowedGapY && dx < maxAllowedGapX
+            val isSideBySide = sideGap < maxAllowedGapX && dy < maxAllowedGapY
             val alignedVertically = yOverlap > (sH * 0.15f)
-            val closeHorizontally = sideGap < (sW * 1.2f)
+            val closeHorizontally = sideGap < maxAllowedGapX
             return isOriginsClose || isSideBySide || (closeHorizontally && alignedVertically)
         } else {
             val vGap = max(0f, if (r1.y < r2.y) r2.y - r1Bottom else r1.y - r2Bottom)
