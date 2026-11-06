@@ -16,10 +16,10 @@ class HybridTextRecognizer(
 ) : TextRecognizer {
 
     private val TAG = "HybridTextRecognizer"
-    
+
     // محرك ML Kit لاستخراج إحداثيات وأماكن الصناديق هندسياً فقط
     private val mlKitRecognizer = MlKitTextRecognizer(language)
-    
+
     // محرك PaddleOCR للتعرف الفعلي على النص حصرياً داخل الصناديق المقصوصة والمدمجة
     private val paddleRecognizer = PaddleTextRecognizer(context, language, forceHorizontal = true)
 
@@ -32,11 +32,24 @@ class HybridTextRecognizer(
         val angle: Float
     )
 
+    // ✅ نتيجة جديدة: نص Paddle مع إحداثيات الصندوق المدمج
+    data class HybridResult(
+        val text: String,
+        val box: HybridBox
+    )
+
     override fun recognize(image: InputImage): String {
-        val bitmap = image.bitmapInternal ?: return mlKitRecognizer.recognize(image)
-        
+        val results = recognizeWithBoxes(image)
+        return results.joinToString("\n") { it.text }
+    }
+
+    // ✅ الدالة الجديدة: تنفذ الخطوات 1-5 وتعيد النصوص مع الإحداثيات
+    fun recognizeWithBoxes(image: InputImage): List<HybridResult> {
+        val bitmap = image.bitmapInternal ?: return emptyList()
+        val results = mutableListOf<HybridResult>()
+
         try {
-            // 1. استخراج مواقع وأماكن الصناديق وزوايا الميل عبر ML Kit (تجاهل نصوصه بالكامل)
+            // 1. استلام الصورة وعمل ML Kit OCR لاستخراج الصناديق
             val mlKitResult: Text = mlKitRecognizer.process(image)
             val rawBoxes = mutableListOf<HybridBox>()
 
@@ -56,11 +69,11 @@ class HybridTextRecognizer(
                 )
             }
 
-            // 2. دمج الفقاعات والصناديق هندسياً للحصول على فقاعات متكاملة ونظيفة
+            // 2. دمج فقاعات ML Kit هندسياً
             val mergedBoxes = mergeBoxesIntelligently(rawBoxes)
-            val extractedBlocks = mutableListOf<String>()
 
-            // 3. المرور على كل فقاعة مدمجة، قصها، وتمريرها إلى PaddleOCR
+            // 3. استخدام صناديق ML Kit المدمجة لقص أجزاء من الصورة
+            // 4. إرسال الأجزاء المقصوصة إلى Paddle OCR
             for (box in mergedBoxes) {
                 val startX = max(0, box.x)
                 val startY = max(0, box.y)
@@ -77,7 +90,7 @@ class HybridTextRecognizer(
                     // قص مساحة الفقاعة المدمجة بدقة من الصورة الأصلية
                     croppedBitmap = Bitmap.createBitmap(bitmap, startX, startY, cropW, cropH)
 
-                    // تصحيح الدوران بناءً على زاوية الميل لضمان قراءة أفقية سليمة عبر PaddleOCR
+                    // تصحيح الدوران بناءً على زاوية الميل
                     rotatedBitmap = if (abs(box.angle) > 1f) {
                         val matrix = Matrix().apply {
                             postRotate(-box.angle, cropW / 2f, cropH / 2f)
@@ -88,13 +101,13 @@ class HybridTextRecognizer(
                     }
 
                     val croppedInput = InputImage.fromBitmap(rotatedBitmap, 0)
-                    
-                    // 4. قراءة النص حصرياً عبر PaddleOCR للفقاعة المدمجة والمصححة
+
+                    // قراءة النص حصرياً عبر PaddleOCR
                     val paddleText = paddleRecognizer.recognize(croppedInput)
 
-                    // اعتماد نص Paddle فقط، وتجاهل الصندوق تماماً إن لم يتم العرف على نص (بدون العودة لـ ML Kit)
+                    // 5. إعادة نص Paddle مع إحداثيات الصندوق
                     if (paddleText.isNotBlank()) {
-                        extractedBlocks.add(paddleText.trim())
+                        results.add(HybridResult(paddleText.trim(), box))
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "خطأ أثناء معالجة القصة الهجينة للصندوق", e)
@@ -104,10 +117,10 @@ class HybridTextRecognizer(
                 }
             }
 
-            return extractedBlocks.joinToString("\n")
+            return results
         } catch (e: Exception) {
-            Log.e(TAG, "فشل في تشغيل النظام الهجين، الرجوع إلى المحرك البديل", e)
-            return mlKitRecognizer.recognize(image)
+            Log.e(TAG, "فشل في تشغيل النظام الهجين", e)
+            return emptyList()
         }
     }
 
@@ -128,14 +141,14 @@ class HybridTextRecognizer(
 
                 val xOverlap = max(0, min(current.x + current.width, other.x + other.width) - max(current.x, other.x))
                 val yOverlap = max(0, min(current.y + current.height, other.y + other.height) - max(current.y, other.y))
-                
-                // دمج المربعات المتقاربة أو المتداخلة هنامياً لتشكيل فقاعة واحدة متكاملة
+
+                // دمج المربعات المتقاربة أو المتداخلة
                 if (xOverlap > 0 || yOverlap > 0 || (abs(current.y - other.y) < current.height * 0.8f)) {
                     val minX = min(current.x, other.x)
                     val minY = min(current.y, other.y)
                     val maxX = max(current.x + current.width, other.x + other.width)
                     val maxY = max(current.y + current.height, other.y + other.height)
-                    
+
                     current = HybridBox(
                         x = minX,
                         y = minY,
