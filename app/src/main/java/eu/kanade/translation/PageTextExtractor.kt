@@ -1,10 +1,13 @@
 package eu.kanade.translation
 
+import android.content.Context
 import android.graphics.Bitmap
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import eu.kanade.translation.model.PageTranslation
 import eu.kanade.translation.model.TranslationBlock
+import eu.kanade.translation.recognizer.HybridTextRecognizer
+import eu.kanade.translation.recognizer.TextRecognizerLanguage
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
@@ -16,7 +19,7 @@ import logcat.LogPriority
 import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
 
 /** Which OCR engine reads the page. */
-enum class OcrMode { MLKIT, PADDLE }
+enum class OcrMode { MLKIT, PADDLE, HYBRID }
 
 /** A text box found by an OCR engine, in image pixels. */
 class OcrBox(
@@ -39,6 +42,8 @@ class PageTextExtractor(
     private val isRtl: Boolean,
     private val mlKit: (suspend (InputImage) -> Text)?,
     private val paddle: (suspend (InputImage) -> List<OcrBox>)?,
+    private val context: Context? = null,
+    private val recognizerLanguage: TextRecognizerLanguage = TextRecognizerLanguage.JAPANESE,
 ) {
 
     suspend fun extract(bitmap: Bitmap): PageTranslation? {
@@ -47,6 +52,7 @@ class PageTextExtractor(
         val boxes = when (mode) {
             OcrMode.MLKIT -> mlKitBoxes(image)
             OcrMode.PADDLE -> paddleBoxes(image)
+            OcrMode.HYBRID -> hybridBoxes(image, bitmap)
         }
         logcat(LogPriority.ERROR) { ">>> OCR $mode found ${boxes.size} boxes <<<" }
         if (boxes.isEmpty()) return null
@@ -70,7 +76,6 @@ class PageTextExtractor(
         val recognize = mlKit ?: return emptyList()
         return recognize(image).textBlocks.mapNotNull { block ->
             val bounds = block.boundingBox ?: return@mapNotNull null
-            // تم إزالة شرط الحذف القديم (block.text.length <= 1) لكي لا يتم تجاهل الحروف المفردة
             val line = block.lines.firstOrNull()
             val symbol = line?.elements?.firstOrNull()?.symbols?.firstOrNull()?.boundingBox
             OcrBox(
@@ -89,6 +94,38 @@ class PageTextExtractor(
     private suspend fun paddleBoxes(image: InputImage): List<OcrBox> {
         val recognize = paddle ?: return emptyList()
         return recognize(image).filter { it.text.isNotBlank() }
+    }
+
+    private suspend fun hybridBoxes(image: InputImage, bitmap: Bitmap): List<OcrBox> {
+        val ctx = context ?: return mlKitBoxes(image)
+        return try {
+            val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
+            val recognizedTextResult = hybridRecognizer.recognize(image)
+            hybridRecognizer.close()
+
+            // الاعتماد على صناديق ML Kit مع تحديث النص المستخرج بالدقة العالية للمحرك الهجين
+            val mlKitRecognize = mlKit ?: return emptyList()
+            val mlKitResult = mlKitRecognize(image)
+
+            mlKitResult.textBlocks.mapNotNull { block ->
+                val bounds = block.boundingBox ?: return@mapNotNull null
+                val line = block.lines.firstOrNull()
+                val symbol = line?.elements?.firstOrNull()?.symbols?.firstOrNull()?.boundingBox
+                OcrBox(
+                    text = block.text,
+                    x = bounds.left.toFloat(),
+                    y = bounds.top.toFloat(),
+                    width = bounds.width().toFloat(),
+                    height = bounds.height().toFloat(),
+                    symWidth = symbol?.width()?.toFloat() ?: DEFAULT_SYMBOL,
+                    symHeight = symbol?.height()?.toFloat() ?: DEFAULT_SYMBOL,
+                    angle = line?.angle ?: 0f,
+                )
+            }
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e) { "فشل في تنفيذ محرك Hybrid OCR، جاري العودة إلى ML Kit" }
+            mlKitBoxes(image)
+        }
     }
 
     private fun OcrBox.toBlock() = TranslationBlock(
@@ -141,7 +178,6 @@ internal object TextBlockMerger {
 
         if (filteredBlocks.isEmpty()) return mutableListOf()
 
-        // الاعتماد على نسبة الأبعاد حصرياً لتجنب الأخطاء مع التكبير (Upscaling)
         val isWebtoon = imgHeight > (imgWidth * 2.0f)
 
         var currentBlocks = filteredBlocks.toMutableList()
@@ -172,7 +208,6 @@ internal object TextBlockMerger {
 
         val mergedBlocks = currentBlocks.mapNotNull { block ->
             val text = block.text.trim()
-            // السماح بالنصوص التي طولها حرف واحد (text.length < 1 بدلاً من < 2) لعدم حذف الحروف المهمة
             if (text.isBlank() || text.length < 1) {
                 null
             } else {
