@@ -52,6 +52,8 @@ class AiPrefs(private val base: ReaderPreferences, private val mangaId: Long?) {
     val translateLatinFilterEnabled: Preference<Boolean> = own(base.translateLatinFilterEnabled)
     val translateLatinMinLetters: Preference<Int> = own(base.translateLatinMinLetters)
     val translateSkipSameLanguage: Preference<Boolean> = own(base.translateSkipSameLanguage)
+    val translateLatinKeepWords: Preference<String> = own(base.translateLatinKeepWords)
+    val translateLatinKeepCommon: Preference<Boolean> = own(base.translateLatinKeepCommon)
 
     fun forceTranslate(mangaId: Long): Preference<Boolean> = base.mangaForceTranslate(mangaId)
 
@@ -86,7 +88,7 @@ class AiPrefs(private val base: ReaderPreferences, private val mangaId: Long?) {
         translationMaxTokens, translationServerUrl, translatePagesPerRequest, translateMaxChars,
         translateMaxWaitSeconds, translateCollisionPadding, translateFilterWordsEnabled,
         translateFilterWords, translateLatinFilterEnabled, translateLatinMinLetters,
-        translateSkipSameLanguage,
+        translateSkipSameLanguage, translateLatinKeepWords, translateLatinKeepCommon,
     )
 
     /** Puts the settings of this scope back to their defaults. Keys, server addresses and model links are kept. */
@@ -136,6 +138,8 @@ class AiPrefs(private val base: ReaderPreferences, private val mangaId: Long?) {
         reset(translateLatinFilterEnabled)
         reset(translateLatinMinLetters)
         reset(translateSkipSameLanguage)
+        reset(translateLatinKeepWords)
+        reset(translateLatinKeepCommon)
     }
     
     /** Gives this manga a copy of the general settings, so its own settings start from what you have now. */
@@ -175,5 +179,7 @@ class AiPrefs(private val base: ReaderPreferences, private val mangaId: Long?) {
         copy(base.translateLatinFilterEnabled)
         copy(base.translateLatinMinLetters)
         copy(base.translateSkipSameLanguage)
+        copy(base.translateLatinKeepWords)
+        copy(base.translateLatinKeepCommon)
     }
 }
