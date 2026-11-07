@@ -73,6 +73,8 @@ internal fun TranslationSection(prefs: AiPrefs, inReader: Boolean = false) {
     val latinFilter by prefs.translateLatinFilterEnabled.collectAsState()
     if (latinFilter) {
         TSlider("Fewest different letters to keep a bubble", prefs.translateLatinMinLetters, 1..6) { "$it" }
+        CheckboxItem(label = "Keep common short English words (I, is, or, the, you...)", pref = prefs.translateLatinKeepCommon)
+        TextSetting("Words to keep, separated by commas", prefs.translateLatinKeepWords)
     }
     CheckboxItem(label = "Do not translate when the page is already in the target language", pref = prefs.translateSkipSameLanguage)
     val skipSame by prefs.translateSkipSameLanguage.collectAsState()
