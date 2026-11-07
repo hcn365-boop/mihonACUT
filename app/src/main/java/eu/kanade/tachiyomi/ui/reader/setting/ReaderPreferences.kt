@@ -276,6 +276,11 @@ class ReaderPreferences(
     val translateFilterWordsEnabled: Preference<Boolean> = preferenceStore.getBoolean("pref_translate_filter_words_enabled", false)
 
     val translateFilterWords: Preference<String> = preferenceStore.getString("pref_translate_filter_words", "")
+        // Words the "few different letters" filter must keep, such as is, or, i (separated by commas)
+    val translateLatinKeepWords: Preference<String> = preferenceStore.getString("pref_translate_latin_keep_words", "")
+
+    // Also keep the common short English words (I, is, or, the, you, her...)
+    val translateLatinKeepCommon: Preference<Boolean> = preferenceStore.getBoolean("pref_translate_latin_keep_common", true)
 
     // Remove Latin bubbles with fewer different letters than this
     val translateLatinFilterEnabled: Preference<Boolean> = preferenceStore.getBoolean("pref_translate_latin_filter", false)
