@@ -256,7 +256,7 @@ object AiConfig {
                 fromSource = p.translateAutoFromSource.get(),
                 confirmPerPage = p.translateConfirmLanguage.get(),
             ),
-            filter = PageFilterOptions(
+                        filter = PageFilterOptions(
                 words = if (p.translateFilterWordsEnabled.get()) {
                     PageFilterOptions.parseWords(p.translateFilterWords.get())
                 } else {
@@ -264,6 +264,8 @@ object AiConfig {
                 },
                 latinEnabled = p.translateLatinFilterEnabled.get(),
                 latinMinLetters = p.translateLatinMinLetters.get().coerceIn(1, 10),
+                keepWords = PageFilterOptions.parseWords(p.translateLatinKeepWords.get()),
+                keepCommon = p.translateLatinKeepCommon.get(),
                 skipSameLanguage = p.translateSkipSameLanguage.get(),
             ),
         )
