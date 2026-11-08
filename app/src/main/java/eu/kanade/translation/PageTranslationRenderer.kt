@@ -23,6 +23,7 @@ object PageTranslationRenderer {
     private const val MIN_BOX_PX = 6f
     private const val MIN_TEXT_PX = 8
     private const val MAX_TEXT_PX = 200
+    private const val BUBBLE_COLOR = Color.WHITE
 
     /** Blocks whose box is tilted more than this are treated as vertical and drawn straight. */
     private const val VERTICAL_ANGLE = 85f
@@ -53,14 +54,13 @@ object PageTranslationRenderer {
         return output
     }
 
-    /** الخطوة 1: مسح النص الأصلي برسم خلفية نظيفة مطابقة لخلفية الفقاعة مع إضافة هامش بسيط للطمس */
+    /** الخطوة 1: مسح النص الأصلي برسم خلفية نظيفة بلون أبيض ثابت */
     private fun eraseOriginalText(bitmap: Bitmap, canvas: Canvas, block: TranslationBlock, scale: Float) {
         val metrics = calculateBoxCoordinates(bitmap, block, scale)
         if (metrics.width < MIN_BOX_PX || metrics.height < MIN_BOX_PX) return
 
-        val background = sampleBackground(bitmap, metrics.left, metrics.top, metrics.right, metrics.bottom)
         val radius = min(metrics.width, metrics.height) * 0.15f
-        canvas.drawRoundRect(metrics.left, metrics.top, metrics.right, metrics.bottom, radius, radius, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = background })
+        canvas.drawRoundRect(metrics.left, metrics.top, metrics.right, metrics.bottom, radius, radius, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = BUBBLE_COLOR })
     }
 
     /** الخطوة 2: حساب حجم النص المناسب وطباعته داخل الإطار مع الـ Padding الجديد (5%) */
@@ -80,7 +80,7 @@ object PageTranslationRenderer {
 
         val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
             this.typeface = typeface
-            color = Color.BLACK // يمكنك ضبطه حسب رغبتك أو بناءً على إضاءة الخلفية
+            color = Color.BLACK
         }
         
         val layout = fitText(block.translation, paint, width.toInt(), height.toInt())
@@ -139,33 +139,4 @@ object PageTranslationRenderer {
             .setAlignment(Layout.Alignment.ALIGN_CENTER)
             .setIncludePad(false)
             .build()
-
-    private fun sampleBackground(bitmap: Bitmap, left: Float, top: Float, right: Float, bottom: Float): Int {
-        val reds = ArrayList<Int>()
-        val greens = ArrayList<Int>()
-        val blues = ArrayList<Int>()
-
-        fun add(x: Float, y: Float) {
-            val pixel = bitmap.getPixel(x.toInt().coerceIn(0, bitmap.width - 1), y.toInt().coerceIn(0, bitmap.height - 1))
-            reds.add(Color.red(pixel))
-            greens.add(Color.green(pixel))
-            blues.add(Color.blue(pixel))
-        }
-
-        val steps = 16
-        for (i in 0..steps) {
-            val x = left + (right - left) * i / steps
-            val y = top + (bottom - top) * i / steps
-            add(x, top - 2)
-            add(x, bottom + 2)
-            add(left - 2, y)
-            add(right + 2, y)
-        }
-        return Color.rgb(median(reds), median(greens), median(blues))
-    }
-
-    private fun median(values: MutableList<Int>): Int {
-        values.sort()
-        return values[values.size / 2]
-    }
 }
