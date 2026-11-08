@@ -14,10 +14,9 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Draws the translation of a page into its bitmap, so the page can be cached and shown by any viewer
- * with no overlay. It follows a two-step strategy:
+ * Draws the translation of a page into its bitmap using a two-step strategy:
  * 1. Erases/covers all original text boxes across the entire page first.
- * 2. Draws all translated texts over the cleaned boxes second.
+ * 2. Draws all translated texts over the cleaned boxes second, with a nice inner padding.
  */
 object PageTranslationRenderer {
 
@@ -34,12 +33,11 @@ object PageTranslationRenderer {
         val canvas = Canvas(output)
         val scale = output.width / page.imgWidth
 
-        // فلترة الصناديق التي تحتوي على ترجمة فعالة فقط
         val validBlocks = page.blocks.filter { it.translation.isNotBlank() }
         if (validBlocks.isEmpty()) return output
 
         // ==========================================
-        // الخطوة الأولى: طمس ومسح كل الفقاعات في الصفحة أولاً
+        // الخطوة الأولى: مسح وطمس كل الفقاعات في الصفحة أولاً
         // ==========================================
         for (block in validBlocks) {
             eraseOriginalText(output, canvas, block, scale)
@@ -55,36 +53,34 @@ object PageTranslationRenderer {
         return output
     }
 
-    /** الخطوة 1: مسح النص الأصلي برسم خلفية نظيفة مطابقة لخلفية الفقاعة */
+    /** الخطوة 1: مسح النص الأصلي برسم خلفية نظيفة مطابقة لخلفية الفقاعة مع إضافة هامش بسيط للطمس */
     private fun eraseOriginalText(bitmap: Bitmap, canvas: Canvas, block: TranslationBlock, scale: Float) {
-        val (left, top, right, bottom, width, height) = calculateBoxCoordinates(bitmap, block, scale)
-        if (width < MIN_BOX_PX || height < MIN_BOX_PX) return
+        val metrics = calculateBoxCoordinates(bitmap, block, scale)
+        if (metrics.width < MIN_BOX_PX || metrics.height < MIN_BOX_PX) return
 
-        val background = sampleBackground(bitmap, left, top, right, bottom)
-        val radius = min(width, height) * 0.15f
-        canvas.drawRoundRect(left, top, right, bottom, radius, radius, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = background })
+        val background = sampleBackground(bitmap, metrics.left, metrics.top, metrics.right, metrics.bottom)
+        val radius = min(metrics.width, metrics.height) * 0.15f
+        canvas.drawRoundRect(metrics.left, metrics.top, metrics.right, metrics.bottom, radius, radius, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = background })
     }
 
-    /** الخطوة 2: حساب حجم النص المناسب وطباعته داخل الإطار */
+    /** الخطوة 2: حساب حجم النص المناسب وطباعته داخل الإطار مع الـ Padding الجديد (5%) */
     private fun drawTranslatedText(canvas: Canvas, block: TranslationBlock, scale: Float, typeface: Typeface) {
-        // بما أننا لا نحتاج للبيتماپ هنا في الحسابات المباشرة باستثناء الأبعاد، سنأخذ أبعاد الإطار المحسوبة
-        // لضمان التوافق مع العرض، سنعيد حساب الإحداثيات أو تمريرها. سنعيد حسابها بوضوح:
-        val padX = block.symWidth * 2
-        val padY = block.symHeight
-        val left = max((block.x - padX / 2) * scale, 0f)
-        val top = max((block.y - padY / 2) * scale, 0f)
-        val right = left + (block.width + padX) * scale
-        val bottom = top + (block.height + padY) * scale
+        // حساب الـ Padding بنسبة 5% من أبعاد الصندوق لتجنب التصاق النص بالحواف
+        val paddingX = block.width * scale * 0.05f
+        val paddingY = block.height * scale * 0.05f
+
+        val left = max(block.x * scale + paddingX, 0f)
+        val top = max(block.y * scale + paddingY, 0f)
+        val right = max(left + (block.width * scale) - (paddingX * 2), left + 10f)
+        val bottom = max(top + (block.height * scale) - (paddingY * 2), top + 10f)
+        
         val width = right - left
         val height = bottom - top
         if (width < MIN_BOX_PX || height < MIN_BOX_PX) return
 
-        // تحديد لون النص بناءً على لون الخلفية (تم أخذ العينة من وظيفة سابقة، هنا سنبسطها أو نحدد لون النص الافتراضي)
-        // للإبقاء على نفس دقة اختيار لون النص المتبوع بالسابق:
-        // سنحدد اللون بناءً على مركز الصندوق أو افتراضي أسود/أبيض
         val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
             this.typeface = typeface
-            color = Color.BLACK // أو يمكنك الاعتماد على تحليل الـ luminance لو أردت
+            color = Color.BLACK // يمكنك ضبطه حسب رغبتك أو بناءً على إضاءة الخلفية
         }
         
         val layout = fitText(block.translation, paint, width.toInt(), height.toInt())
@@ -107,6 +103,7 @@ object PageTranslationRenderer {
     )
 
     private fun calculateBoxCoordinates(bitmap: Bitmap, block: TranslationBlock, scale: Float): BoxMetrics {
+        // مساحة مسح الخلفية تبقى بحجم الصندوق الأصلي لضمان مسح النص بالكامل
         val padX = block.symWidth * 2
         val padY = block.symHeight
         val left = max((block.x - padX / 2) * scale, 0f)
@@ -171,7 +168,4 @@ object PageTranslationRenderer {
         values.sort()
         return values[values.size / 2]
     }
-
-    private fun luminance(color: Int): Float =
-        (0.299f * Color.red(color) + 0.587f * Color.green(color) + 0.114f * Color.blue(color)) / 255f
 }
