@@ -115,35 +115,74 @@ object PageTranslationRenderer {
         return BoxMetrics(left, top, right, bottom, width, height)
     }
 
-    /** Binary search for the largest font size whose wrapped text fits the box height. */
+    /** 
+     * خوارزمية البحث الثنائي الذكية لحجم الخط مع قياس دقيق لعرض الكلمات 
+     * لضمان ملاءمة النص داخل الارتفاع والعرض دون كسر الكلمات.
+     */
     private fun fitText(text: String, paint: TextPaint, width: Int, height: Int): StaticLayout {
         var low = MIN_TEXT_PX
         var high = max(low, min(height, MAX_TEXT_PX))
         var best = low
+        
+        var bestLayout: StaticLayout? = null
+
         while (low <= high) {
             val mid = (low + high) / 2
             paint.textSize = mid.toFloat()
-            if (layout(text, paint, width).height <= height) {
+            
+            // توزيع النص مسبقاً بناءً على الحجم الحالي للخط وعرض الصندوق
+            val formattedText = formatTextToPreventCutting(text, paint, width)
+            val currentLayout = layout(formattedText, paint, width)
+
+            if (currentLayout.height <= height) {
                 best = mid
+                bestLayout = currentLayout
                 low = mid + 1
             } else {
                 high = mid - 1
             }
         }
+        
+        // ضبط حجم الخط النهائي وإعادة البناء
         paint.textSize = best.toFloat()
-        return layout(text, paint, width)
+        val finalFormattedText = formatTextToPreventCutting(text, paint, width)
+        return layout(finalFormattedText, paint, width)
     }
 
-    /** 
-     * تم تحديث هذه الدالة للاعتماد على الفراغات والمسافات عبر BreakStrategy 
-     * لتقليل تقطيع الكلمات من منتصفها بشكل عشوائي قدر الإمكان.
+    /**
+     * خوارزمية الكسر المسبق للأسطر (Word-Bound Wrapping Algorithm):
+     * تقوم بفحص الكلمات بناءً على الفراغات، وإذا تبين أن الكلمة التالية ستقطع حافة 
+     * عرض الفقاعة، يتم فصلها مسبقاً بنزول سطر تلقائي (\n) لحمايتها من التقطيع.
      */
+    private fun formatTextToPreventCutting(text: String, paint: TextPaint, maxLineWidth: Int): String {
+        if (maxLineWidth <= 0) return text
+        
+        val words = text.split(Regex("(?<=\\s)|(?=\\s)"))
+        val lineBuilder = StringBuilder()
+        val currentLine = StringBuilder()
+
+        for (word in words) {
+            val testLine = currentLine.toString() + word
+            // إذا كان عرض السطر مع الكلمة الجديدة يتجاوز عرض الفقاعة المتاح
+            if (paint.measureText(testLine) > maxLineWidth) {
+                if (currentLine.isNotEmpty()) {
+                    lineBuilder.append(currentLine.toString().trim()).append("\n")
+                    currentLine.clear()
+                }
+            }
+            currentLine.append(word)
+        }
+        if (currentLine.isNotEmpty()) {
+            lineBuilder.append(currentLine.toString().trim())
+        }
+
+        return lineBuilder.toString()
+    }
+
     private fun layout(text: String, paint: TextPaint, width: Int): StaticLayout =
         StaticLayout.Builder.obtain(text, 0, text.length, paint, max(width, 1))
             .setAlignment(Layout.Alignment.ALIGN_CENTER)
             .setIncludePad(false)
-            // التوزيع الذكي للكلمات بناءً على الفراغات والمسافات
             .setBreakStrategy(StaticLayout.BREAK_STRATEGY_BALANCED)
-            .setHyphenationFrequency(StaticLayout.HYPHENATION_FREQUENCY_NORMAL)
             .build()
 }
