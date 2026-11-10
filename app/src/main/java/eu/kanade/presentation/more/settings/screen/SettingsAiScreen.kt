@@ -22,6 +22,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import cafe.adriel.voyager.navigator.currentOrThrow
 import eu.kanade.presentation.components.AppBar
+import eu.kanade.presentation.reader.settings.BatchSettings
 import eu.kanade.presentation.reader.settings.ColorizeSettings
 import eu.kanade.presentation.reader.settings.PerformanceSettings
 import eu.kanade.presentation.reader.settings.TranslationSection
@@ -41,13 +42,14 @@ import tachiyomi.presentation.core.i18n.stringResource
  */
 object SettingsAiScreen : Screen() {
 
-    private val tabs = listOf("Colorize", "Upscale", "Translate", "Performance")
+    private val tabs = listOf("Colorize", "Upscale", "Translate", "Performance", "Batch")
 
     @Composable
     override fun Content() {
         val backPress = LocalBackPress.currentOrThrow
         val context = LocalContext.current
         val prefs = remember { AiPrefs(context.appGraph.readerPreferences, null) }
+        val base = remember { context.appGraph.readerPreferences }
         val topBarState = rememberTopAppBarState()
         var selected by remember { mutableIntStateOf(0) }
         var confirmReset by remember { mutableStateOf(false) }
@@ -73,13 +75,17 @@ object SettingsAiScreen : Screen() {
                             0 -> ColorizeSettings(prefs)
                             1 -> UpscaleSettings(prefs)
                             2 -> TranslationSection(prefs, inReader = false)
+                            3 -> PerformanceSettings(prefs)
+                            4 -> BatchSettings(base)
                             else -> PerformanceSettings(prefs)
                         }
-                        TextButton(
-                            onClick = { confirmReset = true },
-                            modifier = Modifier.padding(horizontal = 8.dp),
-                        ) {
-                            Text("Reset AI settings to defaults")
+                        if (selected != 4) {
+                            TextButton(
+                                onClick = { confirmReset = true },
+                                modifier = Modifier.padding(horizontal = 8.dp),
+                            ) {
+                                Text("Reset AI settings to defaults")
+                            }
                         }
                     }
                 }
