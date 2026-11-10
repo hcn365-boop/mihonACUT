@@ -83,6 +83,8 @@ class AiSnapshot(
     /** Translation settings, or null when translation is off. */
     val translation: TranslationConfig? = null,
     val translateCollisionPadding: Float = 1.3f,
+    /** 1 = colors as they are; more makes the colors of processed pages stronger. */
+    val saturation: Float = 1f,
     /** The manga this snapshot is for, when it is not the one in [MangaTranslationContext] (post-download jobs). */
     val mangaTitle: String? = null,
     val mangaSourceLang: String? = null,
@@ -141,6 +143,7 @@ object AiConfig {
     val aiThreads: Int get() = s.aiThreads
     val translation: TranslationConfig? get() = s.translation
     val translateCollisionPadding: Float get() = s.translateCollisionPadding
+    val saturation: Float get() = s.saturation
 
     /** Short side (pixels) big pages are shrunk to before upscaling, or 0 when this is off. */
     val normalizeSide: Int
@@ -155,13 +158,17 @@ object AiConfig {
 
     val anyEnabled: Boolean
         get() = s.colorizeEnabled || s.upscaleEnabled || s.upscaleNormalizeEnabled ||
-            s.upscaleFinalPassEnabled || s.translation != null
+            s.upscaleFinalPassEnabled || s.translation != null ||
+            (!isPost && usePostProcessed() && PostProcessStore.maybeHasResults)
 
     private var prefsRef: ReaderPreferences? = null
     private var viewerScope: CoroutineScope? = null
     private var onOutputChanged: (() -> Unit)? = null
     private var bindJob: Job? = null
     private var notifyJob: Job? = null
+
+    /** False when the user turned off the use of pages processed in advance (batch processing). */
+    fun usePostProcessed(): Boolean = prefsRef?.postUseProcessed?.get() != false
 
     /** True when the user asked to translate this manga even if the page language is the target language. */
     fun forceTranslate(mangaId: Long): Boolean =
@@ -280,6 +287,7 @@ object AiConfig {
         aiThreads = p.aiThreads.get(),
         translation = buildTranslation(p),
         translateCollisionPadding = p.translateCollisionPadding.get() / 100f,
+        saturation = if (p.colorizeSaturationEnabled.get()) p.colorizeSaturation.get() / 100f else 1f,
         mangaTitle = mangaTitle,
         mangaSourceLang = sourceLang,
         forceTranslate = forceTranslate,
