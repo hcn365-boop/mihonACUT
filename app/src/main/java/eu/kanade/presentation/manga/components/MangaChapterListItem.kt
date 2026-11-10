@@ -27,6 +27,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import eu.kanade.tachiyomi.data.download.model.Download
+import eu.kanade.tachiyomi.ui.reader.colorize.ChapterProcessState
 import me.saket.swipe.SwipeableActionsBox
 import mihon.icons.materialsymbols.MaterialSymbols
 import mihon.icons.materialsymbols.rounded.BookmarkAdd
@@ -62,6 +63,8 @@ fun MangaChapterListItem(
     onLongClick: () -> Unit,
     onClick: () -> Unit,
     onDownloadClick: ((ChapterDownloadAction) -> Unit)?,
+    processStateProvider: () -> ChapterProcessState = { ChapterProcessState.NotProcessed },
+    onProcessClick: ((ChapterProcessAction) -> Unit)? = null,
     onChapterSwipe: (LibraryPreferences.ChapterSwipeAction) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -178,6 +181,16 @@ fun MangaChapterListItem(
                 downloadProgressProvider = downloadProgressProvider,
                 onClick = { onDownloadClick?.invoke(it) },
             )
+
+            // Only a downloaded chapter has pages to process.
+            if (onProcessClick != null && downloadStateProvider() == Download.State.DOWNLOADED) {
+                ChapterProcessIndicator(
+                    enabled = true,
+                    modifier = Modifier.padding(start = 4.dp),
+                    stateProvider = processStateProvider,
+                    onClick = onProcessClick,
+                )
+            }
         }
     }
 }
