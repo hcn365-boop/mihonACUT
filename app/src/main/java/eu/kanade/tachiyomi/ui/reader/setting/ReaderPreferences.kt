@@ -167,6 +167,10 @@ class ReaderPreferences(
     val colorizeEnabled: Preference<Boolean> = preferenceStore.getBoolean("pref_colorize_enabled", false)
 
     val colorizeIntensity: Preference<Int> = preferenceStore.getInt("pref_colorize_intensity", 120)
+        // Boost the color saturation of processed pages
+    val colorizeSaturationEnabled: Preference<Boolean> = preferenceStore.getBoolean("pref_colorize_saturation_enabled", false)
+
+    val colorizeSaturation: Preference<Int> = preferenceStore.getInt("pref_colorize_saturation", 130)
 
     val colorizeAcceleration: Preference<String> = preferenceStore.getString("pref_colorize_accel", "CPU")
 
