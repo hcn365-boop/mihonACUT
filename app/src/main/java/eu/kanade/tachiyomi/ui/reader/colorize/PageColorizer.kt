@@ -144,6 +144,14 @@ object PageColorizer {
         }
     }
 
+    /** Batch processing: the processed page as bytes, or null when the page stays as it is. Throws on failure. */
+    suspend fun processToBytes(context: Context, source: BufferedSource): ByteArray? {
+        val result = run(context.applicationContext, source, display = true) ?: return null
+        return result.readByteArray()
+    }
+
+    fun contentHash(bytes: ByteArray): String = hash(bytes)
+
     /**
      * Background work for a page that is not on screen yet. Never throws.
      * [full]: build the base image (and, if [translate], read the text and queue it for translation).
@@ -166,6 +174,16 @@ object PageColorizer {
         display: Boolean,
         translate: Boolean = true,
     ): BufferedSource? {
+        // Pages processed in advance (batch processing) are used as they are.
+        if (display && !AiConfig.isPost && AiConfig.usePostProcessed() && PostProcessStore.maybeHasResults) {
+            val original = source.peek().readByteArray()
+            when (val found = PostProcessStore.lookup(context, hash(original))) {
+                is PostProcessStore.Found.Processed -> return Buffer().write(found.bytes)
+                PostProcessStore.Found.Keep -> return null
+                null -> Unit
+            }
+        }
+
         val colorModel = modelFile(context)
         val intensity = AiConfig.colorizeIntensity
         val wantColor = AiConfig.colorizeEnabled && intensity > 0f && colorModel.length() > 0
@@ -310,10 +328,15 @@ object PageColorizer {
                         page = refined
                     }
                     
-                    // تطبيق فلتر التشبع الآمن لرفع حيوية الألوان
-                    val saturated = applySaturation(page, 1.3f)
-                    if (saturated !== page && page !== working) page.recycle()
-                    saturated
+                    // Optional: stronger colors (applied only if colorized and saturation != 1f)
+                    val saturation = AiConfig.saturation
+                    if (color && saturation != 1f) {
+                        val saturated = applySaturation(page, saturation)
+                        if (saturated !== page && page !== working) page.recycle()
+                        saturated
+                    } else {
+                        page
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -509,7 +532,7 @@ object PageColorizer {
         val color = if (intensity < 0f) "n" else (intensity * 100).roundToInt().toString()
         val upscaleStamp = if (upscale) "${upscaleSignature()}_${AiConfig.upscaleMaxOutputPixels / 1_000_000}" else "n"
         val finalPassStamp = "_f${if (AiConfig.upscaleFinalPassEnabled) "1" else "0"}${if (AiConfig.upscaleFinalPassKeepSize) "k" else "g"}${AiConfig.upscaleFinalPassMaxPixels / 1_000_000}"
-        return "${imageHash}_c${color}${if (sam) "s" else ""}_${colorModel.length()}_u${upscaleStamp}_s$shrinkSide$finalPassStamp"
+        return "${imageHash}_c${color}${if (sam) "s" else ""}_${colorModel.length()}_u${upscaleStamp}_s$shrinkSide$finalPassStamp_t${(AiConfig.saturation * 100).roundToInt()}"
     }
 
     private fun cacheFile(context: Context, name: String): File = File(File(context.cacheDir, PAGE_CACHE_DIR), name)
@@ -521,6 +544,7 @@ object PageColorizer {
     }
 
     private fun saveCachedPage(file: File, data: ByteArray) {
+        if (AiConfig.isPost) return
         val dir = file.parentFile ?: return
         dir.mkdirs()
         val temp = File(dir, "${file.name}.${System.nanoTime()}.tmp")
