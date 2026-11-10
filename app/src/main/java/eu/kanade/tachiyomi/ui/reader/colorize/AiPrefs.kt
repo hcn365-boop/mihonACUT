@@ -30,6 +30,8 @@ class AiPrefs(
     val colorizeMaxMegapixels: Preference<Int> = own(base.colorizeMaxMegapixels)
     val colorizePreloadCount: Preference<Int> = own(base.colorizePreloadCount)
     val colorizeUseSam: Preference<Boolean> = own(base.colorizeUseSam)
+    val colorizeSaturationEnabled: Preference<Boolean> = own(base.colorizeSaturationEnabled)
+    val colorizeSaturation: Preference<Int> = own(base.colorizeSaturation)
 
     val upscaleEnabled: Preference<Boolean> = own(base.upscaleEnabled)
     val upscaleRestoreModel: Preference<String> = own(base.upscaleRestoreModel)
@@ -102,6 +104,7 @@ class AiPrefs(
     /** Settings that change how a page looks: a change reloads the pages being read. */
     val appearancePrefs: List<Preference<*>> = listOf(
         colorizeEnabled, colorizeUseSam, colorizeIntensity, colorizeMaxMegapixels,
+        colorizeSaturationEnabled, colorizeSaturation,
         upscaleEnabled, upscaleRestoreModel, upscaleMainModel, upscaleMaxMegapixels, upscaleMaxOutputMegapixels,
         upscaleNormalizeEnabled, upscaleNormalizeShortSide,
         upscaleFinalPassEnabled, upscaleFinalPassKeepSize, upscaleFinalPassMaxMegapixels,
@@ -121,6 +124,8 @@ class AiPrefs(
         reset(colorizeMaxMegapixels)
         reset(colorizePreloadCount)
         reset(colorizeUseSam)
+        reset(colorizeSaturationEnabled)
+        reset(colorizeSaturation)
         reset(upscaleEnabled)
         reset(upscaleRestoreModel)
         reset(upscaleMainModel)
@@ -173,6 +178,8 @@ class AiPrefs(
         copy(base.colorizeMaxMegapixels)
         copy(base.colorizePreloadCount)
         copy(base.colorizeUseSam)
+        copy(base.colorizeSaturationEnabled)
+        copy(base.colorizeSaturation)
         copy(base.upscaleEnabled)
         copy(base.upscaleRestoreModel)
         copy(base.upscaleMainModel)
