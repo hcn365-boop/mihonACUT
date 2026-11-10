@@ -4,16 +4,24 @@ import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
 import tachiyomi.core.common.preference.Preference
 
 /**
- * The AI settings, either the general ones ([mangaId] null) or the copy that belongs to one manga.
+ * The AI settings, in one of three sets: the general ones, the copy that belongs to one manga ([mangaId]),
+ * or the copy used for post-download processing ([scope] "_post").
  *
  * Settings that describe how a manga should look (colorize, upscale, translation, language...) can be
  * kept per manga. Settings that belong to the phone or to a service account (memory, cache, threads,
  * hardware, model links, API key, server, request limits) are always the general ones.
  */
-class AiPrefs(private val base: ReaderPreferences, private val mangaId: Long?) {
+class AiPrefs(
+    private val base: ReaderPreferences,
+    private val mangaId: Long?,
+    scope: String? = null,
+) {
+
+    /** Added to the key of every setting that can be kept apart; null for the general settings. */
+    private val suffix: String? = scope ?: mangaId?.let { "_m$it" }
 
     private fun <T> own(pref: Preference<T>): Preference<T> =
-        if (mangaId != null) base.scoped(pref, mangaId) else pref
+        if (suffix != null) base.scoped(pref, suffix) else pref
 
     // region Can belong to one manga
 
@@ -91,6 +99,20 @@ class AiPrefs(private val base: ReaderPreferences, private val mangaId: Long?) {
         translateSkipSameLanguage, translateLatinKeepWords, translateLatinKeepCommon,
     )
 
+    /** Settings that change how a page looks: a change reloads the pages being read. */
+    val appearancePrefs: List<Preference<*>> = listOf(
+        colorizeEnabled, colorizeUseSam, colorizeIntensity, colorizeMaxMegapixels,
+        upscaleEnabled, upscaleRestoreModel, upscaleMainModel, upscaleMaxMegapixels, upscaleMaxOutputMegapixels,
+        upscaleNormalizeEnabled, upscaleNormalizeShortSide,
+        upscaleFinalPassEnabled, upscaleFinalPassKeepSize, upscaleFinalPassMaxMegapixels,
+    ) + translationPrefs
+
+    /** Settings of the phone and of the queues: a change does not reload pages. */
+    val runtimePrefs: List<Preference<*>> = listOf(
+        aiMemoryBudgetMb, aiCacheSizeMb, pagePreloadCount, colorizePreloadCount, upscalePreloadCount,
+        colorizeAcceleration, upscaleAcceleration, aiThreads,
+    )
+
     /** Puts the settings of this scope back to their defaults. Keys, server addresses and model links are kept. */
     fun resetToDefaults() {
         fun <T> reset(pref: Preference<T>) = pref.set(pref.defaultValue())
@@ -142,10 +164,10 @@ class AiPrefs(private val base: ReaderPreferences, private val mangaId: Long?) {
         reset(translateLatinKeepCommon)
     }
     
-    /** Gives this manga a copy of the general settings, so its own settings start from what you have now. */
+    /** Gives this set a copy of the general settings, so it starts from what you have now. */
     fun copyGeneralSettings() {
-        val id = mangaId ?: return
-        fun <T> copy(general: Preference<T>) = base.scoped(general, id).set(general.get())
+        val key = suffix ?: return
+        fun <T> copy(general: Preference<T>) = base.scoped(general, key).set(general.get())
         copy(base.colorizeEnabled)
         copy(base.colorizeIntensity)
         copy(base.colorizeMaxMegapixels)
