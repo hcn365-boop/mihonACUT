@@ -115,19 +115,15 @@ object PageTranslationRenderer {
         return BoxMetrics(left, top, right, bottom, width, height)
     }
 
-    /** Binary search for the largest font size whose wrapped text fits both width and height constraints. */
+    /** Binary search for the largest font size whose wrapped text fits the box height. */
     private fun fitText(text: String, paint: TextPaint, width: Int, height: Int): StaticLayout {
         var low = MIN_TEXT_PX
         var high = max(low, min(height, MAX_TEXT_PX))
         var best = low
-        
         while (low <= high) {
             val mid = (low + high) / 2
             paint.textSize = mid.toFloat()
-            val layout = layout(text, paint, width)
-            
-            // التأكد من أن النص يتوافق مع الارتفاع المتاح داخل الصندوق
-            if (layout.height <= height) {
+            if (layout(text, paint, width).height <= height) {
                 best = mid
                 low = mid + 1
             } else {
@@ -138,11 +134,16 @@ object PageTranslationRenderer {
         return layout(text, paint, width)
     }
 
+    /** 
+     * تم تحديث هذه الدالة للاعتماد على الفراغات والمسافات عبر BreakStrategy 
+     * لتقليل تقطيع الكلمات من منتصفها بشكل عشوائي قدر الإمكان.
+     */
     private fun layout(text: String, paint: TextPaint, width: Int): StaticLayout =
         StaticLayout.Builder.obtain(text, 0, text.length, paint, max(width, 1))
             .setAlignment(Layout.Alignment.ALIGN_CENTER)
             .setIncludePad(false)
-            .setBreakStrategy(StaticLayout.BREAK_STRATEGY_BALANCED) // توزيع متوازن للأسطر لتفادي تقطيع الكلمات المزعج
-            .setHyphenationFrequency(StaticLayout.HYPHENATION_FREQUENCY_NONE)
+            // التوزيع الذكي للكلمات بناءً على الفراغات والمسافات
+            .setBreakStrategy(StaticLayout.BREAK_STRATEGY_BALANCED)
+            .setHyphenationFrequency(StaticLayout.HYPHENATION_FREQUENCY_NORMAL)
             .build()
 }
