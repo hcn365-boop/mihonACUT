@@ -115,15 +115,19 @@ object PageTranslationRenderer {
         return BoxMetrics(left, top, right, bottom, width, height)
     }
 
-    /** Binary search for the largest font size whose wrapped text fits the box height. */
+    /** Binary search for the largest font size whose wrapped text fits both width and height constraints. */
     private fun fitText(text: String, paint: TextPaint, width: Int, height: Int): StaticLayout {
         var low = MIN_TEXT_PX
         var high = max(low, min(height, MAX_TEXT_PX))
         var best = low
+        
         while (low <= high) {
             val mid = (low + high) / 2
             paint.textSize = mid.toFloat()
-            if (layout(text, paint, width).height <= height) {
+            val layout = layout(text, paint, width)
+            
+            // التأكد من أن النص يتوافق مع الارتفاع المتاح داخل الصندوق
+            if (layout.height <= height) {
                 best = mid
                 low = mid + 1
             } else {
@@ -138,5 +142,7 @@ object PageTranslationRenderer {
         StaticLayout.Builder.obtain(text, 0, text.length, paint, max(width, 1))
             .setAlignment(Layout.Alignment.ALIGN_CENTER)
             .setIncludePad(false)
+            .setBreakStrategy(StaticLayout.BREAK_STRATEGY_BALANCED) // توزيع متوازن للأسطر لتفادي تقطيع الكلمات المزعج
+            .setHyphenationFrequency(StaticLayout.HYPHENATION_FREQUENCY_NONE)
             .build()
 }
