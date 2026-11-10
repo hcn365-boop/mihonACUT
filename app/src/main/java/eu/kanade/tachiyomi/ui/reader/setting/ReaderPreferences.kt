@@ -214,6 +214,11 @@ class ReaderPreferences(
     val upscaleFinalPassMaxMegapixels: Preference<Int> = preferenceStore.getInt("pref_upscale_final_max_mp", 4)
     // endregion
 
+    // Batch processing of downloaded chapters
+    val postProcessAuto: Preference<Boolean> = preferenceStore.getBoolean("pref_post_process_auto", false)
+
+    val postUseProcessed: Preference<Boolean> = preferenceStore.getBoolean("pref_post_use_processed", true)
+
     // region Translation
     
     val translateCollisionPadding: Preference<Int> = preferenceStore.getInt("pref_translate_collision_padding", 130)
@@ -232,9 +237,10 @@ class ReaderPreferences(
     fun mangaOverride(mangaId: Long): Preference<Boolean> =
         preferenceStore.getBoolean("pref_translate_manga_override_$mangaId", false)
 
+    /** The same setting kept apart under a suffix: for one manga ("_m12") or for batch processing ("_post"). */
     @Suppress("UNCHECKED_CAST")
-    fun <T> scoped(pref: Preference<T>, mangaId: Long): Preference<T> {
-        val key = "${pref.key()}_m$mangaId"
+    fun <T> scoped(pref: Preference<T>, suffix: String): Preference<T> {
+        val key = "${pref.key()}$suffix"
         return when (val default = pref.defaultValue()) {
             is Boolean -> preferenceStore.getBoolean(key, default)
             is Int -> preferenceStore.getInt(key, default)
@@ -242,6 +248,8 @@ class ReaderPreferences(
             else -> error("Unsupported setting type for $key")
         } as Preference<T>
     }
+
+    fun <T> scoped(pref: Preference<T>, mangaId: Long): Preference<T> = scoped(pref, "_m$mangaId")
 
     val translateEnabled: Preference<Boolean> = preferenceStore.getBoolean("pref_translate_enabled", false)
 
