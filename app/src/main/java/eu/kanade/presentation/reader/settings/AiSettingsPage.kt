@@ -117,6 +117,11 @@ internal fun ColorizeSettings(prefs: AiPrefs) {
     CheckboxItem(label = "Colorize pages (Manga Light V6)", pref = prefs.colorizeEnabled)
     if (enabled) {
         IntSlider("Color intensity", prefs.colorizeIntensity, 0..120) { "$it%" }
+        val saturationOn by prefs.colorizeSaturationEnabled.collectAsState()
+        CheckboxItem(label = "Boost color saturation of processed pages", pref = prefs.colorizeSaturationEnabled)
+        if (saturationOn) {
+            IntSlider("Saturation", prefs.colorizeSaturation, 100..200) { "$it%" }
+        }
     }
     
     // خيار تفعيل دليلي الـ SAM مباشرة من الملف المضمن في مجلد الـ Assets
