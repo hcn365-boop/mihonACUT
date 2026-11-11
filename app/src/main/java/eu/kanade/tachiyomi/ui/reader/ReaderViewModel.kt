@@ -332,6 +332,7 @@ class ReaderViewModel(
                 val source = sourceManager.getOrStub(manga.source)
                 MangaTranslationContext.update(manga.id, manga.title, source.lang)
                 AiConfig.onMangaChanged()
+                PostProcessStore.refresh(context)
                 incognitoMode = getIncognitoState.await(manga.source)
                 mutableState.update { it.copy(manga = manga, source = source) }
                 if (chapterId == -1L) chapterId = initialChapterId
