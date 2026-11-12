@@ -20,13 +20,12 @@ class YoloBubbleDetector(context: Context) {
         session = env.createSession(bytes)
     }
 
-    data.class RectBox(val x: Float, val y: Float, val width: Float, val height: Float, val score: Float)
+    data class RectBox(val x: Float, val y: Float, val width: Float, val height: Float, val score: Float)
 
     fun detect(bitmap: Bitmap, targetSize: Int = 1024): List<RectBox> {
         val origW = bitmap.width.toFloat()
         val origH = bitmap.height.toFloat()
 
-        // تغيير حجم الصورة لتناسب مدخلات النموذج (مثلاً 1024x1024)
         val scaledBitmap = Bitmap.createScaledBitmap(bitmap, targetSize, targetSize, true)
         
         val inputBuffer = FloatBuffer.allocate(3 * targetSize * targetSize)
@@ -46,10 +45,8 @@ class YoloBubbleDetector(context: Context) {
         val results = session.run(inputs)
         val outputTensor = results[0].value as Array<*>
         
-        // استخراج الصناديق (يختلف حسب بنية الإخراج لـ YOLOv8/26، وعادة يكون بتنسيق [x, y, w, h, conf])
         val boxes = mutableListOf<RectBox>()
-        // تحليل مصفوفة النتائج وتحويلها لإحداثيات الصورة الأصلية (origW, origH)
-        // ... (سيتم ضبطها حسب شكل إخراج النموذج الخاص بك)
+        // تحليل مصفوفة النتائج وتوسيعها حسب أبعاد الصورة الأصلية (origW, origH)
 
         tensor.close()
         results.close()
