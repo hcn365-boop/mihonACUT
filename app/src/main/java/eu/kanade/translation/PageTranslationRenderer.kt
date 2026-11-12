@@ -65,9 +65,9 @@ object PageTranslationRenderer {
 
     /** الخطوة 2: حساب حجم النص المناسب وطباعته داخل الإطار مع الـ Padding الجديد (5%) */
     private fun drawTranslatedText(canvas: Canvas, block: TranslationBlock, scale: Float, typeface: Typeface) {
-        // حساب الـ Padding بنسبة 5% من أبعاد الصندوق لتجنب التصاق النص بالحواف
-        val paddingX = block.width * scale * 0.05f
-        val paddingY = block.height * scale * 0.05f
+        // حساب الـ Padding بنسبة 1% من أبعاد الصندوق لتجنب التصاق النص بالحواف
+        val paddingX = block.width * scale * 0.01f
+        val paddingY = block.height * scale * 0.01f
 
         val left = max(block.x * scale + paddingX, 0f)
         val top = max(block.y * scale + paddingY, 0f)
