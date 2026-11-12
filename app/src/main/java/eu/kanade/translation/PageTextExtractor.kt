@@ -40,109 +40,86 @@ class PageTextExtractor(
 ) {
 
     suspend fun extract(bitmap: Bitmap): PageTranslation? {
-        val image = InputImage.fromBitmap(bitmap, 0)
-        logcat(LogPriority.ERROR) { ">>> OCR branch selected: mode=$mode <<<" }
+        logcat(LogPriority.ERROR) { ">>> OCR branch selected: mode=$mode (Strict YOLO Mode) <<<" }
 
-        val paddingFactor = AiConfig.translateCollisionPadding
         val page = PageTranslation(imgWidth = bitmap.width.toFloat(), imgHeight = bitmap.height.toFloat())
-        val isHybridMode = (mode == OcrMode.HYBRID)
+        val blocks = mutableListOf<TranslationBlock>()
 
-        // 1. الكشف عن الفقاعات باستخدام نموذج YOLO إذا كان التلوين مفعلاً والمحيط متاحاً
+        // 1. استخراج فقاعات YOLO أولاً
         var yoloBubbles: List<YoloBubbleDetector.RectBox> = emptyList()
-        if (context != null && AiConfig.colorizeEnabled) {
+        if (context != null) {
             try {
                 val detector = YoloBubbleDetector(context)
                 yoloBubbles = detector.detect(bitmap)
                 detector.close()
             } catch (e: Exception) {
-                logcat(LogPriority.ERROR, e) { "YOLO Bubble Detection failed, falling back to standard merger" }
+                logcat(LogPriority.ERROR, e) { "YOLO Bubble Detection failed" }
             }
         }
 
-        when (mode) {
-            OcrMode.MLKIT -> {
-                val boxes = mlKitBoxes(image)
-                if (boxes.isEmpty()) return null
-                page.blocks = TextBlockMerger.merge(
-                    blocks = boxes.map { it.toBlock() },
-                    imgWidth = bitmap.width.toFloat(),
-                    imgHeight = bitmap.height.toFloat(),
-                    collisionPaddingFactor = paddingFactor,
-                    isHybrid = isHybridMode,
-                    yoloBubbles = yoloBubbles
-                )
-            }
-            OcrMode.PADDLE -> {
-                val boxes = paddleBoxes(image)
-                if (boxes.isEmpty()) return null
-                page.blocks = TextBlockMerger.merge(
-                    blocks = boxes.map { it.toBlock() },
-                    imgWidth = bitmap.width.toFloat(),
-                    imgHeight = bitmap.height.toFloat(),
-                    collisionPaddingFactor = paddingFactor,
-                    isHybrid = isHybridMode,
-                    yoloBubbles = yoloBubbles
-                )
-            }
-            OcrMode.HYBRID -> {
-                val ctx = context
-                if (ctx != null) {
-                    try {
-                        val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
-                        val hybridResults = hybridRecognizer.recognizeWithBoxes(image)
-                        hybridRecognizer.close()
+        // إذا لم يكتشف YOLO أي فقاعات، نتوقف (لأننا نراقب أداء YOLO حصراً)
+        if (yoloBubbles.isEmpty()) {
+            logcat(LogPriority.ERROR) { "YOLO detected 0 bubbles on this page!" }
+            return null
+        }
 
-                        if (hybridResults.isEmpty()) return null
+        // 2. تشغيل الـ OCR حصراً داخل حدود كل فقاعة اكتشفها YOLO
+        for (bubble in yoloBubbles) {
+            val left = bubble.x.toInt().coerceIn(0, bitmap.width - 1)
+            val top = bubble.y.toInt().coerceIn(0, bitmap.height - 1)
+            val width = bubble.width.toInt().coerceIn(1, bitmap.width - left)
+            val height = bubble.height.toInt().coerceIn(1, bitmap.height - top)
 
-                        val rawTranslationBlocks = hybridResults.map { result ->
-                            TranslationBlock(
-                                text = result.text,
-                                width = result.box.width.toFloat(),
-                                height = result.box.height.toFloat(),
-                                symWidth = DEFAULT_SYMBOL,
-                                symHeight = DEFAULT_SYMBOL,
-                                angle = result.box.angle,
-                                x = result.box.x.toFloat(),
-                                y = result.box.y.toFloat()
-                            )
-                        }
+            // قص صورة الفقاعة المكتشفة فقط
+            val croppedBitmap = Bitmap.createBitmap(bitmap, left, top, width, height)
+            val croppedInput = InputImage.fromBitmap(croppedBitmap, 0)
 
-                        page.blocks = TextBlockMerger.merge(
-                            blocks = rawTranslationBlocks,
-                            imgWidth = bitmap.width.toFloat(),
-                            imgHeight = bitmap.height.toFloat(),
-                            collisionPaddingFactor = paddingFactor,
-                            isHybrid = isHybridMode,
-                            yoloBubbles = yoloBubbles
-                        )
-                    } catch (e: Exception) {
-                        logcat(LogPriority.ERROR, e) { "Hybrid processing failed, falling back to ML Kit" }
-                        val boxes = mlKitBoxes(image)
-                        if (boxes.isEmpty()) return null
-                        page.blocks = TextBlockMerger.merge(
-                            blocks = boxes.map { it.toBlock() },
-                            imgWidth = bitmap.width.toFloat(),
-                            imgHeight = bitmap.height.toFloat(),
-                            collisionPaddingFactor = paddingFactor,
-                            isHybrid = isHybridMode,
-                            yoloBubbles = yoloBubbles
-                        )
+            try {
+                val recognizedText = when (mode) {
+                    OcrMode.MLKIT -> {
+                        mlKit?.invoke(croppedInput)?.text?.trim() ?: ""
                     }
-                } else {
-                    val boxes = mlKitBoxes(image)
-                    if (boxes.isEmpty()) return null
-                    page.blocks = TextBlockMerger.merge(
-                        blocks = boxes.map { it.toBlock() },
-                        imgWidth = bitmap.width.toFloat(),
-                        imgHeight = bitmap.height.toFloat(),
-                        collisionPaddingFactor = paddingFactor,
-                        isHybrid = isHybridMode,
-                        yoloBubbles = yoloBubbles
+                    OcrMode.PADDLE -> {
+                        paddle?.invoke(croppedInput)?.joinToString(" ") { it.text }?.trim() ?: ""
+                    }
+                    OcrMode.HYBRID -> {
+                        val ctx = context
+                        if (ctx != null) {
+                            val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
+                            val results = hybridRecognizer.recognizeWithBoxes(croppedInput)
+                            hybridRecognizer.close()
+                            results.joinToString(" ") { it.text }.trim()
+                        } else {
+                            mlKit?.invoke(croppedInput)?.text?.trim() ?: ""
+                        }
+                    }
+                }
+
+                // إذا وجدنا نصاً داخل فقاعة YOLO، نعتمد إحداثيات الفقاعة كصندوق نهائي للترجمة
+                if (recognizedText.isNotBlank()) {
+                    blocks.add(
+                        TranslationBlock(
+                            text = recognizedText,
+                            width = bubble.width,
+                            height = bubble.height,
+                            symWidth = DEFAULT_SYMBOL,
+                            symHeight = DEFAULT_SYMBOL,
+                            angle = 0f,
+                            x = bubble.x,
+                            y = bubble.y
+                        )
                     )
+                }
+            } catch (e: Exception) {
+                logcat(LogPriority.ERROR, e) { "OCR failed inside YOLO bubble crop" }
+            } finally {
+                if (croppedBitmap !== bitmap) {
+                    croppedBitmap.recycle()
                 }
             }
         }
 
+        page.blocks = blocks
         return page.takeIf { it.blocks.isNotEmpty() }
     }
 
@@ -199,8 +176,7 @@ internal object TextBlockMerger {
         imgWidth: Float, 
         imgHeight: Float, 
         collisionPaddingFactor: Float = 1.3f,
-        isHybrid: Boolean = false,
-        yoloBubbles: List<YoloBubbleDetector.RectBox> = emptyList()
+        isHybrid: Boolean = false
     ): MutableList<TranslationBlock> {
         if (blocks.isEmpty()) return mutableListOf()
 
@@ -266,10 +242,10 @@ internal object TextBlockMerger {
                 newWidth = block.width * finalScale
             }
 
-            var newX = block.x - (newWidth - block.width) / 2f
-            var newY = block.y - (newHeight - block.height) / 2f
+            val newX = block.x - (newWidth - block.width) / 2f
+            val newY = block.y - (newHeight - block.height) / 2f
 
-            var scaledBlock = block.copy(
+            block.copy(
                 text = cleanedText,
                 translation = cleanedTranslation,
                 width = newWidth.coerceAtMost(imgWidth),
@@ -277,52 +253,9 @@ internal object TextBlockMerger {
                 x = newX.coerceIn(0f, imgWidth - newWidth.coerceAtMost(imgWidth)),
                 y = newY.coerceIn(0f, imgHeight - newHeight.coerceAtMost(imgHeight)),
             )
-
-            // دمج إحداثيات YOLO إذا كان التلوين مفعلاً وتم رصد فقاعة تحتضن النص
-            if (AiConfig.colorizeEnabled && yoloBubbles.isNotEmpty()) {
-                scaledBlock = applyYoloBubbleBounds(scaledBlock, yoloBubbles)
-            }
-
-            scaledBlock
         }.toMutableList()
 
         return expandedBlocks
-    }
-
-    /**
-     * مطابقة وتوسيع صندوق النص ليطابق فقاعة YOLO التي تتقاطع معه أو تحتويه
-     */
-    private fun applyYoloBubbleBounds(block: TranslationBlock, bubbles: List<YoloBubbleDetector.RectBox>): TranslationBlock {
-        val blockCenterX = block.x + block.width / 2f
-        val blockCenterY = block.y + block.height / 2f
-
-        // البحث عن أقرب فقاعة YOLO يحتوي مركزها أو تتقاطع بقوة مع صندوق النص
-        val matchingBubble = bubbles.find { bubble ->
-            blockCenterX >= bubble.x && blockCenterX <= (bubble.x + bubble.width) &&
-            blockCenterY >= bubble.y && blockCenterY <= (bubble.y + bubble.height)
-        } ?: bubbles.minByOrNull { bubble ->
-            val bCenterX = bubble.x + bubble.width / 2f
-            val bCenterY = bubble.y + bubble.height / 2f
-            abs(blockCenterX - bCenterX) + abs(blockCenterY - bCenterY)
-        }
-
-        // إذا وجدنا فقاعة قريبة ومناسبة، نتبنى إحداثياتها لتغطية الفقاعة بالكامل
-        if (matchingBubble != null) {
-            val overlapX = min(block.x + block.width, matchingBubble.x + matchingBubble.width) - max(block.x, matchingBubble.x)
-            val overlapY = min(block.y + block.height, matchingBubble.y + matchingBubble.height) - max(block.y, matchingBubble.y)
-            
-            // إذا كان هناك تقاطع أو أن الفقاعة تحيط بالنص
-            if (overlapX > 0 || overlapY > 0 || matchingBubble.score > 0.5f) {
-                return block.copy(
-                    x = matchingBubble.x,
-                    y = matchingBubble.y,
-                    width = matchingBubble.width,
-                    height = matchingBubble.height
-                )
-            }
-        }
-
-        return block
     }
 
     private fun shouldMergeTextBlock(r1: TranslationBlock, r2: TranslationBlock, isHybrid: Boolean): Boolean {
