@@ -46,7 +46,7 @@ class MlKitTextRecognizer(override val language: TextRecognizerLanguage) : TextR
 
     override fun recognize(image: InputImage): String {
         Log.d(TAG, "Starting recognize(image) method")
-        val mlKitResult = process(image)
+        val mlKitResult = process(image) ?: return ""
 
         val rawBlocks = mutableListOf<MlKitTextBlock>()
         for (block in mlKitResult.textBlocks) {
@@ -68,8 +68,16 @@ class MlKitTextRecognizer(override val language: TextRecognizerLanguage) : TextR
         return finalBlocks.joinToString("\n") { it.text }
     }
 
-    fun process(image: InputImage): Text {
+    fun process(image: InputImage): Text? {
         Log.d(TAG, "Starting process(image) method")
+        
+        // === تجاوز بصمت وبأمان إذا كانت الأبعاد أقل من 32 بكسل لتفادي الانهيار ===
+        if (image.width < 32 || image.height < 32) {
+            Log.w(TAG, "Skipping image processing due to small dimensions: ${image.width}x${image.height}")
+            return null
+        }
+        // ===================================================================
+
         return try {
             val result = Tasks.await<Text>(recognizer.process(image))
             Log.d(TAG, "Text processing completed successfully")
@@ -104,7 +112,7 @@ class MlKitTextRecognizer(override val language: TextRecognizerLanguage) : TextR
             result
         } catch (e: Exception) {
             Log.e(TAG, "Error during text processing: ${e.message}", e)
-            throw e
+            null
         }
     }
 
