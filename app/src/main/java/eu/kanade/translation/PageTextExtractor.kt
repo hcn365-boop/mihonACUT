@@ -2,6 +2,7 @@ package eu.kanade.translation
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Color
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import eu.kanade.translation.model.PageTranslation
@@ -44,8 +45,6 @@ class PageTextExtractor(
 
         val paddingFactor = AiConfig.translateCollisionPadding
         val page = PageTranslation(imgWidth = bitmap.width.toFloat(), imgHeight = bitmap.height.toFloat())
-
-        // تحديد ما إذا كان الوضع الحالي هو Hybrid لزيادة معامل السماحية للدمج
         val isHybridMode = (mode == OcrMode.HYBRID)
 
         when (mode) {
@@ -57,7 +56,8 @@ class PageTextExtractor(
                     imgWidth = bitmap.width.toFloat(),
                     imgHeight = bitmap.height.toFloat(),
                     collisionPaddingFactor = paddingFactor,
-                    isHybrid = isHybridMode
+                    isHybrid = isHybridMode,
+                    bitmap = bitmap
                 )
             }
             OcrMode.PADDLE -> {
@@ -68,7 +68,8 @@ class PageTextExtractor(
                     imgWidth = bitmap.width.toFloat(),
                     imgHeight = bitmap.height.toFloat(),
                     collisionPaddingFactor = paddingFactor,
-                    isHybrid = isHybridMode
+                    isHybrid = isHybridMode,
+                    bitmap = bitmap
                 )
             }
             OcrMode.HYBRID -> {
@@ -99,7 +100,8 @@ class PageTextExtractor(
                             imgWidth = bitmap.width.toFloat(),
                             imgHeight = bitmap.height.toFloat(),
                             collisionPaddingFactor = paddingFactor,
-                            isHybrid = isHybridMode
+                            isHybrid = isHybridMode,
+                            bitmap = bitmap
                         )
                     } catch (e: Exception) {
                         logcat(LogPriority.ERROR, e) { "Hybrid processing failed, falling back to ML Kit" }
@@ -110,7 +112,8 @@ class PageTextExtractor(
                             imgWidth = bitmap.width.toFloat(),
                             imgHeight = bitmap.height.toFloat(),
                             collisionPaddingFactor = paddingFactor,
-                            isHybrid = isHybridMode
+                            isHybrid = isHybridMode,
+                            bitmap = bitmap
                         )
                     }
                 } else {
@@ -121,7 +124,8 @@ class PageTextExtractor(
                         imgWidth = bitmap.width.toFloat(),
                         imgHeight = bitmap.height.toFloat(),
                         collisionPaddingFactor = paddingFactor,
-                        isHybrid = isHybridMode
+                        isHybrid = isHybridMode,
+                        bitmap = bitmap
                     )
                 }
             }
@@ -183,7 +187,8 @@ internal object TextBlockMerger {
         imgWidth: Float, 
         imgHeight: Float, 
         collisionPaddingFactor: Float = 1.3f,
-        isHybrid: Boolean = false
+        isHybrid: Boolean = false,
+        bitmap: Bitmap? = null
     ): MutableList<TranslationBlock> {
         if (blocks.isEmpty()) return mutableListOf()
 
@@ -214,7 +219,6 @@ internal object TextBlockMerger {
 
                 for (j in i + 1 until currentBlocks.size) {
                     if (visited[j]) continue
-                    // تمرير مؤشر الـ Hybrid لدالة الفحص والدمج
                     if (shouldMergeTextBlock(currentMerged, currentBlocks[j], isHybrid)) {
                         currentMerged = mergeTextBlock(currentMerged, currentBlocks[j], isWebtoon)
                         visited[j] = true
@@ -253,7 +257,7 @@ internal object TextBlockMerger {
             val newX = block.x - (newWidth - block.width) / 2f
             val newY = block.y - (newHeight - block.height) / 2f
 
-            block.copy(
+            val scaledBlock = block.copy(
                 text = cleanedText,
                 translation = cleanedTranslation,
                 width = newWidth.coerceAtMost(imgWidth),
@@ -261,10 +265,90 @@ internal object TextBlockMerger {
                 x = newX.coerceIn(0f, imgWidth - newWidth.coerceAtMost(imgWidth)),
                 y = newY.coerceIn(0f, imgHeight - newHeight.coerceAtMost(imgHeight)),
             )
+
+            // تطبيق التوسع الذكي للفقاعة فقط إذا كان التلوين مفعلاً والصورة متوفرة
+            if (bitmap != null && AiConfig.colorizeEnabled) {
+                expandrainedBlockToBubble(bitmap, scaledBlock)
+            } else {
+                scaledBlock
+            }
         }.toMutableList()
 
-        // تم حذف استدعاء resolveCollisions نهائياً من هنا
         return expandedBlocks
+    }
+
+    /**
+     * دالة التوسع الذكي مع فحص متعدد النقاط لتخطي الحروف السوداء وحماية المؤثرات الصوتية (SFX)
+     */
+    private fun expandrainedBlockToBubble(bitmap: Bitmap, block: TranslationBlock): TranslationBlock {
+        val imgWidth = bitmap.width
+        val imgHeight = bitmap.height
+
+        var left = block.x.toInt().coerceIn(0, imgWidth - 1)
+        var top = block.y.toInt().coerceIn(0, imgHeight - 1)
+        var right = (block.x + block.width).toInt().coerceIn(0, imgWidth - 1)
+        var bottom = (block.y + block.height).toInt().coerceIn(0, imgHeight - 1)
+
+        val centerX = (left + right) / 2
+        val centerY = (top + bottom) / 2
+        if (centerX !in 0 until imgWidth || centerY !in 0 until imgHeight) return block
+
+        // فحص عينات متعددة حول المركز لتجنب الاصطدام بالحروف السوداء داخل النص
+        val offsets = listOf(
+            Pair(0, 0),
+            Pair(-10, 0),
+            Pair(10, 0),
+            Pair(0, -10),
+            Pair(0, 10)
+        )
+
+        var whiteCount = 0
+        var blackCount = 0
+
+        for ((dx, dy) in offsets) {
+            val px = (centerX + dx).coerceIn(0, imgWidth - 1)
+            val py = (centerY + dy).coerceIn(0, imgHeight - 1)
+            val pixel = bitmap.getPixel(px, py)
+            
+            val r = Color.red(pixel)
+            val g = Color.green(pixel)
+            val b = Color.blue(pixel)
+            val brightness = (r + g + b) / 3
+
+            val isWhite = brightness > 230 && abs(r - g) < 10 && abs(g - b) < 10
+            val isBlack = brightness < 30 && abs(r - g) < 10 && abs(g - b) < 10
+
+            if (isWhite) whiteCount++
+            if (isBlack) blackCount++
+        }
+
+        val isPureWhite = whiteCount >= 2
+        val isPureBlack = blackCount >= 2
+
+        // إذا لم تكن الخلفية بيضاء ناصعة أو سوداء صافية، فهذا مؤثر صوتي (SFX) ونلغي التوسع فوراً
+        if (!isPureWhite && !isPureBlack) {
+            return block
+        }
+
+        val isDarkBubble = isPureBlack && !isPureWhite
+
+        fun isMatchColor(pixel: Int): Boolean {
+            val brightness = (Color.red(pixel) + Color.green(pixel) + Color.blue(pixel)) / 3
+            return if (isDarkBubble) brightness < 50 else brightness > 200
+        }
+
+        // التوسع الشعاعي للجهات الأربع بشكل مستقل
+        while (left > 0 && isMatchColor(bitmap.getPixel(left - 1, centerY))) left--
+        while (right < imgWidth - 1 && isMatchColor(bitmap.getPixel(right + 1, centerY))) right++
+        while (top > 0 && isMatchColor(bitmap.getPixel(centerX, top - 1))) top--
+        while (bottom < imgHeight - 1 && isMatchColor(bitmap.getPixel(centerX, bottom + 1))) bottom++
+
+        return block.copy(
+            x = left.toFloat(),
+            y = top.toFloat(),
+            width = max(block.width, (right - left).toFloat()),
+            height = max(block.height, (bottom - top).toFloat())
+        )
     }
 
     private fun shouldMergeTextBlock(r1: TranslationBlock, r2: TranslationBlock, isHybrid: Boolean): Boolean {
@@ -281,7 +365,6 @@ internal object TextBlockMerger {
         val sH = max(r1.symHeight, max(r2.symHeight, 12f))
         val sW = max(r1.symWidth, max(r2.symWidth, 12f))
 
-        // زيادة المسافة العمودية فقط عند تفعيل Hybrid مع الحفاظ على الأفقية ثابتة
         val gapMultiplier = 1.2f
         val maxAllowedGapX = sW * gapMultiplier 
         val maxAllowedGapY = if (isHybrid) sH * 1.5f else sH * gapMultiplier 
