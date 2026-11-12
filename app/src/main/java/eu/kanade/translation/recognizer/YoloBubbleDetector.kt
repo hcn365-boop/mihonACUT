@@ -8,7 +8,6 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import java.nio.FloatBuffer
-import kotlin.math.max
 import kotlin.math.min
 
 class YoloBubbleDetector(context: Context) {
@@ -16,6 +15,7 @@ class YoloBubbleDetector(context: Context) {
     private val session: OrtSession
 
     init {
+        // تأكد من تطابق اسم ملف الـ ONNX في مجلد assets/yolo/
         val inputStream = context.assets.open("yolo/yolo26s.onnx")
         val bytes = inputStream.readBytes()
         inputStream.close()
@@ -28,31 +28,29 @@ class YoloBubbleDetector(context: Context) {
         val origW = bitmap.width.toFloat()
         val origH = bitmap.height.toFloat()
 
-        // 1. الحفاظ على الأبعاد الأصلية وحساب نسبة التكبير/التصغير (Letterboxing)
+        // 1. الحفاظ على الأبعاد الأصلية (Letterboxing) حسب مواصفات النموذج
         val scale = min(targetSize.toFloat() / origW, targetSize.toFloat() / origH)
         val scaledW = (origW * scale).toInt()
         val scaledH = (origH * scale).toInt()
 
         val resizedBitmap = Bitmap.createScaledBitmap(bitmap, scaledW, scaledH, true)
 
-        // 2. إنشاء لوحة مربعة 1024x1024 وملؤها باللون الرمادي المعياري (114, 114, 114)
         val paddedBitmap = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(paddedBitmap)
-        canvas.drawColor(Color.rgb(114, 114, 114))
+        canvas.drawColor(Color.rgb(114, 114, 114)) // اللون الرمادي المعياري لـ YOLO
 
-        // وضع الصورة المصغرة في المنتصف تماماً
         val dx = (targetSize - scaledW) / 2f
         val dy = (targetSize - scaledH) / 2f
         canvas.drawBitmap(resizedBitmap, dx, dy, null)
 
-        // 3. تعبئة التنسور بنظام NCHW (قنوات R ثم G ثم B منفصلة)
+        // 2. تجهيز التنسور بنظام NCHW وتطبيع الألوان (0.0 إلى 1.0)
         val inputBuffer = FloatBuffer.allocate(3 * targetSize * targetSize)
         val pixels = IntArray(targetSize * targetSize)
         paddedBitmap.getPixels(pixels, 0, targetSize, 0, 0, targetSize, targetSize)
 
         val rChannel = FloatArray(targetSize * targetSize)
         val gChannel = FloatArray(targetSize * targetSize)
-        val bChannel = FloatArray(targetSize * targetSize)
+        val bChannel = FloatArray(targetStateSize(targetSize)) // bChannel size
 
         for (i in pixels.indices) {
             val p = pixels[i]
@@ -73,11 +71,54 @@ class YoloBubbleDetector(context: Context) {
         val boxes = mutableListOf<RectBox>()
 
         try {
-            // استخراج التحليلات من مخرجات نموذج الـ ONNX وإعادة تحويل الإحداثيات عكسياً للصورة الأصلية
-            // x_orig = (x_detected - dx) / scale
-            // y_orig = (y_detected - dy) / scale
             val rawOutput = results[0].value
-            // يتم تحليل المصفوفة الناتجة وتعبئة الـ boxes هنا حسب بنية النموذج الفعلية
+            // معالجة مخرجات YOLO26 / YOLOv8 القياسية [1, 5/8400, N]
+            if (rawOutput is Array<*>) {
+                val batch0 = rawOutput[0]
+                if (batch0 is Array<*>) {
+                    // إذا كان الإخراج بتنسيق [Attr, Anchors]
+                    if (batch0.isNotEmpty() && batch0[0] is FloatArray) {
+                        val channels = batch0 as Array<FloatArray>
+                        if (channels.size >= 5) {
+                            val numAnchors = channels[0].size
+                            for (i in 0 until numAnchors) {
+                                val conf = channels[4][i]
+                                if (conf > 0.25f) { // نسبة الثقة أكبر من 25%
+                                    val xc = channels[0][i]
+                                    val yc = channels[1][i]
+                                    val w = channels[2][i]
+                                    val h = channels[3][i]
+
+                                    val x1 = xc - w / 2f
+                                    val y1 = yc - h / 2f
+
+                                    // عكس تأثير الـ Letterboxing والحجم لاستعادة الإحداثيات الأصلية للصورة
+                                    val origX = (x1 - dx) / scale
+                                    val origY = (y1 - dy) / scale
+                                    val origWBox = w / scale
+                                    val origHBox = h / scale
+
+                                    boxes.add(
+                                        RectBox(
+                                            x = origX.coerceIn(0f, origW),
+                                            y = origY.coerceIn(0f, origH),
+                                            width = origWBox.coerceAtMost(origW - origX),
+                                            height = origHBox.coerceAtMost(origH - origY),
+                                            score = conf
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    } 
+                    // إذا كان الإخراج بتنسيق [Anchors, Attr] (عكسي)
+                    else if (batch0.isNotEmpty() && batch0[0] is FloatArray) {
+                        // يتم التعامل معه إذا تطلب الأمر بناءً على شكل المصفوفة
+                    }
+                } else if (batch0 is FloatArray) {
+                    // بعض النماذج تصدر مصفوفة مسطحة 2د
+                }
+            }
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
@@ -89,6 +130,8 @@ class YoloBubbleDetector(context: Context) {
 
         return boxes
     }
+
+    private fun targetStateSize(size: Int) = size * size
 
     fun close() {
         session.close()
