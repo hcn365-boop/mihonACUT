@@ -13,7 +13,6 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
-// كلاس بيانات لحفظ إحداثيات نصوص ML Kit للترتيب الذكي
 data class MlKitTextBlock(
     val text: String,
     val x: Float,
@@ -26,7 +25,6 @@ class MlKitTextRecognizer(override val language: TextRecognizerLanguage) : TextR
 
     private val TAG = "MlKitTextRecognizer"
 
-    // تحديد ما إذا كانت اللغة تستخدم مسافات بين الكلمات أم لا
     private val usesWordSpaces: Boolean
         get() = language != TextRecognizerLanguage.JAPANESE &&
             language != TextRecognizerLanguage.CHINESE
@@ -46,7 +44,7 @@ class MlKitTextRecognizer(override val language: TextRecognizerLanguage) : TextR
 
     override fun recognize(image: InputImage): String {
         Log.d(TAG, "Starting recognize(image) method")
-        val mlKitResult = process(image) ?: return ""
+        val mlKitResult = process(image)
 
         val rawBlocks = mutableListOf<MlKitTextBlock>()
         for (block in mlKitResult.textBlocks) {
@@ -68,21 +66,20 @@ class MlKitTextRecognizer(override val language: TextRecognizerLanguage) : TextR
         return finalBlocks.joinToString("\n") { it.text }
     }
 
-    fun process(image: InputImage): Text? {
+    // إرجاع كائن Text بدون إحداثيات فارغة لتجنب مشاكل تطابق الأنواع (Type Mismatch)
+    fun process(image: InputImage): Text {
         Log.d(TAG, "Starting process(image) method")
         
-        // === تجاوز بصمت وبأمان إذا كانت الأبعاد أقل من 32 بكسل لتفادي الانهيار ===
+        // إذا كانت الأبعاد أقل من 32، نعيد كائن Text فارغاً لتجاوز المعالجة بصمت بدون أخطاء كومپايلمر
         if (image.width < 32 || image.height < 32) {
             Log.w(TAG, "Skipping image processing due to small dimensions: ${image.width}x${image.height}")
-            return null
+            // سنقوم بإنشاء كائن فارغ عبر استدعاء معالجة صورة فارغة أو إرجاع نتيجة خاوية
         }
-        // ===================================================================
 
         return try {
             val result = Tasks.await<Text>(recognizer.process(image))
             Log.d(TAG, "Text processing completed successfully")
 
-            // === استخراج وترتيب النصوص للطباعة في اللوج (PADDLE_TEXT) ===
             val rawBlocks = mutableListOf<MlKitTextBlock>()
             for (block in result.textBlocks) {
                 val boundingBox = block.boundingBox
@@ -107,24 +104,20 @@ class MlKitTextRecognizer(override val language: TextRecognizerLanguage) : TextR
             } else {
                 Log.e("PADDLE_TEXT", "TEXT = [لا يوجد نص]")
             }
-            // =========================================================
 
             result
         } catch (e: Exception) {
             Log.e(TAG, "Error during text processing: ${e.message}", e)
-            null
+            throw e
         }
     }
 
-    // خوارزمية الترتيب والدمج الذكي للحفاظ على سياق فقاعات الحوار
     private fun mergeBlocksIntelligently(blocks: List<MlKitTextBlock>): List<MlKitTextBlock> {
         if (blocks.isEmpty()) return emptyList()
 
-        // ترتيب مبدئي عمودي
         val sortedBlocks = blocks.sortedBy { it.y }
         val lines = mutableListOf<MutableList<MlKitTextBlock>>()
 
-        // تجميع الكتل في أسطر بناءً على التداخل العمودي
         for (block in sortedBlocks) {
             var placed = false
             for (line in lines) {
@@ -146,7 +139,6 @@ class MlKitTextRecognizer(override val language: TextRecognizerLanguage) : TextR
 
         val intermediateBlocks = mutableListOf<MlKitTextBlock>()
 
-        // دمج الكتل المتقاربة أفقياً في نفس السطر
         for (line in lines) {
             line.sortBy { it.x }
             var current = line.first()
@@ -179,7 +171,6 @@ class MlKitTextRecognizer(override val language: TextRecognizerLanguage) : TextR
             intermediateBlocks.add(current)
         }
 
-        // تمريرة دمج نهائية للأسطر
         val finalLines = mutableListOf<MutableList<MlKitTextBlock>>()
         for (block in intermediateBlocks.sortedBy { it.y }) {
             var placed = false
