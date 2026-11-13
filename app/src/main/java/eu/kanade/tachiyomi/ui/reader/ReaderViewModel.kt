@@ -94,6 +94,7 @@ import java.util.Date
 import kotlin.time.Clock
 import eu.kanade.translation.MangaTranslationContext
 import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
+import eu.kanade.tachiyomi.ui.reader.colorize.PostProcessManager
 /**
  * Presenter used by the activity to perform background operations.
  */
