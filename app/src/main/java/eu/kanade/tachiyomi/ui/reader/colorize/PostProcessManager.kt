@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import logcat.LogPriority
 import okio.Buffer
+import tachiyomi.core.common.util.system.ImageUtil
 import tachiyomi.core.common.util.system.logcat
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.cancellation.CancellationException
@@ -111,6 +112,13 @@ object PostProcessManager {
             setState(chapterId, ChapterProcessState.NotProcessed)
         }
     }
+
+    /** The downloaded image files of a chapter folder, in reading order. */
+    fun listPages(chapterDir: UniFile): List<Uri> =
+        chapterDir.listFiles().orEmpty()
+            .filter { it.isFile && ImageUtil.isImage(it.name) { it.openInputStream() } }
+            .sortedBy { it.name }
+            .map { it.uri }
 
     private fun startWorker() {
         synchronized(lock) {
