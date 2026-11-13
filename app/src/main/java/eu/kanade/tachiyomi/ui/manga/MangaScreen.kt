@@ -46,6 +46,7 @@ import eu.kanade.tachiyomi.ui.home.HomeScreen
 import eu.kanade.tachiyomi.ui.manga.notes.MangaNotesScreen
 import eu.kanade.tachiyomi.ui.manga.track.TrackInfoDialogHomeScreen
 import eu.kanade.tachiyomi.ui.reader.ReaderActivity
+import eu.kanade.tachiyomi.ui.reader.colorize.PostProcessManager
 import eu.kanade.tachiyomi.ui.setting.SettingsScreen
 import eu.kanade.tachiyomi.ui.webview.WebViewScreen
 import eu.kanade.tachiyomi.util.system.copyToClipboard
@@ -74,6 +75,8 @@ class MangaScreen(
     override fun Content() {
         val navigator = LocalNavigator.currentOrThrow
         val context = LocalContext.current
+        LaunchedEffect(Unit) { PostProcessManager.ensureLoaded(context) }
+        val processStates by PostProcessManager.states.collectAsStateWithLifecycle()
         val haptic = LocalHapticFeedback.current
         val scope = rememberCoroutineScope()
         val viewModel =
@@ -113,6 +116,8 @@ class MangaScreen(
             navigateUp = navigator::pop,
             onChapterClicked = { openChapter(context, it) },
             onDownloadChapter = viewModel::runChapterDownloadActions.takeIf { !successState.source.isLocalOrStub() },
+            processStates = processStates,
+            onProcessChapter = viewModel::processChapter.takeIf { !successState.source.isLocalOrStub() },
             onAddToLibraryClicked = {
                 viewModel.toggleFavorite()
                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
