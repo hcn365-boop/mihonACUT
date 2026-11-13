@@ -532,7 +532,7 @@ object PageColorizer {
         val color = if (intensity < 0f) "n" else (intensity * 100).roundToInt().toString()
         val upscaleStamp = if (upscale) "${upscaleSignature()}_${AiConfig.upscaleMaxOutputPixels / 1_000_000}" else "n"
         val finalPassStamp = "_f${if (AiConfig.upscaleFinalPassEnabled) "1" else "0"}${if (AiConfig.upscaleFinalPassKeepSize) "k" else "g"}${AiConfig.upscaleFinalPassMaxPixels / 1_000_000}"
-        return "${imageHash}_c${color}${if (sam) "s" else ""}_${colorModel.length()}_u${upscaleStamp}_s$shrinkSide$finalPassStamp_t${(AiConfig.saturation * 100).roundToInt()}"
+        return "${imageHash}_c${color}${if (sam) "s" else ""}_${colorModel.length()}_u${upscaleStamp}_s$shrinkSide${finalPassStamp}_t${(AiConfig.saturation * 100).roundToInt()}"
     }
 
     private fun cacheFile(context: Context, name: String): File = File(File(context.cacheDir, PAGE_CACHE_DIR), name)
