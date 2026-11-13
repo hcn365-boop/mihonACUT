@@ -41,6 +41,8 @@ import eu.kanade.tachiyomi.data.download.model.Download
 import eu.kanade.tachiyomi.data.track.EnhancedTracker
 import eu.kanade.tachiyomi.data.track.TrackerManager
 import eu.kanade.tachiyomi.source.Source
+import eu.kanade.tachiyomi.ui.reader.colorize.ChapterProcessAction
+import eu.kanade.tachiyomi.ui.reader.colorize.PostProcessManager
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
 import eu.kanade.tachiyomi.util.chapter.getNextUnread
 import eu.kanade.tachiyomi.util.removeCovers
@@ -98,7 +100,7 @@ class MangaViewModel(
     private val context: Context,
     private val libraryPreferences: LibraryPreferences,
     trackPreferences: TrackPreferences,
-    readerPreferences: ReaderPreferences,
+    private val readerPreferences: ReaderPreferences,
     private val trackerManager: TrackerManager,
     private val trackChapter: TrackChapter,
     private val downloadManager: DownloadManager,
@@ -259,6 +261,37 @@ class MangaViewModel(
 
             // Initial loading finished
             updateSuccessState { it.copy(isRefreshingData = false) }
+        }
+    }
+
+    /** Called by the process button next to a chapter. */
+    fun processChapter(chapterId: Long, action: ChapterProcessAction) {
+        when (action) {
+            ChapterProcessAction.CANCEL -> PostProcessManager.cancel(chapterId)
+            ChapterProcessAction.DELETE -> PostProcessManager.delete(context, chapterId)
+            ChapterProcessAction.START -> {
+                val successState = successState ?: return
+                val chapter = successState.chapters.firstOrNull { it.id == chapterId }?.chapter ?: return
+                viewModelScope.launchIO {
+                    val pages = try {
+                        downloadManager.buildPageList(successState.source, successState.manga, chapter).mapNotNull { it.uri }
+                    } catch (e: Throwable) {
+                        logcat(LogPriority.ERROR, e)
+                        return@launchIO
+                    }
+                    PostProcessManager.enqueue(
+                        context,
+                        readerPreferences,
+                        PostProcessManager.Request(
+                            chapterId = chapter.id,
+                            mangaId = successState.manga.id,
+                            mangaTitle = successState.manga.title,
+                            sourceLang = successState.source.lang,
+                            pageUris = pages,
+                        ),
+                    )
+                }
+            }
         }
     }
 
