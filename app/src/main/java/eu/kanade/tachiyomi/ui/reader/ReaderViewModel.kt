@@ -38,6 +38,7 @@ import eu.kanade.tachiyomi.data.saver.Location
 import eu.kanade.tachiyomi.source.Source
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.ui.reader.colorize.PostProcessManager
 import eu.kanade.tachiyomi.ui.reader.loader.ChapterLoader
 import eu.kanade.tachiyomi.ui.reader.loader.DownloadPageLoader
 import eu.kanade.tachiyomi.ui.reader.model.InsertPage
@@ -332,6 +333,7 @@ class ReaderViewModel(
                 val source = sourceManager.getOrStub(manga.source)
                 MangaTranslationContext.update(manga.id, manga.title, source.lang)
                 AiConfig.onMangaChanged()
+                PostProcessManager.ensureLoaded(context)
                 PostProcessStore.refresh(context)
                 incognitoMode = getIncognitoState.await(manga.source)
                 mutableState.update { it.copy(manga = manga, source = source) }
