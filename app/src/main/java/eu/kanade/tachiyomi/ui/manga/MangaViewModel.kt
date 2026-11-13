@@ -92,6 +92,8 @@ import tachiyomi.domain.track.interactor.GetTracks
 import tachiyomi.i18n.MR
 import tachiyomi.source.local.isLocal
 import kotlin.math.floor
+import eu.kanade.presentation.manga.components.ChapterProcessAction
+
 
 @AssistedInject
 class MangaViewModel(
