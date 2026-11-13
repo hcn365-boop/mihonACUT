@@ -334,7 +334,7 @@ class ReaderViewModel(
                 MangaTranslationContext.update(manga.id, manga.title, source.lang)
                 AiConfig.onMangaChanged()
                 PostProcessManager.ensureLoaded(context)
-                PostProcessStore.refresh(context)
+                PostProcessManager.ensureLoaded(context)
                 incognitoMode = getIncognitoState.await(manga.source)
                 mutableState.update { it.copy(manga = manga, source = source) }
                 if (chapterId == -1L) chapterId = initialChapterId
