@@ -15,6 +15,7 @@ import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.source.UnmeteredSource
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.ui.reader.colorize.PostProcessManager
 import eu.kanade.tachiyomi.util.storage.DiskUtil
 import eu.kanade.tachiyomi.util.storage.DiskUtil.NOMEDIA_FILE
 import eu.kanade.tachiyomi.util.storage.saveTo
@@ -42,6 +43,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import logcat.LogPriority
+import mihon.app.di.appGraph
 import mihon.core.archive.ZipWriter
 import nl.adaptivity.xmlutil.serialization.XML
 import okhttp3.Response
@@ -406,6 +408,28 @@ class Downloader(
             DiskUtil.createNoMediaFile(tmpDir, context)
 
             download.status = Download.State.DOWNLOADED
+
+            // Process the chapter in advance when the user asked for it (not for CBZ files).
+            if (!downloadPreferences.saveChaptersAsCBZ.get()) {
+                runCatching {
+                    val readerPreferences = context.appGraph.readerPreferences
+                    if (readerPreferences.postProcessAuto.get()) {
+                        mangaDir.findFile(chapterDirname)?.let { chapterDir ->
+                            PostProcessManager.enqueue(
+                                context,
+                                readerPreferences,
+                                PostProcessManager.Request(
+                                    chapterId = download.chapter.id,
+                                    mangaId = download.manga.id,
+                                    mangaTitle = download.manga.title,
+                                    sourceLang = download.source.lang,
+                                    pageUris = PostProcessManager.listPages(chapterDir),
+                                ),
+                            )
+                        }
+                    }
+                }.onFailure { logcat(LogPriority.ERROR, it) }
+            }
         } catch (error: Throwable) {
             if (error is CancellationException) throw error
             // If the page list threw, it will resume here
