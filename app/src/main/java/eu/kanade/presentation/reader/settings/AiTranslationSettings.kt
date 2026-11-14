@@ -122,8 +122,8 @@ internal fun TranslationSection(prefs: AiPrefs, inReader: Boolean = false) {
     TSlider("Wait before sending a partial request", prefs.translateMaxWaitSeconds, 1..30) { "$it s" }
     TSlider("Pages read ahead for translation", prefs.translatePreloadCount, 0..10) { "$it" }
 
-    TranslationTestButton(prefs = prefs)[span_1](start_span)[span_1](end_span)
-    
+    TranslationTestButton(prefs = prefs)
+
     var size by remember { mutableStateOf(TranslationStore.sizeBytes(context)) }
     TextButton(
         onClick = {
