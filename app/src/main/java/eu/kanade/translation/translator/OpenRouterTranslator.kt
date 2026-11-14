@@ -14,6 +14,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 
 class OpenRouterTranslator(
     override val fromLang: TextRecognizerLanguage,
@@ -23,11 +24,17 @@ class OpenRouterTranslator(
     val maxOutputToken: Int,
     val temp: Float,
 ) : TextTranslator {
-    private val okHttpClient = OkHttpClient()
-    override suspend fun translate(pages: MutableMap<String, PageTranslation>) {
 
+    // The default timeouts of OkHttp are 10 seconds, too short for a language model.
+    private val okHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .build()
+
+    override suspend fun translate(pages: MutableMap<String, PageTranslation>) {
         try {
-            val data = pages.mapValues { (k, v) -> v.blocks.map { b -> b.text } }
+            val data = pages.mapValues { (_, v) -> v.blocks.map { b -> b.text } }
             val json = JSONObject(data)
             val mediaType = "application/json; charset=utf-8".toMediaType()
             val jsonObject = buildJsonObject {
@@ -82,41 +89,58 @@ class OpenRouterTranslator(
                         put("content", "JSON $json")
                     }
                 }
-
             }.toString()
             val body = jsonObject.toRequestBody(mediaType)
-            val access = "https://openrouter.ai/api/v1/chat/completions"
-            val build: Request =
-                Request.Builder().url(access).header(
-                    "Authorization",
-                    "Bearer $apiKey",
-                ).header("Content-Type", "application/json").post(body).build()
-            val response = okHttpClient.newCall(build).await()
-            val rBody = response.body
-            val json2 = JSONObject(rBody.string())
-            val resJson =
-                JSONObject(json2.getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content"))
+            val build: Request = Request.Builder()
+                .url("https://openrouter.ai/api/v1/chat/completions")
+                .header("Authorization", "Bearer $apiKey")
+                .header("Content-Type", "application/json")
+                .post(body)
+                .build()
+
+            // One request, under the shared policy: spaced out, tried again when busy, paused when refused.
+            val content = policy.execute {
+                okHttpClient.newCall(build).await().use { response ->
+                    val text = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        val reason = runCatching { JSONObject(text).getJSONObject("error").getString("message") }
+                            .getOrNull()
+                        try {
+                            RequestPolicy.checkStatus(response.code, response.header("Retry-After"))
+                        } catch (e: TranslationRateLimitedException) {
+                            throw TranslationRateLimitedException("OpenRouter: ${reason ?: e.message}", e.retryAfterMs)
+                        } catch (e: IllegalStateException) {
+                            throw IllegalStateException("OpenRouter: ${reason ?: e.message}", e)
+                        }
+                    }
+                    val choices = JSONObject(text).optJSONArray("choices")
+                    if (choices == null || choices.length() == 0) {
+                        throw IllegalStateException("OpenRouter answered without a translation")
+                    }
+                    choices.getJSONObject(0).getJSONObject("message").getString("content")
+                }
+            }
+
+            // Markdown marks around the JSON would break the parsing.
+            val resJson = JSONObject(content.replace("```json", "").replace("```", "").trim())
 
             for ((k, v) in pages) {
                 v.blocks.forEachIndexed { i, b ->
-                    run {
-                        val res = resJson.optJSONArray(k)?.optString(i, "NULL")
-                        b.translation = if (res == null || res == "NULL") b.text else res
-                    }
+                    val res = resJson.optJSONArray(k)?.optString(i, "NULL")
+                    b.translation = if (res == null || res == "NULL") b.text else res
                 }
-                v.blocks =
-                    v.blocks.filterNot { it.translation.contains("RTMTH") }.toMutableList()
+                v.blocks = v.blocks.filterNot { it.translation.contains("RTMTH") }.toMutableList()
             }
-
-
         } catch (e: Exception) {
             logcat { "Image Translation Error : ${e.stackTraceToString()}" }
             throw e
         }
     }
 
-    override fun close() {
+    override fun close() {}
+
+    companion object {
+        /** Free models allow about 20 requests a minute (check your model): one every 3.5 seconds. */
+        private val policy = RequestPolicy(name = "OpenRouter", minIntervalMs = 3500, maxConcurrent = 1)
     }
-
-
 }
