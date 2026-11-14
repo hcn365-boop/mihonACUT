@@ -182,6 +182,7 @@ object PostProcessManager {
         AiConfig.withSnapshot(snapshot) {
             pages.forEachIndexed { index, uri ->
                 kotlin.coroutines.coroutineContext.ensureActive()
+                val started = System.currentTimeMillis()
                 val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
                     ?: error("Cannot read the page $uri")
                 val hash = PageColorizer.contentHash(bytes)
@@ -196,6 +197,10 @@ object PostProcessManager {
                     val file = folder.createFile(name) ?: error("Cannot create $name")
                     file.openOutputStream().use { it.write(processed) }
                     PostProcessStore.savePage(context, request.chapterId, hash, file.uri.toString())
+                }
+                logcat(LogPriority.ERROR) {
+                    "Batch page ${index + 1}/${pages.size}: ${System.currentTimeMillis() - started} ms, " +
+                        if (processed == null) "left as it is" else "processed (${processed.size / 1024} KB)"
                 }
                 setState(request.chapterId, ChapterProcessState.Processing((index + 1f) / pages.size))
             }
