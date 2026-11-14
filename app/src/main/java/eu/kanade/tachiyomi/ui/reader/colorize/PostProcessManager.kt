@@ -30,13 +30,13 @@ import kotlin.coroutines.cancellation.CancellationException
  */
 object PostProcessManager {
 
-    /** One chapter to process: its pages are the downloaded image files, in reading order. */
+    /** One chapter to process: [chapterDir] is its download folder, whose image files are the pages. */
     class Request(
         val chapterId: Long,
         val mangaId: Long,
         val mangaTitle: String,
         val sourceLang: String,
-        val pageUris: List<Uri>,
+        val chapterDir: UniFile,
     )
 
     private class Entry(val context: Context, val prefs: ReaderPreferences, val request: Request)
@@ -94,6 +94,11 @@ object PostProcessManager {
         setState(id, ChapterProcessState.Queued)
         queue.trySend(Entry(context.applicationContext, prefs, request))
         startWorker()
+    }
+
+    /** Shows the error state of a chapter that could not even be queued (for example a CBZ file). */
+    fun fail(chapterId: Long) {
+        setState(chapterId, ChapterProcessState.Error)
     }
 
     fun cancel(chapterId: Long) {
@@ -162,11 +167,10 @@ object PostProcessManager {
     private suspend fun process(entry: Entry) {
         val request = entry.request
         val context = entry.context
-        val pages = request.pageUris
+        // The folder comes from the download manager: a folder found from a page address has no parent.
+        val chapterDir = request.chapterDir
+        val pages = listPages(chapterDir)
         if (pages.isEmpty()) error("The chapter has no downloaded pages")
-
-        val chapterDir = UniFile.fromUri(context, pages.first())?.parentFile
-            ?: error("Cannot find the chapter's download folder")
         val folder = chapterDir.findFile(FOLDER)?.takeIf { it.isDirectory }
             ?: chapterDir.createDirectory(FOLDER)
             ?: error("Cannot create the \"$FOLDER\" folder")
