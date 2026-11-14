@@ -15,76 +15,79 @@ import java.util.concurrent.TimeUnit
 class LMStudioTranslator(
     override val fromLang: TextRecognizerLanguage,
     override val toLang: TextTranslatorLanguage,
-    private val apiUrl: String, // رابط الخادم: http://10.0.0.10:1234/v1/chat/completions
+    private val apiUrl: String, // The server link: http://10.0.0.10:1234/v1/chat/completions
+    // The name of the model loaded in LM Studio. The old fixed name stays as the default.
+    private val modelName: String = "qwen2.5-7b-instruct",
 ) : TextTranslator {
 
     private val okHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS) // تمديد وقت القراءة ليتناسب مع حجم المودل 7B
+        .readTimeout(120, TimeUnit.SECONDS) // A 7B model on a graphics card needs time to answer.
         .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
     override suspend fun translate(pages: MutableMap<String, PageTranslation>) {
         try {
             val mediaType = "application/json; charset=utf-8".toMediaType()
+            var total = 0
+            var failures = 0
+            var lastError: Exception? = null
 
             for ((_, page) in pages) {
-                page.blocks.forEachIndexed { _, block ->
-                    // التأكد من إرسال نص نظيف تماماً وتجنب أي ترميز خاطئ
+                for (block in page.blocks) {
                     val cleanBlockText = block.text.trim().replace("\n", " ")
-                    if (cleanBlockText.isBlank()) return@forEachIndexed
+                    if (cleanBlockText.isBlank()) continue
+                    total++
 
-                    // تعليمات النظام الموجهة للنموذج لتقديم ترجمة صياغية احترافية
                     val systemInstruction = "You are an expert manga translator. Translate the following text from ${fromLang.name} to ${toLang.label}. Provide ONLY the natural, fluid translated text, without any explanations, thinking process, or additional formatting."
 
-                    // بناء هيكل JSON الدقيق المتوافق مع OpenAI API
                     val root = JSONObject()
-                    root.put("model", "qwen2.5-7b-instruct")
-
-                    val messagesArray = JSONArray()
-
-                    val systemMsg = JSONObject()
-                    systemMsg.put("role", "system")
-                    systemMsg.put("content", systemInstruction)
-                    messagesArray.put(systemMsg)
-
-                    val userMsg = JSONObject()
-                    userMsg.put("role", "user")
-                    userMsg.put("content", cleanBlockText)
-                    messagesArray.put(userMsg)
-
-                    root.put("messages", messagesArray)
+                    root.put("model", modelName)
+                    root.put(
+                        "messages",
+                        JSONArray()
+                            .put(JSONObject().put("role", "system").put("content", systemInstruction))
+                            .put(JSONObject().put("role", "user").put("content", cleanBlockText)),
+                    )
                     root.put("stream", false)
-                    root.put("temperature", 0.7) // نسبة توازن بين الدقة والإبداع الصياغي
+                    root.put("temperature", 0.7)
 
-                    val body = root.toString().toRequestBody(mediaType)
-                    val build: Request = Request.Builder()
+                    val request: Request = Request.Builder()
                         .url(apiUrl)
                         .header("Content-Type", "application/json")
-                        .post(body)
+                        .post(root.toString().toRequestBody(mediaType))
                         .build()
 
-                    // إرسال الطلب والانتظار حتى يستجيب كرت الشاشة
-                    val response = okHttpClient.newCall(build).await()
-                    
-                    if (response.isSuccessful) {
-                        val rBody = response.body ?: return@forEachIndexed
-                        val jsonResponse = JSONObject(rBody.string())
-                        
-                        val choices = jsonResponse.optJSONArray("choices")
-                        if (choices != null && choices.length() > 0) {
-                            val message = choices.getJSONObject(0).optJSONObject("message")
-                            val translatedText = message?.optString("content", "")?.trim('"', '\n', ' ', '`')
-                            
-                            if (!translatedText.isNullOrEmpty() && translatedText != cleanBlockText) {
-                                block.translation = translatedText
+                    try {
+                        // One request at a time: the graphics card answers one text at a time anyway.
+                        val translatedText = policy.execute {
+                            okHttpClient.newCall(request).await().use { response ->
+                                RequestPolicy.checkStatus(response.code, response.header("Retry-After"))
+                                val choices = JSONObject(response.body?.string().orEmpty()).optJSONArray("choices")
+                                if (choices == null || choices.length() == 0) {
+                                    ""
+                                } else {
+                                    choices.getJSONObject(0).optJSONObject("message")
+                                        ?.optString("content", "").orEmpty()
+                                        .trim('"', '\n', ' ', '`')
+                                }
                             }
                         }
-                    } else {
-                        logcat { "LM Studio API Error: HTTP ${response.code} - ${response.message}" }
+                        if (translatedText.isNotEmpty() && translatedText != cleanBlockText) {
+                            block.translation = translatedText
+                        }
+                    } catch (e: TranslationRateLimitedException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // One bubble failing must not stop the others; the page fails only if all of them do.
+                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        failures++
+                        lastError = e
+                        logcat { "LM Studio request failed: ${e.message}" }
                     }
                 }
             }
+            if (total > 0 && failures == total) throw lastError ?: IllegalStateException("LM Studio did not answer")
         } catch (e: Exception) {
             logcat { "LM Studio Translator Error : ${e.stackTraceToString()}" }
             throw e
@@ -92,4 +95,15 @@ class LMStudioTranslator(
     }
 
     override fun close() {}
+
+    companion object {
+        /** A server of your own has no limit; one request at a time keeps the card busy without piling up. */
+        private val policy = RequestPolicy(
+            name = "LM Studio",
+            minIntervalMs = 0,
+            jitterMs = 0,
+            maxConcurrent = 1,
+            maxAttempts = 2,
+        )
+    }
 }
