@@ -13,6 +13,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
+import eu.kanade.tachiyomi.ui.reader.colorize.AiPrefs
 import eu.kanade.translation.model.PageTranslation
 import eu.kanade.translation.model.TranslationBlock
 import eu.kanade.translation.recognizer.TextRecognizerLanguage
@@ -26,7 +27,7 @@ import kotlin.coroutines.cancellation.CancellationException
  * model name or server address shows up here instead of silently on a page.
  */
 @Composable
-internal fun TranslationTestButton() {
+internal fun TranslationTestButton(prefs: AiPrefs) {
     val scope = rememberCoroutineScope()
     var running by remember { mutableStateOf(false) }
     var result by remember { mutableStateOf<String?>(null) }
@@ -35,7 +36,8 @@ internal fun TranslationTestButton() {
         enabled = !running,
         modifier = Modifier.padding(horizontal = 8.dp),
         onClick = {
-            val settings = AiConfig.translation?.settings
+            // The settings of the tab that is open (real-time or batch), not only the real-time ones.
+            val settings = AiConfig.translationFor(prefs)?.settings
             if (settings == null) {
                 result = "Translation is turned off."
                 return@TextButton
