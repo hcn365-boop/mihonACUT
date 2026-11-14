@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.data.download
 
 import android.content.Context
+import com.hippo.unifile.UniFile
 import dev.zacsweers.metro.AppScope
 import dev.zacsweers.metro.Inject
 import dev.zacsweers.metro.SingleIn
@@ -171,6 +172,10 @@ class DownloadManager(
                 Page(i, uri = file.uri).apply { status = Page.State.Ready }
             }
     }
+
+    /** The download folder of a chapter, or null when it is not downloaded. A CBZ file is not a folder. */
+    fun findChapterDir(source: Source, manga: Manga, chapter: Chapter): UniFile? =
+        provider.findChapterDir(chapter.name, chapter.scanlator, chapter.url, manga.title, source)
 
     /**
      * Returns true if the chapter is downloaded.
