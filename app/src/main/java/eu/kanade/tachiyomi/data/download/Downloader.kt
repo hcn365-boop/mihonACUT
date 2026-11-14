@@ -423,7 +423,7 @@ class Downloader(
                                     mangaId = download.manga.id,
                                     mangaTitle = download.manga.title,
                                     sourceLang = download.source.lang,
-                                    pageUris = PostProcessManager.listPages(chapterDir),
+                                    chapterDir = chapterDir,
                                 ),
                             )
                         }
