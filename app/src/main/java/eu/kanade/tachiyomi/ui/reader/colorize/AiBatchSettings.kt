@@ -36,6 +36,18 @@ internal fun BatchSettings(base: ReaderPreferences) {
         modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
     )
     TextButton(
+        onClick = { prefs.applyBatchDefaults() },
+        modifier = Modifier.padding(horizontal = 8.dp),
+    ) {
+        Text("Recommended values for batch processing")
+    }
+    Text(
+        text = "Wider page limits and bigger translation requests, because nothing waits for the reader here. " +
+            "The limit on the size of the result stays, since the reader opens the processed pages.",
+        style = MaterialTheme.typography.bodySmall,
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+    )
+    TextButton(
         onClick = { prefs.copyGeneralSettings() },
         modifier = Modifier.padding(horizontal = 8.dp),
     ) {
