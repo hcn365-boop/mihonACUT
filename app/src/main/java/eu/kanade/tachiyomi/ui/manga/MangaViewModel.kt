@@ -274,10 +274,10 @@ class MangaViewModel(
                 val successState = successState ?: return
                 val chapter = successState.chapters.firstOrNull { it.id == chapterId }?.chapter ?: return
                 viewModelScope.launchIO {
-                    val pages = try {
-                        downloadManager.buildPageList(successState.source, successState.manga, chapter).mapNotNull { it.uri }
-                    } catch (e: Throwable) {
-                        logcat(LogPriority.ERROR, e)
+                    val chapterDir = downloadManager.findChapterDir(successState.source, successState.manga, chapter)
+                    if (chapterDir == null || !chapterDir.isDirectory) {
+                        // Not downloaded, or saved as a CBZ file, which batch processing does not read yet.
+                        PostProcessManager.fail(chapter.id)
                         return@launchIO
                     }
                     PostProcessManager.enqueue(
@@ -288,7 +288,7 @@ class MangaViewModel(
                             mangaId = successState.manga.id,
                             mangaTitle = successState.manga.title,
                             sourceLang = successState.source.lang,
-                            pageUris = pages,
+                            chapterDir = chapterDir,
                         ),
                     )
                 }
