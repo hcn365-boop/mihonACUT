@@ -84,9 +84,9 @@ class AiPrefs(
     val translationTemperature: Preference<String> = base.translationTemperature
     val translationMaxTokens: Preference<String> = base.translationMaxTokens
     val translationServerUrl: Preference<String> = base.translationServerUrl
-    val translatePagesPerRequest: Preference<Int> = base.translatePagesPerRequest
-    val translateMaxChars: Preference<Int> = base.translateMaxChars
-    val translateMaxWaitSeconds: Preference<Int> = base.translateMaxWaitSeconds
+    val translatePagesPerRequest: Preference<Int> = own(base.translatePagesPerRequest)
+    val translateMaxChars: Preference<Int> = own(base.translateMaxChars)
+    val translateMaxWaitSeconds: Preference<Int> = own(base.translateMaxWaitSeconds)
 
     // endregion
 
@@ -169,6 +169,23 @@ class AiPrefs(
         reset(translateLatinKeepCommon)
     }
     
+    /**
+     * Values for batch processing: nothing waits for the reader there, so the page limits can be wider
+     * and the translation requests bigger. The limit on the size of the result stays, because the reader
+     * still has to open the processed pages.
+     */
+    fun applyBatchDefaults() {
+        val key = suffix ?: return
+        fun <T> put(general: Preference<T>, value: T) = base.scoped(general, key).set(value)
+        put(base.colorizeMaxMegapixels, 40)
+        put(base.upscaleMaxMegapixels, 12)
+        put(base.upscaleMaxOutputMegapixels, 12)
+        put(base.upscaleFinalPassMaxMegapixels, 12)
+        put(base.translatePagesPerRequest, 4)
+        put(base.translateMaxChars, 3000)
+        put(base.translateMaxWaitSeconds, 8)
+    }
+
     /** Gives this set a copy of the general settings, so it starts from what you have now. */
     fun copyGeneralSettings() {
         val key = suffix ?: return
@@ -202,6 +219,9 @@ class AiPrefs(
         copy(base.translateAutoFromTitle)
         copy(base.translateAutoFromSource)
         copy(base.translateConfirmLanguage)
+        copy(base.translatePagesPerRequest)
+        copy(base.translateMaxChars)
+        copy(base.translateMaxWaitSeconds)
         copy(base.translateCollisionPadding)
         copy(base.translateFilterWordsEnabled)
         copy(base.translateFilterWords)
