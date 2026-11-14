@@ -293,6 +293,9 @@ object AiConfig {
         forceTranslate = forceTranslate,
     )
 
+    /** The translation settings of any set of settings (real-time, one manga's, or batch). Null when off. */
+    fun translationFor(p: AiPrefs): TranslationConfig? = buildTranslation(p)
+
     private fun buildTranslation(p: AiPrefs): TranslationConfig? {
         if (!p.translateEnabled.get()) return null
         val from = p.translateFrom.get()
