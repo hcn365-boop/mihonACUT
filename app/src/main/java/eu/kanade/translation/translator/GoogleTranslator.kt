@@ -4,14 +4,13 @@ import eu.kanade.tachiyomi.network.await
 import eu.kanade.translation.model.PageTranslation
 import eu.kanade.translation.model.TranslationBlock
 import eu.kanade.translation.recognizer.TextRecognizerLanguage
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import tachiyomi.core.common.util.system.logcat
+import java.io.IOException
 import java.net.URLEncoder
+import java.util.IdentityHashMap
 import java.util.concurrent.TimeUnit
 
 @Suppress("PropertyName", "MaxLineLength", "FunctionName")
@@ -85,7 +84,7 @@ class GoogleTranslator(
     // هل لغة الترجمة الحالية لا تستخدم لاتيني؟
     private val shouldFixUntranslated = nonLatinLanguages.contains(toLang)
 
-    override suspend fun translate(pages: MutableMap<String, PageTranslation>) = coroutineScope {
+    override suspend fun translate(pages: MutableMap<String, PageTranslation>) {
         val rtlLanguages = setOf(
             TextTranslatorLanguage.ARABIC,
             TextTranslatorLanguage.PERSIAN,
@@ -97,11 +96,10 @@ class GoogleTranslator(
             TextTranslatorLanguage.YIDDISH,
             TextTranslatorLanguage.KURDISH,
         )
-        val isRTL = rtlLanguages.contains(toLang)
-        val rtlMarker = if (isRTL) "\u200F" else ""
+        val rtlMarker = if (rtlLanguages.contains(toLang)) "\u200F" else ""
 
-        // 1. تجميع البلوكات الصالحة
-        val allValidBlocks = mutableListOf<TranslationBlock>()
+        // 1. The blocks that can be translated.
+        val valid = mutableListOf<TranslationBlock>()
         pages.forEach { (_, page) ->
             page.blocks.forEach { block ->
                 val isAcceptedAngle = (block.angle >= -15.0f && block.angle <= 15.0f) ||
@@ -110,101 +108,114 @@ class GoogleTranslator(
                 val isUrl = urlPattern.containsMatchIn(block.text)
 
                 if (isAcceptedAngle && !isUrl) {
-                    allValidBlocks.add(block)
+                    valid.add(block)
                 } else {
                     block.translation = ""
                 }
             }
         }
+        if (valid.isEmpty()) return
 
-        if (allValidBlocks.isEmpty()) return@coroutineScope
+        // 2. A phrase translated before (a sound effect, "yes", a name) needs no request.
+        val translations = IdentityHashMap<TranslationBlock, String>()
+        val pending = mutableListOf<TranslationBlock>()
+        for (block in valid) {
+            val known = cachedPhrase(cleanSymbols(block.text))
+            if (known != null) translations[block] = known else pending.add(block)
+        }
 
-        // 2. التحزيم
+        // 3. Batches of at most 1700 characters (the text travels inside the address).
         val batches = mutableListOf<MutableList<TranslationBlock>>()
-        var currentBatch = mutableListOf<TranslationBlock>()
-        var currentLength = 0
-
-        for (block in allValidBlocks) {
-            val cleanedBlockText = cleanSymbols(block.text)
-            val textToAdd = cleanedBlockText + SAFE_SEPARATOR
-
-            if (currentLength + textToAdd.length > 1700 && currentBatch.isNotEmpty()) {
-                batches.add(currentBatch)
-                currentBatch = mutableListOf()
-                currentLength = 0
+        var current = mutableListOf<TranslationBlock>()
+        var length = 0
+        for (block in pending) {
+            val size = cleanSymbols(block.text).length + SAFE_SEPARATOR.length
+            if (length + size > MAX_BATCH_CHARS && current.isNotEmpty()) {
+                batches.add(current)
+                current = mutableListOf()
+                length = 0
             }
-            currentBatch.add(block)
-            currentLength += textToAdd.length + 1
+            current.add(block)
+            length += size + 1
         }
-        if (currentBatch.isNotEmpty()) batches.add(currentBatch)
+        if (current.isNotEmpty()) batches.add(current)
 
-        // 3. الترجمة وإصلاح الكلمات بالتوازي (Parallel Processing)
-        val deferredBatches = batches.map { batch ->
-            async {
-                val mergedText = batch.joinToString("\n") {
-                    cleanSymbols(it.text) + SAFE_SEPARATOR
+        // 4. One request after another. The policy spaces them out, so a long chapter cannot get us blocked.
+        val fresh = IdentityHashMap<TranslationBlock, String>()
+        var lastError: Exception? = null
+        for (batch in batches) {
+            try {
+                val lines = translateBatch(batch)
+                batch.forEachIndexed { index, block ->
+                    val line = lines.getOrNull(index)
+                    if (!line.isNullOrBlank()) fresh[block] = line
                 }
-
-                val translatedMergedText = try {
-                    translateText(toLang.code, mergedText)
-                } catch (e: Exception) {
-                    logcat { "Translation failed: ${e.message}" }
-                    ""
-                }
-
-                if (translatedMergedText.isNotBlank()) {
-                    val translatedLines = translatedMergedText.split("\n")
-                        .map { it.trim() }
-                        .filter { it.isNotEmpty() }
-
-                    val textToFixMap = mutableMapOf<Int, String>()
-
-                    batch.forEachIndexed { index, _ ->
-                        if (index < translatedLines.size) {
-                            val cleanText = translatedLines[index]
-                                .removeSuffix(".")
-                                .removeSuffix(" .")
-                                .trim()
-
-                            textToFixMap[index] = cleanText
-                        }
-                    }
-
-                    // إصلاح الكلمات غير المترجمة دفعة واحدة لهذه الحزمة
-                    val fixedTexts = fixUntranslatedWordsBatch(textToFixMap.values.toList(), toLang.code)
-
-                    batch.forEachIndexed { index, block ->
-                        if (index < fixedTexts.size) {
-                            block.translation = rtlMarker + fixedTexts[index]
-                        }
-                    }
-                }
+            } catch (e: TranslationRateLimitedException) {
+                // Stop at once: more requests would only make the block longer.
+                throw e
+            } catch (e: IOException) {
+                lastError = e
+                logcat { "Translation failed: ${e.message}" }
+            } catch (e: IllegalStateException) {
+                lastError = e
+                logcat { "Translation failed: ${e.message}" }
             }
         }
+        // Nothing was translated and something failed: tell the caller instead of leaving empty bubbles.
+        if (fresh.isEmpty() && translations.isEmpty() && lastError != null) throw lastError
 
-        // انتظار انتهاء جميع الحزم
-        deferredBatches.awaitAll()
+        // 5. Words left in the original alphabet are translated in ONE request for all the batches.
+        val blocks = fresh.keys.toList()
+        val fixed = fixUntranslatedWordsBatch(blocks.map { fresh.getValue(it) }, toLang.code)
+        blocks.forEachIndexed { index, block ->
+            translations[block] = fixed[index]
+            rememberPhrase(cleanSymbols(block.text), fixed[index])
+        }
+
+        // 6. Every block gets its translation.
+        for (block in valid) {
+            translations[block]?.let { block.translation = rtlMarker + it }
+        }
     }
 
     /**
-     * يقوم بجمع كل الكلمات غير المترجمة من جميع السطور، وترسلها في طلب شبكة واحد فقط
+     * Translates the blocks of one batch in one request and returns one text per block, in order.
+     * If the service merges or splits lines, the batch is cut in two and each half is translated apart, so every
+     * bubble gets its own text and never the text of its neighbour.
+     */
+    private suspend fun translateBatch(batch: List<TranslationBlock>): List<String> {
+        val merged = batch.joinToString("\n") { cleanSymbols(it.text) + SAFE_SEPARATOR }
+        val translated = translateText(toLang.code, merged)
+        val lines = translated.split("\n").map { it.trim() }.filter { it.isNotEmpty() }
+        if (lines.size == batch.size) return lines.map { tidy(it) }
+        if (batch.size == 1) return listOf(tidy(lines.joinToString(" ")))
+        val half = batch.size / 2
+        return translateBatch(batch.subList(0, half)) + translateBatch(batch.subList(half, batch.size))
+    }
+
+    private fun tidy(text: String): String = text.removeSuffix(".").removeSuffix(" .").trim()
+
+    /**
+     * Collects the words that stayed in the original alphabet in every text and translates them
+     * in a single request. A failure here is not fatal: the texts stay as they are.
      */
     private suspend fun fixUntranslatedWordsBatch(translatedTexts: List<String>, langCode: String): List<String> {
         if (!shouldFixUntranslated) return translatedTexts
 
-        // استخراج كل الكلمات اللاتينية من جميع النصوص معاً بدون تكرار
         val allUntranslatedWords = translatedTexts.flatMap { text ->
             untranslatedWordPattern.findAll(text).map { it.value }.toList()
         }.distinct()
-
         if (allUntranslatedWords.isEmpty()) return translatedTexts
 
-        // تجميع الكلمات في نص واحد يفصل بينها سطر جديد
-        val wordsToTranslateMerged = allUntranslatedWords.joinToString("\n")
-
         val translatedWordsMerged = try {
-            translateText(langCode, wordsToTranslateMerged)
-        } catch (e: Exception) {
+            translateText(langCode, allUntranslatedWords.joinToString("\n"))
+        } catch (e: TranslationRateLimitedException) {
+            logcat { "Skipped fixing the remaining words: ${e.message}" }
+            ""
+        } catch (e: IOException) {
+            logcat { "Failed to translate missing words batch: ${e.message}" }
+            ""
+        } catch (e: IllegalStateException) {
             logcat { "Failed to translate missing words batch: ${e.message}" }
             ""
         }
@@ -214,20 +225,19 @@ class GoogleTranslator(
             val translatedWordsList = translatedWordsMerged.split("\n").map { it.trim() }
             allUntranslatedWords.forEachIndexed { index, word ->
                 if (index < translatedWordsList.size) {
-                    val singleTranslation = translatedWordsList[index].removeSuffix(".").removeSuffix(" .").trim()
-                    if (singleTranslation.isNotBlank() && !untranslatedWordPattern.containsMatchIn(singleTranslation)) {
-                        translationMap[word] = singleTranslation
+                    val single = tidy(translatedWordsList[index])
+                    if (single.isNotBlank() && !untranslatedWordPattern.containsMatchIn(single)) {
+                        translationMap[word] = single
                     }
                 }
             }
         }
 
-        // استبدال الكلمات في النصوص الأصلية
         return translatedTexts.map { originalText ->
             var fixedText = originalText
-            translationMap.forEach { (englishWord, translatedWord) ->
-                // استخدام Regex بحدود الكلمة (\b) لتجنب استبدال أجزاء من كلمات أخرى
-                fixedText = fixedText.replace(Regex("""\b$englishWord\b"""), translatedWord)
+            translationMap.forEach { (word, translatedWord) ->
+                // Word boundaries keep a word from being replaced inside another word.
+                fixedText = fixedText.replace(Regex("""\b$word\b"""), translatedWord)
             }
             fixedText
         }
@@ -240,34 +250,34 @@ class GoogleTranslator(
             .trim()
     }
 
-    private suspend fun translateText(lang: String, text: String): String {
-        val access = getTranslateUrl(lang, text)
+    /** One request, under the shared policy. Every answer is checked before it is read. */
+    private suspend fun translateText(lang: String, text: String): String = policy.execute {
         val request: Request = Request.Builder()
-            .url(access)
+            .url(getTranslateUrl(lang, text))
             .header(
                 "User-Agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             )
             .build()
 
-        val response = okHttpClient.newCall(request).await()
-        val responseBody = response.body?.string() ?: return ""
-
-        return try {
-            val rootArray = JSONArray(responseBody)
-            val sentencesArray = rootArray.getJSONArray(0)
-            val result = StringBuilder()
-
-            for (i in 0 until sentencesArray.length()) {
-                val sentence = sentencesArray.getJSONArray(i)
-                if (!sentence.isNull(0)) {
-                    result.append(sentence.getString(0))
-                }
+        okHttpClient.newCall(request).await().use { response ->
+            RequestPolicy.checkStatus(response.code, response.header("Retry-After"))
+            val body = response.body?.string().orEmpty()
+            // A web page instead of the answer means the service is blocking us.
+            if (!body.trimStart().startsWith("[")) {
+                throw TranslationRateLimitedException("Google answered with a web page instead of a translation")
             }
-            result.toString()
-        } catch (e: Exception) {
-            logcat { "Parsing Error: $e" }
-            ""
+            try {
+                val sentences = JSONArray(body).getJSONArray(0)
+                val result = StringBuilder()
+                for (i in 0 until sentences.length()) {
+                    val sentence = sentences.getJSONArray(i)
+                    if (!sentence.isNull(0)) result.append(sentence.getString(0))
+                }
+                result.toString()
+            } catch (e: Exception) {
+                throw IllegalStateException("Cannot read the answer of Google: ${e.message}", e)
+            }
         }
     }
 
@@ -324,4 +334,26 @@ class GoogleTranslator(
     }
 
     override fun close() {}
+
+    companion object {
+        /** One policy for all the Google requests of the app: the limits belong to the service. */
+        private val policy = RequestPolicy(name = "Google Translate", minIntervalMs = 800, maxConcurrent = 1)
+
+        private const val MAX_BATCH_CHARS = 1700
+        private const val MAX_PHRASES = 1000
+
+        /** Phrases already translated, per target language, to avoid sending the same text again. */
+        private val phrases = object : LinkedHashMap<String, String>(256, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>): Boolean =
+                size > MAX_PHRASES
+        }
+    }
+
+    private fun cachedPhrase(cleaned: String): String? =
+        if (cleaned.isEmpty()) null else synchronized(phrases) { phrases["${toLang.code}|$cleaned"] }
+
+    private fun rememberPhrase(cleaned: String, translation: String) {
+        if (cleaned.isEmpty() || translation.isBlank()) return
+        synchronized(phrases) { phrases["${toLang.code}|$cleaned"] = translation }
+    }
 }
