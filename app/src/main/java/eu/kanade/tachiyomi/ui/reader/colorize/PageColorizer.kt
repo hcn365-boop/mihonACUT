@@ -150,6 +150,12 @@ object PageColorizer {
         return result.readByteArray()
     }
 
+    /** Batch processing: the page after the image steps with no text drawn, or null when it stays as it is. */
+    suspend fun processImagesToBytes(context: Context, source: BufferedSource): ByteArray? {
+        val result = run(context.applicationContext, source, display = false, translate = false) ?: return null
+        return result.readByteArray()
+    }
+
     fun contentHash(bytes: ByteArray): String = hash(bytes)
 
     /**
@@ -174,13 +180,12 @@ object PageColorizer {
         display: Boolean,
         translate: Boolean = true,
     ): BufferedSource? {
-        // Pages processed in advance (batch processing) are used as they are.
+        // Pages processed in advance (batch processing) are shown as they are, with their saved translation.
         if (display && !AiConfig.isPost && AiConfig.usePostProcessed() && PostProcessStore.maybeHasResults) {
             val original = source.peek().readByteArray()
-            when (val found = PostProcessStore.lookup(context, hash(original))) {
-                is PostProcessStore.Found.Processed -> return Buffer().write(found.bytes)
-                PostProcessStore.Found.Keep -> return null
-                null -> Unit
+            val originalHash = hash(original)
+            PostProcessStore.lookup(context, originalHash)?.let { found ->
+                return PostRead.compose(context, originalHash, original, found)
             }
         }
 
