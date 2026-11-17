@@ -9,6 +9,7 @@ import eu.kanade.translation.translator.TextTranslator
 import eu.kanade.translation.translator.TranslatorSettings
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -87,6 +88,29 @@ object PageTranslationService {
         }
         if (full) scope.launch { flush(limits) } else scheduleFlush(limits)
     }
+
+    /**
+     * Like [enqueue], but returns something to wait for: it completes with the translated page (or null when
+     * the page has no text) once the translation is stored, and fails if the translator failed.
+     */
+    suspend fun enqueueTracked(
+        context: Context,
+        settings: TranslatorSettings,
+        ocrMode: OcrMode,
+        imageHash: String,
+        limits: BatchLimits,
+        loadBitmap: () -> Bitmap?,
+    ): Deferred<PageTranslation?> =
+        when (val prepared = prepare(context.applicationContext, settings, ocrMode, imageHash, loadBitmap)) {
+            is Prepared.Ready -> CompletableDeferred(prepared.page)
+            is Prepared.Waiting -> {
+                val full = synchronized(pendingLock) {
+                    pending.size >= limits.maxPages || pending.values.sumOf { it.chars } >= limits.maxChars
+                }
+                if (full) scope.launch { flush(limits) } else scheduleFlush(limits)
+                prepared.entry.done
+            }
+        }
 
     /**
      * For the page being read: sends it together with every page already waiting, without waiting for
