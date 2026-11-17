@@ -55,6 +55,7 @@ fun ChapterProcessIndicator(
         ChapterProcessState.Queued -> WorkingIndicator(enabled, null, modifier, onClick)
         is ChapterProcessState.Processing -> WorkingIndicator(enabled, state.progress, modifier, onClick)
         ChapterProcessState.Processed -> DoneIndicator(enabled, modifier, onClick)
+        ChapterProcessState.ProcessedFinal -> FinalIndicator(modifier)
         ChapterProcessState.Error -> FailedIndicator(enabled, modifier, onClick)
     }
 }
@@ -186,6 +187,22 @@ private fun DoneIndicator(
                 },
             )
         }
+    }
+}
+
+/** The originals were replaced, so there is no menu: nothing can be redone or undone from here. */
+@Composable
+private fun FinalIndicator(modifier: Modifier) {
+    Box(
+        modifier = modifier.size(IconButtonTokens.StateLayerSize),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = MaterialSymbols.Rounded.Palette,
+            contentDescription = "Processed, original pages replaced",
+            modifier = Modifier.size(IndicatorSize),
+            tint = MaterialTheme.colorScheme.tertiary,
+        )
     }
 }
 
