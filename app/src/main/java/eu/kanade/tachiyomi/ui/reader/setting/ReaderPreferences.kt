@@ -223,6 +223,15 @@ class ReaderPreferences(
 
     val postUseProcessed: Preference<Boolean> = preferenceStore.getBoolean("pref_post_use_processed", true)
 
+    // Batch processing: keep the original pages? When off, the processed page replaces the original
+    val postKeepOriginals: Preference<Boolean> = preferenceStore.getBoolean("pref_post_keep_originals", true)
+
+    // Draw the translation into the processed images (permanent) instead of keeping it apart
+    val postTranslationInImages: Preference<Boolean> = preferenceStore.getBoolean("pref_post_translation_in_images", false)
+
+    // Keep the separate translation as json files next to the chapter, not only in the app
+    val postTranslationInFolder: Preference<Boolean> = preferenceStore.getBoolean("pref_post_translation_in_folder", false)
+
     // region Translation
     
     val translateCollisionPadding: Preference<Int> = preferenceStore.getInt("pref_translate_collision_padding", 130)
