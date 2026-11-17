@@ -26,6 +26,9 @@ object PostProcessStore {
     const val STATE_PROCESSED = 1
     const val STATE_ERROR = 2
 
+    /** Processed with the original pages replaced. */
+    const val STATE_FINAL = 3
+
     @Volatile
     private var hasAny = false
 
@@ -81,6 +84,27 @@ object PostProcessStore {
         db(context).rawQuery("SELECT uri FROM pages WHERE chapter = ? AND uri != ''", arrayOf(chapterId.toString()))
             .use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getString(0)) } }
 
+    /** The json file with the translation of a page, when it is kept next to the chapter. */
+    fun translationUri(context: Context, hash: String): String? =
+        db(context).rawQuery("SELECT translation FROM pages WHERE hash = ?", arrayOf(hash))
+            .use { if (it.moveToFirst()) it.getString(0)?.takeIf { uri -> uri.isNotEmpty() } else null }
+
+    fun setTranslationUri(context: Context, hash: String, uri: String) {
+        val values = ContentValues().apply { put("translation", uri) }
+        db(context).update("pages", values, "hash = ?", arrayOf(hash))
+    }
+
+    /** Where the json files of a chapter are. */
+    fun chapterTranslationUris(context: Context, chapterId: Long): List<String> =
+        db(context).rawQuery(
+            "SELECT translation FROM pages WHERE chapter = ? AND translation IS NOT NULL AND translation != ''",
+            arrayOf(chapterId.toString()),
+        ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getString(0)) } }
+
+    fun chaptersWithState(context: Context, state: Int): Set<Long> =
+        db(context).rawQuery("SELECT chapter FROM chapters WHERE state = ?", arrayOf(state.toString()))
+            .use { cursor -> buildSet { while (cursor.moveToNext()) add(cursor.getLong(0)) } }
+
     fun setChapter(context: Context, chapterId: Long, state: Int) {
         val values = ContentValues().apply {
             put("chapter", chapterId)
@@ -101,15 +125,17 @@ object PostProcessStore {
         refresh(context)
     }
 
-    private class Helper(context: Context) : SQLiteOpenHelper(context, "post_process.db", null, 1) {
+    private class Helper(context: Context) : SQLiteOpenHelper(context, "post_process.db", null, 2) {
         override fun onCreate(db: SQLiteDatabase) {
-            db.execSQL("CREATE TABLE pages (hash TEXT PRIMARY KEY, chapter INTEGER NOT NULL, uri TEXT NOT NULL)")
+            db.execSQL("CREATE TABLE pages (hash TEXT PRIMARY KEY, chapter INTEGER NOT NULL, uri TEXT NOT NULL, translation TEXT)")
             db.execSQL("CREATE INDEX pages_chapter ON pages (chapter)")
             db.execSQL(
                 "CREATE TABLE chapters (chapter INTEGER PRIMARY KEY, state INTEGER NOT NULL, updated INTEGER NOT NULL)",
             )
         }
 
-        override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+        override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+            if (oldVersion < 2) db.execSQL("ALTER TABLE pages ADD COLUMN translation TEXT")
+        }
     }
 }
