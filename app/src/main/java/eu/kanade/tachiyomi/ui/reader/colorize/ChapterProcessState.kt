@@ -15,6 +15,9 @@ sealed interface ChapterProcessState {
     /** Every page was processed and saved. */
     data object Processed : ChapterProcessState
 
+    /** Processed, and the original pages were replaced by the processed ones: there is nothing to undo. */
+    data object ProcessedFinal : ChapterProcessState
+
     /** Stopped by an error; pressing the button tries again. */
     data object Error : ChapterProcessState
 }
