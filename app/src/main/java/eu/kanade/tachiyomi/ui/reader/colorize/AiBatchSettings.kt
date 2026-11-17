@@ -16,6 +16,7 @@ import androidx.compose.ui.unit.dp
 import eu.kanade.tachiyomi.ui.reader.colorize.AiPrefs
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
 import tachiyomi.presentation.core.components.CheckboxItem
+import tachiyomi.presentation.core.util.collectAsState
 
 /**
  * Settings of the batch processing: what the button next to a downloaded chapter does. They are kept
@@ -29,6 +30,34 @@ internal fun BatchSettings(base: ReaderPreferences) {
 
     CheckboxItem(label = "Process chapters automatically after they are downloaded", pref = base.postProcessAuto)
     CheckboxItem(label = "Use the processed pages when reading", pref = base.postUseProcessed)
+
+    // Three independent options. The last one only matters when the translation is not drawn into the images.
+    val keepOriginals by base.postKeepOriginals.collectAsState()
+    val inImages by base.postTranslationInImages.collectAsState()
+    CheckboxItem(label = "Keep the original pages", pref = base.postKeepOriginals)
+    if (!keepOriginals) {
+        Text(
+            text = "Each processed page replaces its original. This cannot be undone, and a chapter processed " +
+                "this way cannot be processed again.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+        )
+    }
+    CheckboxItem(label = "Draw the translation into the images (permanent)", pref = base.postTranslationInImages)
+    if (inImages) {
+        Text(
+            text = "The text becomes part of the image. To change the translation or the font later, the " +
+                "chapter has to be processed again from the original pages.",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+        )
+    } else {
+        CheckboxItem(
+            label = "Keep the translation next to the chapter (json files)",
+            pref = base.postTranslationInFolder,
+        )
+    }
     Text(
         text = "Processed pages are saved in a folder named \"processed\" inside the chapter's download folder, " +
             "next to the original pages, which are never changed.",
