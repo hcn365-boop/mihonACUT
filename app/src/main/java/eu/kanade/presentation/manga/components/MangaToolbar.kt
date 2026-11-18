@@ -37,6 +37,7 @@ fun MangaToolbar(
     onClickRefresh: () -> Unit,
     onClickMigrate: (() -> Unit)?,
     onClickEditNotes: () -> Unit,
+    onClickAiBatchSettings: () -> Unit, // تمت الإضافة هنا
 
     // For action mode
     actionModeCounter: Int,
@@ -144,6 +145,13 @@ fun MangaToolbar(
                         AppBar.OverflowAction(
                             title = stringResource(MR.strings.action_notes),
                             onClick = onClickEditNotes,
+                        ),
+                    )
+                    // الخيار الجديد الخاص بإعدادات الـ Batch للذكاء الاصطناعي
+                    add(
+                        AppBar.OverflowAction(
+                            title = "AI Batch Settings",
+                            onClick = onClickAiBatchSettings,
                         ),
                     )
                 },
