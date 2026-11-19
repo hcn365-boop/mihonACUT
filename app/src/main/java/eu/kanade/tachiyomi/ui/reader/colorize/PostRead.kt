@@ -20,6 +20,12 @@ import java.io.ByteArrayOutputStream
  */
 object PostRead {
 
+    /** Chapter files already read in this run of the app. */
+    private val imported = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** Call after the saved translations were deleted, so the chapter files are read again when needed. */
+    fun forgetImports() = imported.clear()
+
     /** The name under which batch processing saves the translation of a page. */
     fun translationName(originalHash: String): String = "post_$originalHash"
 
@@ -37,10 +43,18 @@ object PostRead {
         val name = translationName(originalHash)
         var saved = TranslationStore.load(context, TranslationStore.Kind.TRANSLATED, name)
         if (saved == null) {
-            // Kept next to the chapter: read the file, and keep a copy in the app for the next time.
-            PostProcessStore.translationUri(context, originalHash)?.let { uri ->
-                saved = PostTranslationFiles.read(context, uri)?.also {
-                    TranslationStore.save(context, TranslationStore.Kind.TRANSLATED, name, it)
+            // Kept next to the chapter: the file holds the whole chapter, so it is read ONCE, and every page
+            // goes to the app's storage in one transaction. Reading it again for each page would be slow.
+            val uri = PostProcessStore.translationUriForPage(context, originalHash)
+            if (uri != null && imported.add(uri)) {
+                val all = PostTranslationFiles.readChapter(context, uri)
+                if (all != null) {
+                    TranslationStore.saveAll(
+                        context,
+                        TranslationStore.Kind.TRANSLATED,
+                        all.mapKeys { translationName(it.key) },
+                    )
+                    saved = all[originalHash]
                 }
             }
         }
