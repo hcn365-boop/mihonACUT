@@ -286,31 +286,34 @@ object PostProcessManager {
             // where the options say.
             if (translation != null && waiting.isNotEmpty()) {
                 PageTranslationService.flushNow(translation.limits)
+                // The translations of the chapter are collected and saved ONCE at the end: one file, or one
+                // database transaction, and never one write per page.
+                val translated = LinkedHashMap<String, PageTranslation>()
                 waiting.forEachIndexed { index, (record, deferred) ->
                     val page = deferred.await()
                     if (page != null && page.blocks.isNotEmpty()) {
-                        when {
-                            inImages -> burn(context, request, chapterDir, keepOriginals, record, page)
-                            inFolder -> {
-                                val file = PostTranslationFiles.write(
-                                    chapterDir.subFolder(PostTranslationFiles.FOLDER),
-                                    record.baseName + ".json",
-                                    page,
-                                )
-                                PostProcessStore.setTranslationUri(context, record.readHash, file.uri.toString())
-                            }
-                            else -> TranslationStore.save(
-                                context,
-                                TranslationStore.Kind.TRANSLATED,
-                                PostRead.translationName(record.readHash),
-                                page,
-                            )
+                        if (inImages) {
+                            burn(context, request, chapterDir, keepOriginals, record, page)
+                        } else {
+                            translated[record.readHash] = page
                         }
                     }
                     setState(
                         request.chapterId,
                         ChapterProcessState.Processing(imageShare + (1f - imageShare) * (index + 1f) / waiting.size),
                     )
+                }
+                if (translated.isNotEmpty()) {
+                    if (inFolder) {
+                        val file = PostTranslationFiles.writeChapter(chapterDir, translated)
+                        PostProcessStore.setChapterTranslationUri(context, request.chapterId, file.uri.toString())
+                    } else {
+                        TranslationStore.saveAll(
+                            context,
+                            TranslationStore.Kind.TRANSLATED,
+                            translated.mapKeys { PostRead.translationName(it.key) },
+                        )
+                    }
                 }
             }
         }
@@ -343,7 +346,8 @@ object PostProcessManager {
     /** Deletes the processed files and the translation files of a chapter and forgets them. Empty folders go too. */
     private fun clearResults(context: Context, chapterId: Long) {
         val folders = mutableSetOf<UniFile>()
-        val uris = PostProcessStore.chapterUris(context, chapterId) + PostProcessStore.chapterTranslationUris(context, chapterId)
+        val uris = PostProcessStore.chapterUris(context, chapterId) +
+            listOfNotNull(PostProcessStore.chapterTranslationUri(context, chapterId))
         uris.forEach { uri ->
             val file = UniFile.fromUri(context, Uri.parse(uri)) ?: return@forEach
             file.parentFile?.let { folders.add(it) }
