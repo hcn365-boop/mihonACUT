@@ -19,14 +19,14 @@ import java.security.MessageDigest
  */
 object TranslationStore {
 
-        enum class Kind(val id: Int) {
+    enum class Kind(val id: Int) {
         OCR(0),
         TRANSLATED(1),
 
         /** The language the OCR of a page was run with, as a plain name. */
         LANGUAGE(2),
-        }
-        
+    }
+
     private const val DATABASE = "translations.db"
     private const val TABLE = "pages"
 
@@ -84,6 +84,28 @@ object TranslationStore {
         database(context).insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
+    /** Saves many pages in one transaction: much faster than one save after another. */
+    fun saveAll(context: Context, kind: Kind, pages: Map<String, PageTranslation>) {
+        if (pages.isEmpty()) return
+        val db = database(context)
+        db.beginTransaction()
+        try {
+            val now = System.currentTimeMillis()
+            for ((name, page) in pages) {
+                val values = ContentValues().apply {
+                    put("name", name)
+                    put("kind", kind.id)
+                    put("data", json.encodeToString(PageTranslation.serializer(), page))
+                    put("updated", now)
+                }
+                db.insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
     fun loadText(context: Context, kind: Kind, name: String): String? =
         database(context).rawQuery(
             "SELECT data FROM $TABLE WHERE name = ? AND kind = ?",
@@ -99,7 +121,7 @@ object TranslationStore {
         }
         database(context).insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
-    
+
     /** Deletes everything of one kind, or of both kinds when [kind] is null. */
     fun clear(context: Context, kind: Kind? = null) {
         val db = database(context)
