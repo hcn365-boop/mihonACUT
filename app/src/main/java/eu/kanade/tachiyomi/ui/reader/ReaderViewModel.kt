@@ -38,6 +38,8 @@ import eu.kanade.tachiyomi.data.saver.Location
 import eu.kanade.tachiyomi.source.Source
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
+import eu.kanade.tachiyomi.ui.reader.colorize.PostProcessManager
 import eu.kanade.tachiyomi.ui.reader.loader.ChapterLoader
 import eu.kanade.tachiyomi.ui.reader.loader.DownloadPageLoader
 import eu.kanade.tachiyomi.ui.reader.model.InsertPage
@@ -54,6 +56,7 @@ import eu.kanade.tachiyomi.util.editCover
 import eu.kanade.tachiyomi.util.lang.byteSize
 import eu.kanade.tachiyomi.util.storage.DiskUtil
 import eu.kanade.tachiyomi.util.storage.cacheImageDir
+import eu.kanade.translation.MangaTranslationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
@@ -91,9 +94,7 @@ import tachiyomi.source.local.image.LocalCoverManager
 import tachiyomi.source.local.isLocal
 import java.util.Date
 import kotlin.time.Clock
-import eu.kanade.translation.MangaTranslationContext
-import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
-import eu.kanade.tachiyomi.ui.reader.colorize.PostProcessManager
+
 /**
  * Presenter used by the activity to perform background operations.
  */
@@ -311,6 +312,7 @@ class ReaderViewModel(
                 downloadManager.addDownloadsToStartOfQueue(listOf(it))
             }
         }
+        MangaTranslationContext.currentChapterPages = null
     }
 
     /**
@@ -334,7 +336,11 @@ class ReaderViewModel(
                 MangaTranslationContext.update(manga.id, manga.title, source.lang)
                 AiConfig.onMangaChanged()
                 PostProcessManager.ensureLoaded(context)
-                PostProcessManager.ensureLoaded(context)
+                MangaTranslationContext.currentChapterPages = {
+                    state.value.viewerChapters?.currChapter?.pages.orEmpty().map { page ->
+                        { page.stream?.invoke()?.use { it.readBytes() } }
+                    }
+                }
                 incognitoMode = getIncognitoState.await(manga.source)
                 mutableState.update { it.copy(manga = manga, source = source) }
                 if (chapterId == -1L) chapterId = initialChapterId
