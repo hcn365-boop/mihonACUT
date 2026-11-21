@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
 import eu.kanade.translation.model.PageTranslation
 import kotlinx.serialization.json.Json
 import java.security.MessageDigest
@@ -19,14 +20,14 @@ import java.security.MessageDigest
  */
 object TranslationStore {
 
-    enum class Kind(val id: Int) {
+        enum class Kind(val id: Int) {
         OCR(0),
         TRANSLATED(1),
 
         /** The language the OCR of a page was run with, as a plain name. */
         LANGUAGE(2),
-    }
-
+        }
+        
     private const val DATABASE = "translations.db"
     private const val TABLE = "pages"
 
@@ -35,15 +36,17 @@ object TranslationStore {
     @Volatile
     private var helper: Helper? = null
 
-    private class Helper(context: Context) : SQLiteOpenHelper(context, DATABASE, null, 1) {
+    private class Helper(context: Context) : SQLiteOpenHelper(context, DATABASE, null, 2) {
         override fun onCreate(db: SQLiteDatabase) {
             db.execSQL(
                 "CREATE TABLE $TABLE (name TEXT NOT NULL, kind INTEGER NOT NULL, data TEXT NOT NULL, " +
-                    "updated INTEGER NOT NULL, PRIMARY KEY (name, kind))",
+                    "updated INTEGER NOT NULL, manga INTEGER NOT NULL DEFAULT -1, PRIMARY KEY (name, kind))",
             )
         }
 
-        override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+        override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+            if (oldVersion < 2) db.execSQL("ALTER TABLE $TABLE ADD COLUMN manga INTEGER NOT NULL DEFAULT -1")
+        }
     }
 
     private fun database(context: Context): SQLiteDatabase {
@@ -74,9 +77,10 @@ object TranslationStore {
         }
     }
 
-    fun save(context: Context, kind: Kind, name: String, page: PageTranslation) {
+    fun save(context: Context, kind: Kind, name: String, page: PageTranslation, manga: Long = AiConfig.mangaId) {
         val values = ContentValues().apply {
             put("name", name)
+            put("manga", manga)
             put("kind", kind.id)
             put("data", json.encodeToString(PageTranslation.serializer(), page))
             put("updated", System.currentTimeMillis())
@@ -84,8 +88,25 @@ object TranslationStore {
         database(context).insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
+    fun loadText(context: Context, kind: Kind, name: String): String? =
+        database(context).rawQuery(
+            "SELECT data FROM $TABLE WHERE name = ? AND kind = ?",
+            arrayOf(name, kind.id.toString()),
+        ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+
+    fun saveText(context: Context, kind: Kind, name: String, value: String, manga: Long = AiConfig.mangaId) {
+        val values = ContentValues().apply {
+            put("name", name)
+            put("manga", manga)
+            put("kind", kind.id)
+            put("data", value)
+            put("updated", System.currentTimeMillis())
+        }
+        database(context).insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+    
     /** Saves many pages in one transaction: much faster than one save after another. */
-    fun saveAll(context: Context, kind: Kind, pages: Map<String, PageTranslation>) {
+    fun saveAll(context: Context, kind: Kind, pages: Map<String, PageTranslation>, manga: Long = AiConfig.mangaId) {
         if (pages.isEmpty()) return
         val db = database(context)
         db.beginTransaction()
@@ -95,6 +116,7 @@ object TranslationStore {
                 val values = ContentValues().apply {
                     put("name", name)
                     put("kind", kind.id)
+                    put("manga", manga)
                     put("data", json.encodeToString(PageTranslation.serializer(), page))
                     put("updated", now)
                 }
@@ -106,21 +128,34 @@ object TranslationStore {
         }
     }
 
-    fun loadText(context: Context, kind: Kind, name: String): String? =
-        database(context).rawQuery(
-            "SELECT data FROM $TABLE WHERE name = ? AND kind = ?",
-            arrayOf(name, kind.id.toString()),
-        ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
-
-    fun saveText(context: Context, kind: Kind, name: String, value: String) {
-        val values = ContentValues().apply {
-            put("name", name)
-            put("kind", kind.id)
-            put("data", value)
-            put("updated", System.currentTimeMillis())
+    /**
+     * Deletes everything saved for the pages with these fingerprints: their text, their language, and the
+     * copies made by batch processing. Names start with the fingerprint of the page.
+     * @return how many rows were deleted
+     */
+    fun deleteForHashes(context: Context, hashes: Collection<String>): Int {
+        if (hashes.isEmpty()) return 0
+        val db = database(context)
+        var deleted = 0
+        db.beginTransaction()
+        try {
+            for (hash in hashes) {
+                deleted += db.delete(TABLE, "name LIKE ? OR name LIKE ?", arrayOf("$hash%", "post_$hash%"))
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
         }
-        database(context).insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+        return deleted
     }
+
+    /**
+     * Deletes everything saved while reading or processing one manga. Rows saved before this existed have no
+     * manga and are only removed by [clear].
+     * @return how many rows were deleted
+     */
+    fun deleteForManga(context: Context, mangaId: Long): Int =
+        database(context).delete(TABLE, "manga = ?", arrayOf(mangaId.toString()))
 
     /** Deletes everything of one kind, or of both kinds when [kind] is null. */
     fun clear(context: Context, kind: Kind? = null) {
