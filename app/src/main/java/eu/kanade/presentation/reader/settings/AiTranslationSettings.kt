@@ -22,7 +22,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import eu.kanade.tachiyomi.ui.reader.colorize.AiPrefs
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
+import eu.kanade.translation.MangaTranslationContext
 import eu.kanade.translation.OcrLanguages
 import eu.kanade.translation.OcrMode
 import eu.kanade.translation.TranslationFont
@@ -34,8 +36,6 @@ import tachiyomi.core.common.preference.Preference
 import tachiyomi.presentation.core.components.CheckboxItem
 import tachiyomi.presentation.core.components.SliderItem
 import tachiyomi.presentation.core.util.collectAsState
-import eu.kanade.translation.MangaTranslationContext
-import eu.kanade.tachiyomi.ui.reader.colorize.AiPrefs
 
 
 /** Translation part of the AI tab. Texts are plain strings for now. */
@@ -124,16 +124,7 @@ internal fun TranslationSection(prefs: AiPrefs, inReader: Boolean = false) {
 
     TranslationTestButton(prefs = prefs)
 
-    var size by remember { mutableStateOf(TranslationStore.sizeBytes(context)) }
-    TextButton(
-        onClick = {
-            TranslationStore.clear(context)
-            size = TranslationStore.sizeBytes(context)
-        },
-        modifier = Modifier.padding(horizontal = 8.dp),
-    ) {
-        Text("Delete saved translations (${size / 1024} KB)")
-    }
+    TranslationDeleteButtons(inReader)
 }
 
 /** Page language list for the chosen OCR engine: the main languages first, then the others. */
