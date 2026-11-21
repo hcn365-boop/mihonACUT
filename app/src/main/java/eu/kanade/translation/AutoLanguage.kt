@@ -32,6 +32,10 @@ object MangaTranslationContext {
     var sourceLang: String = ""
         private set
 
+    /** Gives the bytes of every page of the chapter open in the reader (set by the reader). */
+    @Volatile
+    var currentChapterPages: (() -> List<() -> ByteArray?>)? = null
+
     fun update(mangaId: Long, title: String, sourceLang: String) {
         this.mangaId = mangaId
         this.title = title
