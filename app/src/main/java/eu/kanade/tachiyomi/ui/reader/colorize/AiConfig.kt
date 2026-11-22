@@ -90,6 +90,8 @@ class AiSnapshot(
     val mangaSourceLang: String? = null,
     /** Null: ask the manga's own switch. Otherwise this answer (post-download jobs never force). */
     val forceTranslate: Boolean? = null,
+    /** The manga of a post-download job; null for the live snapshot, which uses the manga the reader has open. */
+    val mangaId: Long? = null,
 )
 
 /**
@@ -153,6 +155,10 @@ object AiConfig {
     val mangaTitle: String
         get() = s.mangaTitle ?: MangaTranslationContext.title
 
+    /** The manga whose pages are being read or processed. Saved translations are marked with it. */
+    val mangaId: Long
+        get() = s.mangaId ?: MangaTranslationContext.mangaId
+
     val mangaSourceLang: String
         get() = s.mangaSourceLang ?: MangaTranslationContext.sourceLang
 
@@ -179,8 +185,8 @@ object AiConfig {
      * The snapshot of the post-download settings, for a job that processes downloaded chapters.
      * [mangaTitle] and [sourceLang] belong to the manga being processed (used by automatic language).
      */
-    fun postSnapshot(prefs: ReaderPreferences, mangaTitle: String, sourceLang: String): AiSnapshot =
-        snapshotFrom(AiPrefs(prefs, null, "_post"), mangaTitle, sourceLang, forceTranslate = false)
+    fun postSnapshot(prefs: ReaderPreferences, mangaId: Long, mangaTitle: String, sourceLang: String): AiSnapshot =
+        snapshotFrom(AiPrefs(prefs, null, "_post"), mangaTitle, sourceLang, forceTranslate = false, mangaId = mangaId)
 
     /**
      * Copies the preferences now and whenever they change.
@@ -191,6 +197,11 @@ object AiConfig {
         viewerScope = scope
         this.onOutputChanged = onOutputChanged
         bindAll(notify = false)
+    }
+
+    /** Asks the viewer to reload the pages, for example after saved translations were deleted. */
+    fun requestReload() {
+        notifyChanged()
     }
 
     /** Call when the manga being read changes, so the right set of settings is used. */
@@ -262,6 +273,7 @@ object AiConfig {
         mangaTitle: String? = null,
         sourceLang: String? = null,
         forceTranslate: Boolean? = null,
+        mangaId: Long? = null,
     ): AiSnapshot = AiSnapshot(
         colorizeEnabled = p.colorizeEnabled.get(),
         colorizeUseSam = p.colorizeUseSam.get(),
@@ -291,6 +303,7 @@ object AiConfig {
         mangaTitle = mangaTitle,
         mangaSourceLang = sourceLang,
         forceTranslate = forceTranslate,
+        mangaId = mangaId,
     )
 
     /** The translation settings of any set of settings (real-time, one manga's, or batch). Null when off. */
