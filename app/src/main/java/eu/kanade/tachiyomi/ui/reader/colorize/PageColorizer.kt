@@ -128,7 +128,7 @@ object PageColorizer {
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            logcat(LogPriority.ERROR, e)
+            logcat(LogPriority.ERROR, e) { "PageColorizer: process failed, returning original source" }
             source
         }
     }
@@ -152,7 +152,7 @@ object PageColorizer {
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            logcat(LogPriority.ERROR, e)
+            logcat(LogPriority.ERROR, e) { "PageColorizer: prefetch failed" }
         }
     }
 
@@ -177,7 +177,12 @@ object PageColorizer {
         val wantFinal = AiConfig.upscaleFinalPassEnabled && acnetReady(context)
         val translation = if (translate) AiConfig.translation else null
         val wantShrink = AiConfig.normalizeSide > 0
-        if (!wantColor && !wantUpscale && !wantShrink && !wantFinal && translation == null) return null
+        if (!wantColor && !wantUpscale && !wantShrink && !wantFinal && translation == null) {
+            logcat(LogPriority.ERROR) {
+                "PageColorizer: skipped (enabled=${AiConfig.colorizeEnabled}, intensity=$intensity, modelLen=${colorModel.length()}, file=${colorModel.absolutePath})"
+            }
+            return null
+        }
         if (ImageUtil.isAnimatedAndSupported(source)) return null
 
         val bytes = source.peek().readByteArray()
@@ -187,6 +192,11 @@ object PageColorizer {
         val pixels = bounds.outWidth.toLong() * bounds.outHeight
 
         val doColor = wantColor && pixels <= AiConfig.colorizeMaxPixels
+        if (wantColor && !doColor) {
+            logcat(LogPriority.ERROR) {
+                "PageColorizer: color skipped by pixels ($pixels > ${AiConfig.colorizeMaxPixels})"
+            }
+        }
         val shortSide = minOf(bounds.outWidth, bounds.outHeight)
         val normalize = AiConfig.normalizeSide
         val upscaleInputPixels = if (normalize in 1 until shortSide) {
@@ -273,6 +283,7 @@ object PageColorizer {
         val file = cacheFile(context, baseName)
         if (file.isFile && file.length() > 0L) {
             file.setLastModified(System.currentTimeMillis())
+            logcat(LogPriority.ERROR) { "PageColorizer: cache hit baseName=$baseName" }
             return file.readBytes()
         }
 
@@ -283,9 +294,18 @@ object PageColorizer {
             var color = doColor
             val upscale = doUpscale && !original.hasAlpha()
             val finalPass = wantFinal && acnetReady(context) && !original.hasAlpha()
-            if (color && !looksGrayscale(working)) color = false
+            if (color && !looksGrayscale(working)) {
+                logcat(LogPriority.ERROR) { "PageColorizer: color skipped because looksGrayscale=false" }
+                color = false
+            }
             if (!color && !upscale && !finalPass && working === original) return null
-            if (estimateBytes(pixels, color, upscale, upscaleScale()) > AiConfig.memoryBudgetBytes) return null
+            val estimated = estimateBytes(pixels, color, upscale, upscaleScale())
+            if (estimated > AiConfig.memoryBudgetBytes) {
+                logcat(LogPriority.ERROR) {
+                    "PageColorizer: skipped by memoryBudget ($estimated > ${AiConfig.memoryBudgetBytes})"
+                }
+                return null
+            }
 
             val processed = try {
                 mutex.withLock {
@@ -294,8 +314,12 @@ object PageColorizer {
                         val colorModel = modelFile(context)
                         val chromaFile = chromaFile(context, imageHash, colorModel)
                         val engine = colorizerEngine(context, colorModel)
-                        val chroma = loadChroma(chromaFile) ?: engine.predict(working).also {
+                        val fromCache = loadChroma(chromaFile)
+                        val chroma = fromCache ?: engine.predict(working).also {
                             runCatching { saveChroma(context, chromaFile, it) }
+                        }
+                        logcat(LogPriority.ERROR) {
+                            "PageColorizer: color chromaFromCache=${fromCache != null} intensity=$intensity sat=${AiConfig.saturation}"
                         }
                         page = engine.render(working, chroma, intensity)
                     }
@@ -323,6 +347,7 @@ object PageColorizer {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
+                logcat(LogPriority.ERROR, e) { "PageColorizer: baseImage failed" }
                 val accelerated = (color && AiConfig.colorizeAcceleration != Acceleration.CPU) ||
                     (upscale && AiConfig.upscaleAcceleration != Acceleration.CPU)
                 if (accelerated && !acceleratorFailed) {
