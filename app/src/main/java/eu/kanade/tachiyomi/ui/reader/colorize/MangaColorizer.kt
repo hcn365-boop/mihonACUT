@@ -103,7 +103,12 @@ class MangaColorizer(
         val bMat = m.mat()
         Core.extractChannel(lab, aMat, 1)
         Core.extractChannel(lab, bMat, 2)
-        Chroma(targetW, targetH, aMat.toFloatArray(plane), bMat.toFloatArray(plane))
+        val aArr = aMat.toFloatArray(plane)
+        val bArr = bMat.toFloatArray(plane)
+        logcat(LogPriority.ERROR) {
+            "MangaColorizer: predict ${targetW}x${targetH} from ${input.width}x${input.height} a=[${aArr.minOrNull()}..${aArr.maxOrNull()}] b=[${bArr.minOrNull()}..${bArr.maxOrNull()}]"
+        }
+        Chroma(targetW, targetH, aArr, bArr)
     }
 
     /**
@@ -138,6 +143,9 @@ class MangaColorizer(
 
             val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(out, bitmap)
+            logcat(LogPriority.ERROR) {
+                "MangaColorizer: render ${width}x${height} intensity=$intensity chroma=${chroma.width}x${chroma.height}"
+            }
             bitmap
         }
     }
@@ -158,6 +166,9 @@ class MangaColorizer(
                 session.run(mapOf(inputName to inputTensor)).use { result ->
                     val output = result[0] as OnnxTensor
                     val shape = output.info.shape
+                    logcat(LogPriority.ERROR) {
+                        "MangaColorizer: runModel input=$inputName ${width}x${height} outShape=${shape.joinToString("x")}"
+                    }
                     if (shape.size != 4 || shape[1] != 3L) {
                         error("Unexpected colorizer output shape: ${shape.joinToString()}")
                     }
