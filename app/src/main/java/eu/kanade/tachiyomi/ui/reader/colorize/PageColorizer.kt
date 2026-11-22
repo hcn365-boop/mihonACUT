@@ -7,9 +7,11 @@ import android.graphics.Canvas
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
+import eu.kanade.translation.MangaTranslationContext
 import eu.kanade.translation.PageTranslationRenderer
 import eu.kanade.translation.PageTranslationService
 import eu.kanade.translation.TranslationStore
+import eu.kanade.translation.translator.TranslatorSettings
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import logcat.LogPriority
@@ -20,11 +22,11 @@ import tachiyomi.core.common.util.system.logcat
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.MessageDigest
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.math.roundToInt
-import eu.kanade.translation.translator.TranslatorSettings
-import eu.kanade.translation.MangaTranslationContext
 
 /**
  * Processes a manga page for the reader: colorize, then upscale, then translate (text drawn into the
@@ -40,27 +42,20 @@ import eu.kanade.translation.MangaTranslationContext
 object PageColorizer {
 
     private const val MODEL_DIR = "colorizer"
-    private const val COLORIZER_FILE = "v6_generator.onnx"
+    private const val COLORIZER_FILE = "manga-colorize-fp16.onnx"
     private const val UPSCALER_FILE = "anime4k_acnet.onnx"
     private const val CHROMA_CACHE_DIR = "colorizer_cache"
     private const val PAGE_CACHE_DIR = "ai_pages"
 
-    // Chroma is predicted at 512x512 per channel.
-    private const val CHROMA_SIZE = 512 * 512
     private const val MAX_CHROMA_CACHE_BYTES = 256L * 1024 * 1024
     private const val JPEG_QUALITY = 95
 
     private val mutex = Mutex()
 
-    // One lock per page name (shared between a few names), so the same page is never built twice at once
     private val pageLocks = Array(16) { Mutex() }
 
     private fun pageLock(name: String): Mutex = pageLocks[(name.hashCode() and Int.MAX_VALUE) % pageLocks.size]
 
-    /**
-     * مدير جلسات محركات الذكاء الاصطناعي (مستوحى من تصميم ModelManager لمنع تسريب Native Memory وتجنب SIGSEGV).
-     * يحافظ على حد أقصى من الجلسات النشطة ويغلق القديمة تلقائياً لتفريغ الذاكرة الأصلية.
-     */
     private class EngineManager<T : Closeable>(private val maxEntries: Int = 2) {
         private val sessions = object : LinkedHashMap<String, T>(16, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, T>): Boolean {
@@ -111,28 +106,22 @@ object PageColorizer {
 
     fun upscalerModelFile(context: Context): File = File(File(context.filesDir, MODEL_DIR), UPSCALER_FILE)
 
-    // التحقق من تفعيل ميزة الـ SAM مباشرة عبر الإعدادات
-    private fun samActive(context: Context): Boolean = AiConfig.colorizeUseSam
+    // Manga Colorization V2 does not use Manga Light V6 SAM feature maps.
+    private fun samActive(@Suppress("UNUSED_PARAMETER") context: Context): Boolean = false
 
     fun isModelInstalled(context: Context): Boolean = modelFile(context).length() > 0
 
-    private fun acnetReady(context: Context): Boolean = true // أصبح النموذج ثابتاً ومدمجاً في الـ Assets
+    private fun acnetReady(context: Context): Boolean = true
 
-    /**
-     * تفريغ جميع المحركات وإغلاق جلساتها يدوياً عند الخروج أو تغيير الفصول لتنظيف الذاكرة بالكامل.
-     * لا تستدعِها أثناء معالجة صفحة: الداخلية الوحيدة الآمنة هي عبر [mutex] (انظر baseImage).
-     */
     fun releaseEngines() {
         colorizerManager.reset()
         upscalerManager.reset()
         acnetManager.reset()
     }
 
-    /** Kept for the existing callers: the intensity now comes from [AiConfig]. */
     suspend fun colorize(context: Context, source: BufferedSource, intensity: Float): BufferedSource =
         process(context, source)
 
-    /** For the page on screen. @return the processed page, or [source] itself when it should stay as it is */
     suspend fun process(context: Context, source: BufferedSource): BufferedSource {
         return try {
             run(context.applicationContext, source, display = true) ?: source
@@ -144,13 +133,11 @@ object PageColorizer {
         }
     }
 
-    /** Batch processing: the processed page as bytes, or null when the page stays as it is. Throws on failure. */
     suspend fun processToBytes(context: Context, source: BufferedSource): ByteArray? {
         val result = run(context.applicationContext, source, display = true) ?: return null
         return result.readByteArray()
     }
 
-    /** Batch processing: the page after the image steps with no text drawn, or null when it stays as it is. */
     suspend fun processImagesToBytes(context: Context, source: BufferedSource): ByteArray? {
         val result = run(context.applicationContext, source, display = false, translate = false) ?: return null
         return result.readByteArray()
@@ -158,11 +145,6 @@ object PageColorizer {
 
     fun contentHash(bytes: ByteArray): String = hash(bytes)
 
-    /**
-     * Background work for a page that is not on screen yet. Never throws.
-     * [full]: build the base image (and, if [translate], read the text and queue it for translation).
-     * Not [full]: only warm the colorizer result, which is cheap to reuse later.
-     */
     suspend fun prefetch(context: Context, source: BufferedSource, full: Boolean, translate: Boolean = false) {
         try {
             val app = context.applicationContext
@@ -180,7 +162,6 @@ object PageColorizer {
         display: Boolean,
         translate: Boolean = true,
     ): BufferedSource? {
-        // Pages processed in advance (batch processing) are shown as they are, with their saved translation.
         if (display && !AiConfig.isPost && AiConfig.usePostProcessed() && PostProcessStore.maybeHasResults) {
             val original = source.peek().readByteArray()
             val originalHash = hash(original)
@@ -232,7 +213,6 @@ object PageColorizer {
             "${baseName}_T$key"
         }
 
-        // A page finished before is read straight from disk.
         if (display && finalName != null) readCachedPage(cacheFile(context, finalName))?.let { return it }
 
         val base = if (doColor || doUpscale || doShrink || wantFinal) {
@@ -260,19 +240,17 @@ object PageColorizer {
             ?: base?.let { Buffer().write(it) }
     }
 
-    /** A page bigger than the allowed output size is scaled down: the viewer needs a full buffer per page. */
     private fun capSize(bitmap: Bitmap): Bitmap = PageResizer.fitTo(bitmap, AiConfig.upscaleMaxOutputPixels)
 
-    /** The last step: the built-in ACNet model refines the page. Not run when the page or memory is too big. */
     private fun acnetFinalPass(context: Context, page: Bitmap): Bitmap {
         val pixels = page.width.toLong() * page.height
         if (pixels > AiConfig.upscaleFinalPassMaxPixels) return page
         if (pixels * (14 + 4 * 21) > AiConfig.memoryBudgetBytes) return page
         val acceleration = if (acceleratorFailed) Acceleration.CPU else AiConfig.upscaleAcceleration
         val key = "${acceleration}_${AiConfig.aiThreads}"
-        
+
         val engine = acnetManager.getOrPut(key) { Anime4kUpscaler(context, acceleration, AiConfig.aiThreads) }
-        
+
         val enlarged = engine.upscale(page)
         if (!AiConfig.upscaleFinalPassKeepSize) return capSize(enlarged)
         val restored = PageResizer.resizeTo(enlarged, page.width, page.height)
@@ -332,8 +310,7 @@ object PageColorizer {
                         if (refined !== page && page !== working) page.recycle()
                         page = refined
                     }
-                    
-                    // Optional: stronger colors (applied only if colorized and saturation != 1f)
+
                     val saturation = AiConfig.saturation
                     if (color && saturation != 1f) {
                         val saturated = applySaturation(page, saturation)
@@ -467,18 +444,7 @@ object PageColorizer {
         val setup = "$acceleration/${AiConfig.aiThreads}/sam=$sam"
         val key = "${model.absolutePath}_${setup}_${model.lastModified()}"
         return colorizerManager.getOrPut(key) {
-            val guide = if (sam) {
-                try {
-                    SamFeatureProvider.load(context)
-                } catch (e: Throwable) {
-                    logcat(LogPriority.ERROR, e) { "SAM features: failed to load binary file" }
-                    null
-                }
-            } else {
-                null
-            }
-
-            MangaColorizer(model, acceleration, AiConfig.aiThreads, guide)
+            MangaColorizer(model, acceleration, AiConfig.aiThreads, null)
         }
     }
 
@@ -559,26 +525,41 @@ object PageColorizer {
     }
 
     private fun chromaFile(context: Context, imageHash: String, model: File): File =
-        File(File(context.cacheDir, CHROMA_CACHE_DIR), imageHash + "_" + model.length() + (if (samActive(context)) "_sam" else ""))
+        File(File(context.cacheDir, CHROMA_CACHE_DIR), imageHash + "_" + model.length() + "_v2")
 
+    // Header: 4 bytes width + 4 bytes height (Big Endian), followed by planeSize bytes for A and planeSize bytes for B.
     private fun loadChroma(file: File): MangaColorizer.Chroma? {
         if (!file.isFile) return null
         val data = file.readBytes()
-        if (data.size != CHROMA_SIZE * 2) return null
+        if (data.size < 8) return null
+        val header = ByteBuffer.wrap(data, 0, 8).order(ByteOrder.BIG_ENDIAN)
+        val w = header.int
+        val h = header.int
+        if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return null
+        val plane = w.toLong() * h.toLong()
+        if (plane > Int.MAX_VALUE / 2) return null
+        val planeInt = plane.toInt()
+        if (data.size != 8 + planeInt * 2) return null
         file.setLastModified(System.currentTimeMillis())
         return MangaColorizer.Chroma(
-            FloatArray(CHROMA_SIZE) { data[it].toFloat() },
-            FloatArray(CHROMA_SIZE) { data[CHROMA_SIZE + it].toFloat() },
+            width = w,
+            height = h,
+            a = FloatArray(planeInt) { data[8 + it].toFloat() },
+            b = FloatArray(planeInt) { data[8 + planeInt + it].toFloat() },
         )
     }
 
     private fun saveChroma(context: Context, file: File, chroma: MangaColorizer.Chroma) {
         val dir = file.parentFile ?: return
         dir.mkdirs()
-        val data = ByteArray(CHROMA_SIZE * 2)
-        for (i in 0 until CHROMA_SIZE) {
-            data[i] = chroma.a[i].coerceIn(-127f, 127f).roundToInt().toByte()
-            data[CHROMA_SIZE + i] = chroma.b[i].coerceIn(-127f, 127f).roundToInt().toByte()
+        val plane = chroma.planeSize
+        val data = ByteArray(8 + plane * 2)
+        val header = ByteBuffer.wrap(data, 0, 8).order(ByteOrder.BIG_ENDIAN)
+        header.putInt(chroma.width)
+        header.putInt(chroma.height)
+        for (i in 0 until plane) {
+            data[8 + i] = chroma.a[i].coerceIn(-127f, 127f).roundToInt().toByte()
+            data[8 + plane + i] = chroma.b[i].coerceIn(-127f, 127f).roundToInt().toByte()
         }
         val temp = File(dir, "${file.name}.${System.nanoTime()}.tmp")
         temp.writeBytes(data)
