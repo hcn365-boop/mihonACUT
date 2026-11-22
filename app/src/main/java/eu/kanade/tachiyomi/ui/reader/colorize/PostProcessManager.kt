@@ -217,8 +217,9 @@ object PostProcessManager {
 
         // Start clean: earlier results may come from other settings.
         clearResults(context, request.chapterId)
+        PostProcessStore.registerChapter(context, request.chapterId, request.mangaId)
 
-        val snapshot = AiConfig.postSnapshot(entry.prefs, request.mangaTitle, request.sourceLang)
+        val snapshot = AiConfig.postSnapshot(entry.prefs, request.mangaId, request.mangaTitle, request.sourceLang)
         AiConfig.withSnapshot(snapshot) {
             val translation = AiConfig.translation
             val records = ArrayList<PageRecord>()
