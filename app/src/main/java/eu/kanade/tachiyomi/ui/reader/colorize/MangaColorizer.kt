@@ -19,67 +19,91 @@ import logcat.LogPriority
 import tachiyomi.core.common.util.system.logcat
 
 /**
- * Runs the Manga Light V6 generator (v6_generator.onnx) on a page.
- *
- * Two steps so the expensive part can be cached:
- *  - [predict] runs the model once and returns only the predicted chroma at model resolution (small).
- *  - [render] combines that chroma with the ORIGINAL page luminance at full size.
+ * Runs Manga Colorization V2 ONNX (`manga-colorize-fp16.onnx`) with a [1, 5, H, W] input tensor:
+ *  - Channel 0: grayscale in [0, 1]
+ *  - Channels 1..3: color hints in [-1, 1] (0 when no hints)
+ *  - Channel 4: hint mask (0 when no hints)
  *
  * Not thread safe: call it from one coroutine at a time.
  */
 class MangaColorizer(
     modelFile: File,
-    acceleration: Acceleration = Acceleration.CPU,
-    threads: Int = 0,
-    private val guide: SamFeatures? = null,
+    private val acceleration: Acceleration = Acceleration.CPU,
+    private val threads: Int = 0,
+    @Suppress("UNUSED_PARAMETER") private val guide: SamFeatures? = null,
 ) : Closeable {
-    /** Predicted Lab a/b channels at 512x512, in float Lab units. About 2 MB per page. */
-    class Chroma(val a: FloatArray, val b: FloatArray)
+
+    class Chroma(
+        val width: Int,
+        val height: Int,
+        val a: FloatArray,
+        val b: FloatArray,
+    ) {
+        val planeSize: Int get() = width * height
+    }
 
     private val env = OrtEnvironment.getEnvironment()
     private val session: OrtSession
 
     init {
         check(OpenCVLoader.initLocal()) { "OpenCV native library failed to load" }
-        session = env.createSession(modelFile.absolutePath, OrtSession.SessionOptions())
-        val expectedInputs = setOf(INPUT_IMAGE, INPUT_SAM0, INPUT_SAM1, INPUT_WD14)
-        if (session.inputNames != expectedInputs || session.outputNames != setOf(OUTPUT_RGB)) {
-            val message = "Not a Manga Light V6 generator: inputs=${session.inputNames}, outputs=${session.outputNames}"
+        val options = OrtSession.SessionOptions().apply {
+            if (threads > 0) {
+                setIntraOpNumThreads(threads)
+            }
+            when (acceleration) {
+                Acceleration.CPU -> Unit
+                else -> {
+                    runCatching { addNnapi() }
+                }
+            }
+        }
+        session = env.createSession(modelFile.absolutePath, options)
+        if (session.inputNames.isEmpty() || session.outputNames.isEmpty()) {
             session.close()
-            error(message)
+            error("Invalid ONNX colorizer model: missing inputs or outputs")
         }
     }
 
     fun predict(input: Bitmap): Chroma = Mats().use { m ->
+        val (targetW, targetH) = computeModelSize(input.width, input.height)
+        val plane = targetW * targetH
+
         val rgba = m.mat()
         toMat(input, rgba)
         val gray = m.mat()
         Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
         val small = m.mat()
-        Imgproc.resize(gray, small, Size(SIDE.toDouble(), SIDE.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
-        // Model input range is [-1, 1].
-        small.convertTo(small, CvType.CV_32F, 1.0 / 127.5, -1.0)
-        val pixels = FloatArray(PLANE)
-        small.get(0, 0, pixels)
+        Imgproc.resize(gray, small, Size(targetW.toDouble(), targetH.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        // Channel 0 expects grayscale in [0, 1].
+        small.convertTo(small, CvType.CV_32F, 1.0 / 255.0, 0.0)
+        val grayPlane = FloatArray(plane)
+        small.get(0, 0, grayPlane)
 
-        val rgbPlanes = runModel(pixels)
+        // Build [1, 5, targetH, targetW] tensor: [gray(1), hints(3), mask(1)].
+        val input5Ch = FloatArray(5 * plane)
+        System.arraycopy(grayPlane, 0, input5Ch, 0, plane)
+
+        val rgbPlanes = runModel(input5Ch, targetW, targetH)
         val planes = List(3) { c ->
-            m.mat(SIDE, SIDE, CvType.CV_32F).also { it.put(0, 0, rgbPlanes.copyOfRange(c * PLANE, (c + 1) * PLANE)) }
+            m.mat(targetH, targetW, CvType.CV_32F).also {
+                it.put(0, 0, rgbPlanes.copyOfRange(c * plane, (c + 1) * plane))
+            }
         }
         val merged = m.mat()
         Core.merge(planes, merged)
-        // Model output range is [-1, 1]; bring it to [0, 1] and clamp.
+        // Model output is typically in [-1, 1]; map to [0, 1] and clamp.
         merged.convertTo(merged, CvType.CV_32F, 0.5, 0.5)
         Core.max(merged, Scalar(0.0, 0.0, 0.0), merged)
         Core.min(merged, Scalar(1.0, 1.0, 1.0), merged)
 
         val lab = m.mat()
         Imgproc.cvtColor(merged, lab, Imgproc.COLOR_RGB2Lab)
-        val a = m.mat()
-        val b = m.mat()
-        Core.extractChannel(lab, a, 1)
-        Core.extractChannel(lab, b, 2)
-        Chroma(a.toFloatArray(), b.toFloatArray())
+        val aMat = m.mat()
+        val bMat = m.mat()
+        Core.extractChannel(lab, aMat, 1)
+        Core.extractChannel(lab, bMat, 2)
+        Chroma(targetW, targetH, aMat.toFloatArray(plane), bMat.toFloatArray(plane))
     }
 
     /**
@@ -95,14 +119,14 @@ class MangaColorizer(
             toMat(input, rgba)
             val rgb = m.mat()
             Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB)
-            // 8-bit Lab: L is 0..255, a and b are offset by 128. Kept 8-bit to save memory on big pages.
+            // 8-bit Lab: L is 0..255, a and b are offset by 128.
             val lab = m.mat()
             Imgproc.cvtColor(rgb, lab, Imgproc.COLOR_RGB2Lab)
             val luminance = m.mat()
             Core.extractChannel(lab, luminance, 0)
 
-            val a = scaledChroma(m, chroma.a, intensity, width, height)
-            val b = scaledChroma(m, chroma.b, intensity, width, height)
+            val a = scaledChroma(m, chroma.a, chroma.width, chroma.height, intensity, width, height)
+            val b = scaledChroma(m, chroma.b, chroma.width, chroma.height, intensity, width, height)
             Core.merge(listOf(luminance, a, b), lab)
             Imgproc.cvtColor(lab, rgb, Imgproc.COLOR_Lab2RGB)
 
@@ -122,48 +146,80 @@ class MangaColorizer(
         session.close()
     }
 
-    /** Returns the model output as 3 consecutive 512x512 planes (R, G, B), values in [-1, 1]. */
-    private fun runModel(image: FloatArray): FloatArray {
-        val tensors = ArrayList<OnnxTensor>()
+    private fun runModel(input5Ch: FloatArray, width: Int, height: Int): FloatArray {
+        val inputName = session.inputNames.first()
+        val outputName = session.outputNames.first()
+        val plane = width * height
         try {
-            fun tensor(data: FloatArray, vararg shape: Long): OnnxTensor =
-                OnnxTensor.createTensor(env, FloatBuffer.wrap(data), shape).also { tensors.add(it) }
+            OnnxTensor.createTensor(
+                env,
+                FloatBuffer.wrap(input5Ch),
+                longArrayOf(1, 5, height.toLong(), width.toLong()),
+            ).use { inputTensor ->
+                session.run(mapOf(inputName to inputTensor)).use { result ->
+                    val output = result.getOutput(0) as OnnxTensor
+                    val shape = output.info.shape
+                    if (shape.size != 4 || shape[1] != 3L) {
+                        error("Unexpected colorizer output shape: ${shape.joinToString()}")
+                    }
+                    val outH = shape[2].toInt()
+                    val outW = shape[3].toInt()
+                    val outPlane = outH * outW
+                    val raw = FloatArray(3 * outPlane)
+                    output.floatBuffer.get(raw)
 
-            val inputs = mapOf(
-                INPUT_IMAGE to tensor(image, 1, 1, SIDE.toLong(), SIDE.toLong()),
-                // تم تعديل الأبعاد هنا لتتوافق مع مخرجات النموذج الجديد (64x64 و 32x32)
-                INPUT_SAM0 to tensor(guide?.level0 ?: FloatArray(256 * 64 * 64), 1, 256, 64, 64),
-                INPUT_SAM1 to tensor(guide?.level1 ?: FloatArray(256 * 32 * 32), 1, 256, 32, 32),
-                INPUT_WD14 to tensor(FloatArray(1024), 1, 1024),
-            )
-            session.run(inputs).use { result ->
-                val output = result[0] as OnnxTensor
-                val expected = longArrayOf(1, 3, SIDE.toLong(), SIDE.toLong())
-                if (!output.info.shape.contentEquals(expected)) {
-                    logcat(LogPriority.ERROR) { "SAM encoder: unexpected shapes or failed to output expected shape (got ${output.info.shape.joinToString()})" }
+                    if (outW == width && outH == height && raw.size == 3 * plane) {
+                        return raw
+                    }
+
+                    // Resize output planes back to (height, width) if model output dimensions differ.
+                    Mats().use { m ->
+                        val resizedPlanes = FloatArray(3 * plane)
+                        for (c in 0 until 3) {
+                            val srcMat = m.mat(outH, outW, CvType.CV_32F).apply {
+                                put(0, 0, raw.copyOfRange(c * outPlane, (c + 1) * outPlane))
+                            }
+                            val dstMat = m.mat()
+                            Imgproc.resize(
+                                srcMat,
+                                dstMat,
+                                Size(width.toDouble(), height.toDouble()),
+                                0.0,
+                                0.0,
+                                Imgproc.INTER_LINEAR,
+                            )
+                            dstMat.get(0, 0, resizedPlanes).also {
+                                // Copy channel c into its offset
+                            }
+                            val chArr = FloatArray(plane)
+                            dstMat.get(0, 0, chArr)
+                            System.arraycopy(chArr, 0, resizedPlanes, c * plane, plane)
+                        }
+                        return resizedPlanes
+                    }
                 }
-                require(output.info.shape.contentEquals(expected)) {
-                    "Unexpected model output shape: ${output.info.shape.joinToString()}"
-                }
-                val values = FloatArray(3 * PLANE)
-                output.floatBuffer.get(values)
-                return values
             }
         } catch (e: Throwable) {
-            logcat(LogPriority.ERROR, e) { "SAM encoder: failed to process features" }
+            logcat(LogPriority.ERROR, e) { "MangaColorizer: inference failed" }
             throw e
-        } finally {
-            tensors.forEach { it.close() }
         }
     }
 
-    private fun scaledChroma(m: Mats, values: FloatArray, intensity: Float, width: Int, height: Int): Mat {
-        val small = m.mat(SIDE, SIDE, CvType.CV_32F)
+    private fun scaledChroma(
+        m: Mats,
+        values: FloatArray,
+        srcW: Int,
+        srcH: Int,
+        intensity: Float,
+        dstW: Int,
+        dstH: Int,
+    ): Mat {
+        val small = m.mat(srcH, srcW, CvType.CV_32F)
         small.put(0, 0, values)
         val small8 = m.mat()
         small.convertTo(small8, CvType.CV_8U, intensity.toDouble(), 128.0)
         val full = m.mat()
-        Imgproc.resize(small8, full, Size(width.toDouble(), height.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+        Imgproc.resize(small8, full, Size(dstW.toDouble(), dstH.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
         return full
     }
 
@@ -180,9 +236,8 @@ class MangaColorizer(
         }
     }
 
-    private fun Mat.toFloatArray(): FloatArray = FloatArray(PLANE).also { get(0, 0, it) }
+    private fun Mat.toFloatArray(size: Int): FloatArray = FloatArray(size).also { get(0, 0, it) }
 
-    /** Releases every Mat created through it, even if processing throws. */
     private class Mats : Closeable {
         private val owned = ArrayList<Mat>()
 
@@ -196,12 +251,15 @@ class MangaColorizer(
     }
 
     private companion object {
-        const val SIDE = 512
-        const val PLANE = SIDE * SIDE
-        const val INPUT_IMAGE = "L_bw"
-        const val INPUT_SAM0 = "sam_level0"
-        const val INPUT_SAM1 = "sam_level1"
-        const val INPUT_WD14 = "wd14_embedding"
-        const val OUTPUT_RGB = "rgb_pred"
+        const val MAX_SIDE = 576
+        const val MULTIPLE_OF = 32
+
+        fun computeModelSize(width: Int, height: Int): Pair<Int, Int> {
+            if (width <= 0 || height <= 0) return MAX_SIDE to MAX_SIDE
+            val scale = minOf(1.0, MAX_SIDE.toDouble() / maxOf(width, height))
+            val w = ((width * scale).toInt() / MULTIPLE_OF).coerceAtLeast(1) * MULTIPLE_OF
+            val h = ((height * scale).toInt() / MULTIPLE_OF).coerceAtLeast(1) * MULTIPLE_OF
+            return w to h
+        }
     }
 }
