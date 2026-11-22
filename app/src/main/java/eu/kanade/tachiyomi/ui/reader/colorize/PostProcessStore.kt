@@ -109,6 +109,42 @@ object PostProcessStore {
             arrayOf(hash),
         ).use { if (it.moveToFirst()) it.getString(0)?.takeIf { uri -> uri.isNotEmpty() } else null }
 
+    /** Remembers which manga a chapter belongs to, so the files of a whole manga can be found. */
+    fun registerChapter(context: Context, chapterId: Long, mangaId: Long) {
+        val values = ContentValues().apply { put("manga", mangaId) }
+        val updated = db(context).update("chapters", values, "chapter = ?", arrayOf(chapterId.toString()))
+        if (updated == 0) {
+            values.put("chapter", chapterId)
+            values.put("state", STATE_RUNNING)
+            values.put("updated", System.currentTimeMillis())
+            db(context).insert("chapters", null, values)
+        }
+    }
+
+    /** The chapter (and its translation file) of every chapter of a manga that keeps its translation in a file. */
+    fun translationFilesOfManga(context: Context, mangaId: Long): List<Pair<Long, String>> =
+        db(context).rawQuery(
+            "SELECT chapter, translation FROM chapters WHERE manga = ? AND translation IS NOT NULL AND translation != ''",
+            arrayOf(mangaId.toString()),
+        ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getLong(0) to cursor.getString(1)) } }
+
+    fun allTranslationFiles(context: Context): List<Pair<Long, String>> =
+        db(context).rawQuery(
+            "SELECT chapter, translation FROM chapters WHERE translation IS NOT NULL AND translation != ''",
+            null,
+        ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getLong(0) to cursor.getString(1)) } }
+
+    /** Forgets the translation file of a chapter (the caller deletes the file). */
+    fun clearChapterTranslation(context: Context, chapterId: Long) {
+        val values = ContentValues().apply { putNull("translation") }
+        db(context).update("chapters", values, "chapter = ?", arrayOf(chapterId.toString()))
+    }
+
+    /** The chapter a page was processed with, from the fingerprint of the page. */
+    fun chapterOfPage(context: Context, hash: String): Long? =
+        db(context).rawQuery("SELECT chapter FROM pages WHERE hash = ?", arrayOf(hash))
+            .use { if (it.moveToFirst()) it.getLong(0) else null }
+
     fun chaptersWithState(context: Context, state: Int): Set<Long> =
         db(context).rawQuery("SELECT chapter FROM chapters WHERE state = ?", arrayOf(state.toString()))
             .use { cursor -> buildSet { while (cursor.moveToNext()) add(cursor.getLong(0)) } }
@@ -137,17 +173,18 @@ object PostProcessStore {
         refresh(context)
     }
 
-    private class Helper(context: Context) : SQLiteOpenHelper(context, "post_process.db", null, 3) {
+    private class Helper(context: Context) : SQLiteOpenHelper(context, "post_process.db", null, 4) {
         override fun onCreate(db: SQLiteDatabase) {
             db.execSQL("CREATE TABLE pages (hash TEXT PRIMARY KEY, chapter INTEGER NOT NULL, uri TEXT NOT NULL)")
             db.execSQL("CREATE INDEX pages_chapter ON pages (chapter)")
             db.execSQL(
-                "CREATE TABLE chapters (chapter INTEGER PRIMARY KEY, state INTEGER NOT NULL, updated INTEGER NOT NULL, translation TEXT)",
+                "CREATE TABLE chapters (chapter INTEGER PRIMARY KEY, state INTEGER NOT NULL, updated INTEGER NOT NULL, translation TEXT, manga INTEGER NOT NULL DEFAULT -1)",
             )
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
             if (oldVersion < 3) db.execSQL("ALTER TABLE chapters ADD COLUMN translation TEXT")
+            if (oldVersion < 4) db.execSQL("ALTER TABLE chapters ADD COLUMN manga INTEGER NOT NULL DEFAULT -1")
         }
     }
 }
