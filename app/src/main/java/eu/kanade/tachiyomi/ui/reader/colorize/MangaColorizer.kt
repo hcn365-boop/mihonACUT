@@ -92,8 +92,8 @@ class MangaColorizer(
         }
         val merged = m.mat()
         Core.merge(planes, merged)
-        // Model output is typically in [-1, 1]; map to [0, 1] and clamp.
-        merged.convertTo(merged, CvType.CV_32F, 0.5, 0.5)
+        // Model output is already in [0, 1]; clamp directly to [0, 1].
+        merged.convertTo(merged, CvType.CV_32F, 1.0, 0.0)
         Core.max(merged, Scalar(0.0, 0.0, 0.0), merged)
         Core.min(merged, Scalar(1.0, 1.0, 1.0), merged)
 
@@ -224,7 +224,8 @@ class MangaColorizer(
         val small = m.mat(srcH, srcW, CvType.CV_32F)
         small.put(0, 0, values)
         val small8 = m.mat()
-        small.convertTo(small8, CvType.CV_8U, intensity.toDouble(), 128.0)
+        val chromaGain = (intensity * 2.5f).toDouble()
+        small.convertTo(small8, CvType.CV_8U, chromaGain, 128.0)
         val full = m.mat()
         Imgproc.resize(small8, full, Size(dstW.toDouble(), dstH.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
         return full
