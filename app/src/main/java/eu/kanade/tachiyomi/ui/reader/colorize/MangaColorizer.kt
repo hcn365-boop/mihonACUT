@@ -4,6 +4,10 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.graphics.Bitmap
+import java.io.Closeable
+import java.io.File
+import java.nio.FloatBuffer
+import logcat.LogPriority
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
@@ -12,10 +16,6 @@ import org.opencv.core.Mat
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
-import java.io.Closeable
-import java.io.File
-import java.nio.FloatBuffer
-import logcat.LogPriority
 import tachiyomi.core.common.util.system.logcat
 
 /**
@@ -148,7 +148,6 @@ class MangaColorizer(
 
     private fun runModel(input5Ch: FloatArray, width: Int, height: Int): FloatArray {
         val inputName = session.inputNames.first()
-        val outputName = session.outputNames.first()
         val plane = width * height
         try {
             OnnxTensor.createTensor(
@@ -157,7 +156,7 @@ class MangaColorizer(
                 longArrayOf(1, 5, height.toLong(), width.toLong()),
             ).use { inputTensor ->
                 session.run(mapOf(inputName to inputTensor)).use { result ->
-                    val output = result.getOutput(0) as OnnxTensor
+                    val output = result[0] as OnnxTensor
                     val shape = output.info.shape
                     if (shape.size != 4 || shape[1] != 3L) {
                         error("Unexpected colorizer output shape: ${shape.joinToString()}")
@@ -188,9 +187,6 @@ class MangaColorizer(
                                 0.0,
                                 Imgproc.INTER_LINEAR,
                             )
-                            dstMat.get(0, 0, resizedPlanes).also {
-                                // Copy channel c into its offset
-                            }
                             val chArr = FloatArray(plane)
                             dstMat.get(0, 0, chArr)
                             System.arraycopy(chArr, 0, resizedPlanes, c * plane, plane)
