@@ -39,11 +39,10 @@ class TranslationConfig(
     /** The settings with the page language chosen for the manga being processed (when auto language is on). */
     fun effectiveSettings(): TranslatorSettings {
         val language = AutoLanguage.resolve(
-            settings.from,
-            auto,
-            null,
-            AiConfig.mangaTitle,
-            AiConfig.mangaSourceLang,
+            fallback = settings.from,
+            options = auto,
+            title = AiConfig.mangaTitle,
+            sourceLang = AiConfig.mangaSourceLang,
         ).language
         return if (language == settings.from) settings else settings.copy(from = language)
     }
@@ -153,14 +152,14 @@ object AiConfig {
 
     /** The manga being processed: the one of the snapshot, or the one the reader has open. */
     val mangaTitle: String
-        get() = s.mangaTitle ?: MangaTranslationContext.title
+        get() = s.mangaTitle.orEmpty().ifEmpty { MangaTranslationContext.title }
 
     /** The manga whose pages are being read or processed. Saved translations are marked with it. */
     val mangaId: Long
         get() = s.mangaId ?: MangaTranslationContext.mangaId
 
     val mangaSourceLang: String
-        get() = s.mangaSourceLang ?: MangaTranslationContext.sourceLang
+        get() = s.mangaSourceLang.orEmpty().ifEmpty { MangaTranslationContext.sourceLang }
 
     val anyEnabled: Boolean
         get() = s.colorizeEnabled || s.upscaleEnabled || s.upscaleNormalizeEnabled ||
