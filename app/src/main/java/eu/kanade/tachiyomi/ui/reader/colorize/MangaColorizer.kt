@@ -23,8 +23,8 @@ import java.nio.FloatBuffer
  *
  * Two steps so the expensive part can be cached:
  *  - [predict] runs the model once and returns the predicted RGB at model resolution (small).
- *  - [render] uses model hue/lighting for broad areas while preserving sharp original luminance
- *    around fine lines and text to avoid low-res upscaled lighting blur.
+ *  - [render] uses model hue/lighting while weighting model lighting by original luminance
+ *    so dark text and fine strokes do not inherit low-resolution upscaled lighting blur.
  *
  * Not thread safe: call it from one coroutine at a time.
  */
@@ -80,12 +80,12 @@ class MangaColorizer(
     }
 
     /**
-     * Builds the colored page while avoiding low-resolution upscaled lighting blur on text and sharp lines.
+     * Builds the colored page while reducing low-resolution upscaled lighting blur on text and sharp lines.
      *  1. Hue: upscaled model color normalized to luminance 1 after saturation.
      *  2. Light: upscaled model luminance with floor applied.
      *  3. Detail: local contrast ratio of original luminance relative to its blur.
-     *  4. Final luminance blends model lighting and sharp original luminance based on [detail],
-     *     preventing blurry upscaled lighting from creating halos around dark text and lines.
+     *  4. Final luminance weights model lighting by original luminance [guideY] so dark strokes/text
+     *     retain crisp original luminance while brighter/mid areas use model lighting + detail.
      * Alpha is preserved.
      */
     fun render(input: Bitmap, chroma: Chroma, intensity: Float = 1f): Bitmap {
@@ -158,22 +158,29 @@ class MangaColorizer(
             val detailShaped = m.mat()
             Core.pow(detail, DETAIL_STRENGTH.toDouble(), detailShaped)
 
-            // 4. Blend: where detailShaped < 1 (dark text/lines), preserve sharp original guideY;
-            //    where detailShaped == 1, use model light * detailShaped.
-            //    finalY = detailShaped * (light * detailShaped) + (1 - detailShaped) * guideY
-            val modelCombined = m.mat()
-            Core.multiply(light, detailShaped, modelCombined)
+            // 4. Weight model lighting by original luminance guideY so dark text/strokes
+            //    are not blurred by low-res upscaled `light`.
+            val darkMask = m.mat()
+            Core.min(guideY, ones, darkMask)
+            Core.max(darkMask, Scalar(0.0), darkMask)
 
-            val fromModel = m.mat()
-            Core.multiply(modelCombined, detailShaped, fromModel)
+            val lightWithDetail = m.mat()
+            Core.multiply(light, detailShaped, lightWithDetail)
 
-            val invDetail = m.mat()
-            Core.subtract(ones, detailShaped, invDetail)
-            val fromGuide = m.mat()
-            Core.multiply(guideY, invDetail, fromGuide)
+            val sharpGuideWithDetail = m.mat()
+            Core.multiply(guideY, detailShaped, sharpGuideWithDetail)
+
+            val invMask = m.mat()
+            Core.subtract(ones, darkMask, invMask)
+
+            val partLight = m.mat()
+            Core.multiply(lightWithDetail, darkMask, partLight)
+
+            val partSharp = m.mat()
+            Core.multiply(sharpGuideWithDetail, invMask, partSharp)
 
             val finalY = m.mat()
-            Core.add(fromModel, fromGuide, finalY)
+            Core.add(partLight, partSharp, finalY)
 
             val finalY3 = m.mat()
             Core.merge(listOf(finalY, finalY, finalY), finalY3)
