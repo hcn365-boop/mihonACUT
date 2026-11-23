@@ -4,19 +4,18 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.graphics.Bitmap
+import logcat.LogPriority
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
-import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
+import tachiyomi.core.common.util.system.logcat
 import java.io.Closeable
 import java.io.File
 import java.nio.FloatBuffer
-import logcat.LogPriority
-import tachiyomi.core.common.util.system.logcat
 
 /**
  * Runs the Manga Light V6 generator (v6_generator.onnx) on a page,
@@ -128,13 +127,15 @@ class MangaColorizer(
                 intensity <= 0f -> origRgb.copyTo(blendedRgb)
                 intensity == 1f -> colorizedRgb.copyTo(blendedRgb)
                 else -> {
+                    val clampedIntensity = intensity.coerceIn(0f, 1.2f)
+                    val beta = (1.0 - clampedIntensity.coerceAtMost(1.0)).toFloat()
                     // Blend smoothly around full colorized output without washing out lines
                     Core.addWeighted(
                         colorizedRgb,
-                        intensity.coerceIn(0f, 1.2f).toDouble(),
+                        clampedIntensity.toFloat(),
                         origRgb,
-                        (1.0 - intensity.coerceIn(0f, 1.2f).coerceAtMost(1.0)),
-                        0.0,
+                        beta,
+                        0f,
                         blendedRgb,
                     )
                 }
