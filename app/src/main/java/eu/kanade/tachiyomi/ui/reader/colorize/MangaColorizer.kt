@@ -10,6 +10,7 @@ import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import tachiyomi.core.common.util.system.logcat
@@ -20,10 +21,11 @@ import java.nio.FloatBuffer
 /**
  * Manga Light V6 colorizer.
  *
- * The model predicts RGB at 512x512. Its result is resized to the input bitmap's
- * dimensions. At full intensity, the model's color channels are retained, while
- * dark text/ink luminance from the original image is restored without sharpening
- * or blurring, which avoids introducing edge halos.
+ * The model predicts RGB at 512x512 and only its color (a/b) is used.
+ * Luminance always comes from the original image at full resolution, so
+ * text and ink keep their sharpness. The color channels are upsampled with
+ * a guided filter whose guide is the original luminance, so color edges
+ * follow the original edges without bleeding onto text.
  */
 class MangaColorizer(
     modelFile: File,
@@ -131,9 +133,8 @@ class MangaColorizer(
      * Renders the predicted colors at the input bitmap's dimensions.
      *
      * intensity = 0: original image.
-     * intensity = 1: full model color, with dark original ink/text restored.
-     *
-     * Values above 1 are accepted for compatibility, but clamped to 1.
+     * intensity = 1: full model color with the original luminance.
+     * Values up to 1.2 increase chroma saturation slightly.
      */
     fun render(
         input: Bitmap,
@@ -156,7 +157,7 @@ class MangaColorizer(
 
         val width = input.width
         val height = input.height
-        val amount = intensity.coerceIn(0f, 1f)
+        val chromaScale = intensity.toDouble()
 
         return Mats().use { mats ->
             val inputRgba = mats.mat()
@@ -172,41 +173,27 @@ class MangaColorizer(
                 originalRgb,
                 Imgproc.COLOR_RGBA2RGB,
             )
-            mats.release(inputRgba)
 
             val resultRgb = mats.mat()
 
-            if (amount <= 0f) {
+            if (intensity <= 0f) {
                 originalRgb.copyTo(resultRgb)
             } else {
-                // Rebuild the model's 512x512 RGB output.
+                // Rebuild the model's 512x512 RGB output as 8-bit.
                 val rSmall = mats.mat(SIDE, SIDE, CvType.CV_32F)
                 rSmall.put(0, 0, chroma.r)
-
                 val gSmall = mats.mat(SIDE, SIDE, CvType.CV_32F)
                 gSmall.put(0, 0, chroma.g)
-
                 val bSmall = mats.mat(SIDE, SIDE, CvType.CV_32F)
                 bSmall.put(0, 0, chroma.b)
 
                 val modelSmallFloat = mats.mat()
-                Core.merge(
-                    listOf(rSmall, gSmall, bSmall),
-                    modelSmallFloat,
-                )
-
-                mats.release(rSmall)
-                mats.release(gSmall)
-                mats.release(bSmall)
+                Core.merge(listOf(rSmall, gSmall, bSmall), modelSmallFloat)
 
                 val modelSmallRgb = mats.mat()
-                modelSmallFloat.convertTo(
-                    modelSmallRgb,
-                    CvType.CV_8UC3,
-                )
-                mats.release(modelSmallFloat)
+                modelSmallFloat.convertTo(modelSmallRgb, CvType.CV_8UC3)
 
-                // Resize only the model output to the input bitmap dimensions.
+                // Resize only the color prediction to the input dimensions.
                 val modelRgb = mats.mat()
                 Imgproc.resize(
                     modelSmallRgb,
@@ -216,104 +203,49 @@ class MangaColorizer(
                     0.0,
                     Imgproc.INTER_LANCZOS4,
                 )
-                mats.release(modelSmallRgb)
 
-                val colorRgb: Mat
-                if (amount >= 1f) {
-                    colorRgb = modelRgb
-                } else {
-                    colorRgb = mats.mat()
-                    Core.addWeighted(
-                        modelRgb,
-                        amount.toDouble(),
-                        originalRgb,
-                        (1f - amount).toDouble(),
-                        0.0,
-                        colorRgb,
-                    )
-                    mats.release(modelRgb)
-                }
+                // Original luminance at full resolution (Lab, float).
+                val originalF = mats.mat()
+                originalRgb.convertTo(originalF, CvType.CV_32FC3, 1.0 / 255.0)
+                Imgproc.cvtColor(originalF, originalF, Imgproc.COLOR_RGB2Lab)
 
-                // Convert the colorized page and original to Lab.
-                val colorLab = mats.mat()
-                Imgproc.cvtColor(
-                    colorRgb,
-                    colorLab,
-                    Imgproc.COLOR_RGB2Lab,
-                )
-                mats.release(colorRgb)
+                // Model color in Lab (float).
+                val modelF = mats.mat()
+                modelRgb.convertTo(modelF, CvType.CV_32FC3, 1.0 / 255.0)
+                Imgproc.cvtColor(modelF, modelF, Imgproc.COLOR_RGB2Lab)
 
-                val originalLab = mats.mat()
-                Imgproc.cvtColor(
-                    originalRgb,
-                    originalLab,
-                    Imgproc.COLOR_RGB2Lab,
-                )
-                mats.release(originalRgb)
+                val originalChannels = ArrayList<Mat>()
+                Core.split(originalF, originalChannels)
+                val modelChannels = ArrayList<Mat>()
+                Core.split(modelF, modelChannels)
+                originalChannels.forEach { mats.own(it) }
+                modelChannels.forEach { mats.own(it) }
 
-                // The model's a/b color channels stay unchanged.
-                // Only its L channel is adjusted to recover dark source ink.
-                val modelL = mats.mat()
-                Core.extractChannel(colorLab, modelL, 0)
+                val lOrig = originalChannels[0] // 0..100
+                val modelA = modelChannels[1]   // -127..127
+                val modelB = modelChannels[2]
 
-                val originalL = mats.mat()
-                Core.extractChannel(originalLab, originalL, 0)
-                mats.release(originalLab)
+                // Guide = original luminance normalized to [0, 1].
+                val guideMat = mats.mat()
+                Core.multiply(lOrig, Scalar(0.01), guideMat)
 
-                val pixelCount = Math.multiplyExact(width, height)
-                val modelLight = ByteArray(pixelCount)
-                val originalLight = ByteArray(pixelCount)
+                val aUp = guidedFilter(mats, guideMat, modelA)
+                val bUp = guidedFilter(mats, guideMat, modelB)
 
-                modelL.get(0, 0, modelLight)
-                originalL.get(0, 0, originalLight)
+                Core.multiply(aUp, Scalar(chromaScale), aUp)
+                Core.multiply(bUp, Scalar(chromaScale), bUp)
+                Core.max(aUp, Scalar(-127.0), aUp)
+                Core.min(aUp, Scalar(127.0), aUp)
+                Core.max(bUp, Scalar(-127.0), bUp)
+                Core.min(bUp, Scalar(127.0), bUp)
 
-                for (i in 0 until pixelCount) {
-                    val modelValue = modelLight[i].toInt() and 0xFF
-                    val sourceValue = originalLight[i].toInt() and 0xFF
+                // Original L with the upsampled model a/b.
+                val outLab = mats.mat()
+                Core.merge(listOf(lOrig, aUp, bUp), outLab)
 
-                    /*
-                     * A smooth per-pixel ink mask:
-                     * - dark source pixels get strong ink restoration;
-                     * - light source pixels are left untouched.
-                     *
-                     * No blur, edge sharpening, or high-pass filter is used.
-                     */
-                    val t = (
-                        (INK_MASK_LIGHT_LIMIT - sourceValue).toFloat() /
-                            (INK_MASK_LIGHT_LIMIT - INK_MASK_DARK_LIMIT)
-                        ).coerceIn(0f, 1f)
-
-                    val inkMask = t * t * (3f - 2f * t)
-                    val weight = INK_RESTORE_STRENGTH * amount * inkMask
-
-                    // Only move toward a darker original value; never brighten
-                    // an edge pixel, which helps avoid bright halos.
-                    val restoredValue = if (sourceValue < modelValue) {
-                        modelValue - (modelValue - sourceValue) * weight
-                    } else {
-                        modelValue.toFloat()
-                    }
-
-                    modelLight[i] =
-                        (restoredValue + 0.5f)
-                            .toInt()
-                            .coerceIn(0, 255)
-                            .toByte()
-                }
-
-                modelL.put(0, 0, modelLight)
-
-                // Replace only Lab's L channel; retain the model's a/b channels.
-                Core.insertChannel(modelL, colorLab, 0)
-                mats.release(modelL)
-
-                Imgproc.cvtColor(
-                    colorLab,
-                    resultRgb,
-                    Imgproc.COLOR_Lab2RGB,
-                )
-                mats.release(colorLab)
-                mats.release(originalL)
+                val outRgbF = mats.mat()
+                Imgproc.cvtColor(outLab, outRgbF, Imgproc.COLOR_Lab2RGB)
+                outRgbF.convertTo(resultRgb, CvType.CV_8UC3, 255.0)
             }
 
             val outputRgba = mats.mat()
@@ -322,10 +254,8 @@ class MangaColorizer(
                 outputRgba,
                 Imgproc.COLOR_RGB2RGBA,
             )
-            mats.release(resultRgb)
 
             Core.insertChannel(alpha, outputRgba, 3)
-            mats.release(alpha)
 
             Bitmap.createBitmap(
                 width,
@@ -339,6 +269,58 @@ class MangaColorizer(
 
     override fun close() {
         session.close()
+    }
+
+    /**
+     * Guided filter: upsamples p (color channel) while aligning its edges
+     * with the guide I (original luminance).
+     */
+    private fun guidedFilter(mats: Mats, guideI: Mat, p: Mat): Mat {
+        val ksize = Size(2.0 * GUIDE_RADIUS + 1, 2.0 * GUIDE_RADIUS + 1)
+
+        fun box(src: Mat): Mat {
+            val dst = mats.mat()
+            Imgproc.boxFilter(src, dst, -1, ksize)
+            return dst
+        }
+
+        val meanI = box(guideI)
+        val meanP = box(p)
+
+        val ip = mats.mat()
+        Core.multiply(guideI, p, ip)
+        val meanIp = box(ip)
+
+        val meanIMeanP = mats.mat()
+        Core.multiply(meanI, meanP, meanIMeanP)
+        val cov = mats.mat()
+        Core.subtract(meanIp, meanIMeanP, cov)
+
+        val ii = mats.mat()
+        Core.multiply(guideI, guideI, ii)
+        val meanII = box(ii)
+        val meanISq = mats.mat()
+        Core.multiply(meanI, meanI, meanISq)
+        val variance = mats.mat()
+        Core.subtract(meanII, meanISq, variance)
+        Core.add(variance, Scalar(GUIDE_EPS), variance)
+
+        val a = mats.mat()
+        Core.divide(cov, variance, a)
+
+        val aMeanI = mats.mat()
+        Core.multiply(a, meanI, aMeanI)
+        val b = mats.mat()
+        Core.subtract(meanP, aMeanI, b)
+
+        val meanA = box(a)
+        val meanB = box(b)
+        val aTimesI = mats.mat()
+        Core.multiply(meanA, guideI, aTimesI)
+        val q = mats.mat()
+        Core.add(aTimesI, meanB, q)
+
+        return q
     }
 
     /** Returns model output planes in R, G, B order, each in [-1, 1]. */
@@ -455,12 +437,9 @@ class MangaColorizer(
         ): Mat =
             Mat(rows, cols, type).also(owned::add)
 
-        fun release(mat: Mat) {
-            val index = owned.indexOfFirst { it === mat }
-            if (index >= 0) {
-                owned.removeAt(index)
-                mat.release()
-            }
+        /** Registers a Mat created elsewhere so it is released on close. */
+        fun own(mat: Mat) {
+            owned.add(mat)
         }
 
         override fun close() {
@@ -473,10 +452,8 @@ class MangaColorizer(
         const val SIDE = 512
         const val PLANE = SIDE * SIDE
 
-        // Smoothly restore source ink in dark regions only.
-        const val INK_MASK_DARK_LIMIT = 95
-        const val INK_MASK_LIGHT_LIMIT = 220
-        const val INK_RESTORE_STRENGTH = 0.90f
+        const val GUIDE_RADIUS = 8
+        const val GUIDE_EPS = 1e-3
 
         const val INPUT_IMAGE = "L_bw"
         const val INPUT_SAM0 = "sam_level0"
