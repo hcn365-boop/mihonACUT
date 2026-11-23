@@ -25,6 +25,9 @@ import kotlin.coroutines.cancellation.CancellationException
 import kotlin.math.roundToInt
 import eu.kanade.translation.translator.TranslatorSettings
 import eu.kanade.translation.MangaTranslationContext
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
 
 /**
  * Processes a manga page for the reader: colorize, then upscale, then translate (text drawn into the
@@ -562,29 +565,26 @@ object PageColorizer {
         File(File(context.cacheDir, CHROMA_CACHE_DIR), imageHash + "_" + model.length() + (if (samActive(context)) "_sam" else ""))
 
     private fun loadChroma(file: File): MangaColorizer.Chroma? {
-        if (!file.isFile) return null
-        val data = file.readBytes()
-        if (data.size != CHROMA_SIZE * 2) return null
-        file.setLastModified(System.currentTimeMillis())
-        return MangaColorizer.Chroma(
-            FloatArray(CHROMA_SIZE) { data[it].toFloat() },
-            FloatArray(CHROMA_SIZE) { data[CHROMA_SIZE + it].toFloat() },
-        )
-    }
+    if (!file.isFile) return null
+    val bytes = file.readBytes()
+    if (bytes.size != CHROMA_SIZE * 3 * Float.SIZE_BYTES) return null
+    file.setLastModified(System.currentTimeMillis())
+    val rgb = FloatArray(CHROMA_SIZE * 3)
+    ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(rgb)
+    return MangaColorizer.Chroma(rgb)
+}
 
-    private fun saveChroma(context: Context, file: File, chroma: MangaColorizer.Chroma) {
-        val dir = file.parentFile ?: return
-        dir.mkdirs()
-        val data = ByteArray(CHROMA_SIZE * 2)
-        for (i in 0 until CHROMA_SIZE) {
-            data[i] = chroma.a[i].coerceIn(-127f, 127f).roundToInt().toByte()
-            data[CHROMA_SIZE + i] = chroma.b[i].coerceIn(-127f, 127f).roundToInt().toByte()
-        }
-        val temp = File(dir, "${file.name}.${System.nanoTime()}.tmp")
-        temp.writeBytes(data)
-        temp.renameTo(file)
-        trimCache(dir, MAX_CHROMA_CACHE_BYTES)
-    }
+private fun saveChroma(context: Context, file: File, chroma: MangaColorizer.Chroma) {
+    val dir = file.parentFile ?: return
+    dir.mkdirs()
+    val buffer = ByteBuffer.allocate(CHROMA_SIZE * 3 * Float.SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+    buffer.asFloatBuffer().put(chroma.rgb)
+    val temp = File(dir, "${file.name}.${System.nanoTime()}.tmp")
+    temp.writeBytes(buffer.array())
+    temp.renameTo(file)
+    trimCache(dir, MAX_CHROMA_CACHE_BYTES)
+}
+
 
     private fun trimCache(dir: File, limit: Long) {
         val files = dir.listFiles()
