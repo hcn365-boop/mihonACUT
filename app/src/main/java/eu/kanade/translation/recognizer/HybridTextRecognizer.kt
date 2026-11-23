@@ -3,9 +3,10 @@ package eu.kanade.translation.recognizer
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.util.Log
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
-import android.util.Log
+import eu.kanade.translation.PageTextExtractor
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -25,7 +26,9 @@ class HybridTextRecognizer(
         val y: Int,
         val width: Int,
         val height: Int,
-        val angle: Float
+        val angle: Float,
+        val symWidth: Float = PageTextExtractor.DEFAULT_SYMBOL,
+        val symHeight: Float = PageTextExtractor.DEFAULT_SYMBOL
     )
 
     data class HybridResult(
@@ -38,7 +41,7 @@ class HybridTextRecognizer(
         return results.joinToString("\n") { it.text }
     }
 
-    // استخراج الصناديق بدقة باستخدام ML Kit ثم قراءة النصوص الداخلية عبر PaddleOCR
+    // استخراج الصناديق وأبعاد الرموز من ML Kit ثم قراءة النصوص الداخلية عبر PaddleOCR بعد توسيع الصندوق 10%
     fun recognizeWithBoxes(image: InputImage): List<HybridResult> {
         val bitmap = image.bitmapInternal ?: return emptyList()
         val results = mutableListOf<HybridResult>()
@@ -52,13 +55,34 @@ class HybridTextRecognizer(
                 val line = block.lines.firstOrNull()
                 val angle = line?.angle ?: 0f
 
+                val symbolBoxes = block.lines
+                    .flatMap { it.elements }
+                    .flatMap { it.symbols }
+                    .mapNotNull { it.boundingBox }
+
+                val symWidth = if (symbolBoxes.isNotEmpty()) {
+                    symbolBoxes.map { it.width().toFloat() }.average().toFloat()
+                        .coerceAtLeast(4f)
+                } else {
+                    PageTextExtractor.DEFAULT_SYMBOL
+                }
+
+                val symHeight = if (symbolBoxes.isNotEmpty()) {
+                    symbolBoxes.map { it.height().toFloat() }.average().toFloat()
+                        .coerceAtLeast(4f)
+                } else {
+                    PageTextExtractor.DEFAULT_SYMBOL
+                }
+
                 rawBoxes.add(
                     HybridBox(
                         x = box.left,
                         y = box.top,
                         width = box.width(),
                         height = box.height(),
-                        angle = angle
+                        angle = angle,
+                        symWidth = symWidth,
+                        symHeight = symHeight
                     )
                 )
             }
@@ -74,11 +98,10 @@ class HybridTextRecognizer(
                 val cropH = endY - startY
                 if (cropW < 10 || cropH < 10) continue
 
-                // حساب الـ Padding بنفس طريقة PaddleTextRecognizer (4%)
-                val padX = (cropW * 0.04f).toInt()
-                val padY = (cropH * 0.04f).toInt()
+                // توسيع الصندوق بنسبة 10% لتجنب قص حواف النصوص
+                val padX = (cropW * 0.10f).toInt()
+                val padY = (cropH * 0.10f).toInt()
 
-                // تطبيق الـ Padding على الإحداثيات النهائية
                 val finalStartX = max(0, startX - padX)
                 val finalStartY = max(0, startY - padY)
                 val finalEndX = min(bitmap.width, endX + padX)
@@ -86,20 +109,21 @@ class HybridTextRecognizer(
 
                 val finalCropW = finalEndX - finalStartX
                 val finalCropH = finalEndY - finalStartY
+                if (finalCropW < 10 || finalCropH < 10) continue
 
-                // إنشاء صندوق جديد بالإحداثيات المُصححة (بعد الـ Padding)
                 val adjustedBox = HybridBox(
                     x = finalStartX,
                     y = finalStartY,
                     width = finalCropW,
                     height = finalCropH,
-                    angle = box.angle
+                    angle = box.angle,
+                    symWidth = box.symWidth,
+                    symHeight = box.symHeight
                 )
 
                 var croppedBitmap: Bitmap? = null
                 var rotatedBitmap: Bitmap? = null
                 try {
-                    // استخدام الإحداثيات المُعدّلة للقص
                     croppedBitmap = Bitmap.createBitmap(bitmap, finalStartX, finalStartY, finalCropW, finalCropH)
 
                     rotatedBitmap = if (abs(box.angle) > 1f) {
@@ -115,7 +139,6 @@ class HybridTextRecognizer(
                     val paddleText = paddleRecognizer.recognize(croppedInput)
 
                     if (paddleText.isNotBlank()) {
-                        // استخدام الصندوق المُعدّل بدلاً من الصندوق الأصلي
                         results.add(HybridResult(paddleText.trim(), adjustedBox))
                     }
                 } catch (e: Exception) {
