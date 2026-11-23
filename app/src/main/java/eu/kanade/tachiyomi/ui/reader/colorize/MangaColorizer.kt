@@ -23,7 +23,8 @@ import java.nio.FloatBuffer
  *
  * Two steps so the expensive part can be cached:
  *  - [predict] runs the model once and returns the predicted RGB at model resolution (small).
- *  - [render] takes its lighting from the MODEL, and fine line detail from the ORIGINAL page.
+ *  - [render] uses model hue/lighting for broad areas while preserving sharp original luminance
+ *    around fine lines and text to avoid low-res upscaled lighting blur.
  *
  * Not thread safe: call it from one coroutine at a time.
  */
@@ -79,11 +80,12 @@ class MangaColorizer(
     }
 
     /**
-     * Builds the colored page without guided filtering.
-     *  1. Hue: upscaled model color normalized to luminance 1.
+     * Builds the colored page while avoiding low-resolution upscaled lighting blur on text and sharp lines.
+     *  1. Hue: upscaled model color normalized to luminance 1 after saturation.
      *  2. Light: upscaled model luminance with floor applied.
-     *  3. Detail: original luminance divided by its large-scale blur. Keeps lines and texture.
-     *  4. Final luminance = light * detail. Saturation is applied to the color before normalization.
+     *  3. Detail: local contrast ratio of original luminance relative to its blur.
+     *  4. Final luminance blends model lighting and sharp original luminance based on [detail],
+     *     preventing blurry upscaled lighting from creating halos around dark text and lines.
      * Alpha is preserved.
      */
     fun render(input: Bitmap, chroma: Chroma, intensity: Float = 1f): Bitmap {
@@ -99,7 +101,7 @@ class MangaColorizer(
             val rgb = m.mat()
             rgb8.convertTo(rgb, CvType.CV_32FC3, 1.0 / 255.0)
 
-            // Original luminance (Rec.601), full size. Used for line detail.
+            // Original luminance (Rec.601), full size.
             val guideY = m.mat()
             luma(m, rgb, guideY)
 
@@ -136,28 +138,43 @@ class MangaColorizer(
             val hue = m.mat()
             Core.divide(satColor, satY3, hue)
 
-            // 2. Light: the model's own luminance directly upscaled. Sets brightness and shadows.
+            // 2. Model lighting (upscaled from 512x512).
             val light = m.mat()
             fullY.copyTo(light)
             Core.max(light, Scalar(LIGHT_FLOOR), light)
 
-            // 3. Detail: original luminance relative to its large-scale blur. Keeps lines and texture only.
+            // 3. Detail ratio from original luminance vs local blur.
             val lowGuide = m.mat()
             Imgproc.blur(guideY, lowGuide, Size(2.0 * LIGHT_RADIUS + 1.0, 2.0 * LIGHT_RADIUS + 1.0))
             Core.max(lowGuide, Scalar(LIGHT_FLOOR), lowGuide)
             val detail = m.mat()
             Core.divide(guideY, lowGuide, detail)
 
-            // تقييد التفاصيل بحيث لا تتجاوز 1 (يمنع الهالة الفاتحة)
             val ones = m.mat(detail.rows(), detail.cols(), detail.type())
             ones.setTo(Scalar(1.0))
             Core.min(detail, ones, detail)
+            Core.max(detail, Scalar(0.0), detail)
 
-            Core.pow(detail, DETAIL_STRENGTH.toDouble(), detail)
+            val detailShaped = m.mat()
+            Core.pow(detail, DETAIL_STRENGTH.toDouble(), detailShaped)
 
-            // 4. Final luminance = model lighting * original detail.
+            // 4. Blend: where detailShaped < 1 (dark text/lines), preserve sharp original guideY;
+            //    where detailShaped == 1, use model light * detailShaped.
+            //    finalY = detailShaped * (light * detailShaped) + (1 - detailShaped) * guideY
+            val modelCombined = m.mat()
+            Core.multiply(light, detailShaped, modelCombined)
+
+            val fromModel = m.mat()
+            Core.multiply(modelCombined, detailShaped, fromModel)
+
+            val invDetail = m.mat()
+            Core.subtract(ones, detailShaped, invDetail)
+            val fromGuide = m.mat()
+            Core.multiply(guideY, invDetail, fromGuide)
+
             val finalY = m.mat()
-            Core.multiply(light, detail, finalY)
+            Core.add(fromModel, fromGuide, finalY)
+
             val finalY3 = m.mat()
             Core.merge(listOf(finalY, finalY, finalY), finalY3)
 
