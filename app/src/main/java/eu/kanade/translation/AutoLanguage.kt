@@ -85,8 +85,8 @@ object AutoLanguage {
     }
 
     private val NATIVE_NAMES = mapOf(
-        "español" to TextRecognizerLanguage.SPANISH,
-        "espanol" to TextRecognizerLanguage.SPANISH,
+        "español" to TextRecognizerLanguage.SPANISH_CASTILIAN,
+        "espanol" to TextRecognizerLanguage.SPANISH_CASTILIAN,
         "français" to TextRecognizerLanguage.FRENCH,
         "francais" to TextRecognizerLanguage.FRENCH,
         "deutsch" to TextRecognizerLanguage.GERMAN,
