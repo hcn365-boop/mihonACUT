@@ -170,7 +170,7 @@ object PageTranslationService {
         // The page is already in the target language, and nobody asked for a translation.
         if (skipSame && settings.from.name.equals(settings.to.name, ignoreCase = true)) return Prepared.Ready(null)
 
-        // [تعديل هنا]: ربط مفتاح الكاش صراحةً بلغة الهدف (Target Language) لضمان عدم تداخل الترجمات القديمة عند تغيير اللغة
+        // ربط مفتاح الكاش صراحةً بلغة الهدف (Target Language) لضمان عدم تداخل الترجمات القديمة عند تغيير اللغة
         val targetLangCode = settings.to.name
         val translationName = "${ocrName}_lang_${targetLangCode}_${TranslationStore.key(settings.to.name, settings.engine.name, settings.model, filter?.signature.orEmpty())}"
 
@@ -180,22 +180,27 @@ object PageTranslationService {
         synchronized(pendingLock) { pending[translationName] }?.let { return Prepared.Waiting(it) }
 
         val translationConfig = AiConfig.translation
-        val isDefinitiveFromTitleOrSource = translationConfig?.let { cfg ->
+        val resolvedFromTitleOrSource = translationConfig?.let { cfg ->
             AutoLanguage.resolve(
                 fallback = cfg.settings.from,
                 options = cfg.auto,
                 title = AiConfig.mangaTitle,
                 sourceLang = AiConfig.mangaSourceLang,
-            ).definitive
-        } == true
+            )
+        }
+        val isDefinitive = resolvedFromTitleOrSource?.definitive == true
 
-        // لا يتم تشغيل فحص لغة الصفحة بعد القراءة إذا نجح إيجاد اللغة من العنوان أو المصدر
-        val confirm = translationConfig?.auto?.confirmPerPage == true && !isDefinitiveFromTitleOrSource
+        // التحقق من الإعداد: لا يُشغَّل فحص اللغة بعد القراءة إلا إذا كان confirmPerPage مفعّلاً ولم تُحسم اللغة من العنوان أو المصدر
+        val confirm = translationConfig?.auto?.confirmPerPage == true && !isDefinitive
 
         val ocrPage = ocrMutex.withLock {
             TranslationStore.load(context, Kind.OCR, ocrName) ?: run {
                 val bitmap = loadBitmap() ?: return Prepared.Ready(null)
-                var language = settings.from
+                var language = if (isDefinitive && resolvedFromTitleOrSource != null) {
+                    resolvedFromTitleOrSource.language
+                } else {
+                    settings.from
+                }
                 var found = session(context, language, ocrMode).extractor.extract(bitmap)
                 if (confirm && found != null) {
                     val detected = OcrLanguageCheck.detect(found.blocks.joinToString("\n") { it.text })
