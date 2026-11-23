@@ -7,7 +7,9 @@ import eu.kanade.translation.TranslationStore.Kind
 import eu.kanade.translation.model.PageTranslation
 import eu.kanade.translation.recognizer.TextRecognizerLanguage
 import eu.kanade.translation.translator.TextTranslator
+import eu.kanade.translation.translator.TextTranslatorLanguage
 import eu.kanade.translation.translator.TranslatorSettings
+import java.util.Locale
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -163,44 +165,53 @@ object PageTranslationService {
         imageHash: String,
         loadBitmap: () -> Bitmap?,
     ): Prepared {
-        val ocrName = "${imageHash}_${TranslationStore.key(settings.from.name, ocrMode.name)}"
-        val filter = AiConfig.translation?.filter
+        val translationConfig = AiConfig.translation
+        val resolvedAuto = translationConfig?.let { cfg ->
+            AutoLanguage.resolve(
+                fallback = settings.from,
+                options = cfg.auto,
+                title = AiConfig.mangaTitle,
+                sourceLang = AiConfig.mangaSourceLang,
+            )
+        }
+        val isDefinitive = resolvedAuto?.definitive == true
+        val initialFrom = if (resolvedAuto != null && (translationConfig.auto.enabled || isDefinitive)) {
+            resolvedAuto.language
+        } else {
+            settings.from
+        }
+        val effectiveInitialSettings = if (initialFrom == settings.from) {
+            settings
+        } else {
+            settings.copy(from = initialFrom)
+        }
+
+        val filter = translationConfig?.filter
         val skipSame = filter?.skipSameLanguage == true && !AiConfig.forceTranslate(MangaTranslationContext.mangaId)
 
         // The page is already in the target language, and nobody asked for a translation.
-        if (skipSame && settings.from.name.equals(settings.to.name, ignoreCase = true)) return Prepared.Ready(null)
+        if (skipSame && isSameLanguage(effectiveInitialSettings.from, effectiveInitialSettings.to)) {
+            return Prepared.Ready(null)
+        }
+
+        val ocrName = "${imageHash}_${TranslationStore.key(effectiveInitialSettings.from.name, ocrMode.name)}"
 
         // ربط مفتاح الكاش صراحةً بلغة الهدف (Target Language) لضمان عدم تداخل الترجمات القديمة عند تغيير اللغة
-        val targetLangCode = settings.to.name
-        val translationName = "${ocrName}_lang_${targetLangCode}_${TranslationStore.key(settings.to.name, settings.engine.name, settings.model, filter?.signature.orEmpty())}"
+        val targetLangCode = effectiveInitialSettings.to.name
+        val translationName = "${ocrName}_lang_${targetLangCode}_${TranslationStore.key(effectiveInitialSettings.to.name, effectiveInitialSettings.engine.name, effectiveInitialSettings.model, filter?.signature.orEmpty())}"
 
         TranslationStore.load(context, Kind.TRANSLATED, translationName)?.let {
             return Prepared.Ready(it.takeIf { page -> page.blocks.isNotEmpty() })
         }
         synchronized(pendingLock) { pending[translationName] }?.let { return Prepared.Waiting(it) }
 
-        val translationConfig = AiConfig.translation
-        val resolvedFromTitleOrSource = translationConfig?.let { cfg ->
-            AutoLanguage.resolve(
-                fallback = cfg.settings.from,
-                options = cfg.auto,
-                title = AiConfig.mangaTitle,
-                sourceLang = AiConfig.mangaSourceLang,
-            )
-        }
-        val isDefinitive = resolvedFromTitleOrSource?.definitive == true
-
-        // التحقق من الإعداد: لا يُشغَّل فحص اللغة بعد القراءة إلا إذا كان confirmPerPage مفعّلاً ولم تُحسم اللغة من العنوان أو المصدر
+        // لا يتم تشغيل فحص لغة الصفحة بعد القراءة إذا نجح إيجاد اللغة من العنوان أو المصدر أو كان الخيار مطفأً
         val confirm = translationConfig?.auto?.confirmPerPage == true && !isDefinitive
 
         val ocrPage = ocrMutex.withLock {
             TranslationStore.load(context, Kind.OCR, ocrName) ?: run {
                 val bitmap = loadBitmap() ?: return Prepared.Ready(null)
-                var language = if (isDefinitive && resolvedFromTitleOrSource != null) {
-                    resolvedFromTitleOrSource.language
-                } else {
-                    settings.from
-                }
+                var language = effectiveInitialSettings.from
                 var found = session(context, language, ocrMode).extractor.extract(bitmap)
                 if (confirm && found != null) {
                     val detected = OcrLanguageCheck.detect(found.blocks.joinToString("\n") { it.text })
@@ -227,16 +238,54 @@ object PageTranslationService {
             return Prepared.Ready(null)
         }
         val usedName = TranslationStore.loadText(context, Kind.LANGUAGE, ocrName)
-        val used = TextRecognizerLanguage.entries.firstOrNull { it.name == usedName } ?: settings.from
-        val effective = if (used == settings.from) settings else settings.copy(from = used)
+        val used = TextRecognizerLanguage.entries.firstOrNull { it.name == usedName } ?: effectiveInitialSettings.from
+        val effective = if (used == effectiveInitialSettings.from) {
+            effectiveInitialSettings
+        } else {
+            effectiveInitialSettings.copy(from = used)
+        }
 
         // The language check after OCR may have found that the page is already in the target language.
-        if (skipSame && effective.from.name.equals(effective.to.name, ignoreCase = true)) return Prepared.Ready(null)
+        if (skipSame && isSameLanguage(effective.from, effective.to)) return Prepared.Ready(null)
 
         val entry = synchronized(pendingLock) {
             pending.getOrPut(translationName) { Pending(context, translationName, page, effective) }
         }
         return Prepared.Waiting(entry)
+    }
+
+    private fun isSameLanguage(
+        from: TextRecognizerLanguage,
+        to: TextTranslatorLanguage,
+    ): Boolean {
+        if (from.name.equals(to.name, ignoreCase = true)) return true
+        val fromKey = normalizeLanguageKey(from.code, from.name, from.label)
+        val toKey = normalizeLanguageKey(to.code, to.name, to.label)
+        return fromKey.isNotEmpty() && fromKey == toKey
+    }
+
+    private fun normalizeLanguageKey(vararg values: String?): String {
+        for (raw in values) {
+            val primary = raw
+                ?.trim()
+                ?.lowercase(Locale.ROOT)
+                ?.substringBefore("-")
+                ?.substringBefore("_")
+                ?.substringBefore(";")
+                ?.substringBefore(",")
+                ?.substringBefore("(")
+                ?.trim()
+                .orEmpty()
+            if (primary.isEmpty()) continue
+            val alphaOnly = primary.filter { it.isLetter() }
+            if (alphaOnly.length >= 2) {
+                return alphaOnly.take(2)
+            }
+            if (alphaOnly.isNotEmpty()) {
+                return alphaOnly
+            }
+        }
+        return ""
     }
 
     /** Starts a timer so a page never waits longer than [BatchLimits.maxWaitMillis]. */
