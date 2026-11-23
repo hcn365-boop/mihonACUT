@@ -20,8 +20,9 @@ import java.nio.FloatBuffer
 /**
  * يشغّل نموذج Manga Light V6 لتلوين الصفحة.
  *
- * يُدخل النموذج صورة 512×512، ثم تُكبّر نتيجة RGB إلى أبعاد الصورة الداخلة.
- * عند intensity = 1f يُستخدم خرج النموذج مباشرةً دون استبدال إضاءته بإضاءة الأصل.
+ * النموذج يتنبأ عند 512×512. عند العرض، تُكبّر النتيجة إلى أبعاد
+ * الصورة المدخلة، ثم تُضاف إليها تفاصيل الإضاءة الدقيقة من الأصل
+ * للمساعدة في الحفاظ على حدة النصوص والخطوط.
  */
 class MangaColorizer(
     modelFile: File,
@@ -31,8 +32,8 @@ class MangaColorizer(
 ) : Closeable {
 
     /**
-     * قنوات RGB التي تنبأ بها النموذج، كل قناة بحجم 512×512
-     * وقيمها ضمن النطاق [0, 255].
+     * قنوات RGB المتنبأ بها من النموذج، كل قناة بحجم 512×512
+     * وقيمها في النطاق [0, 255].
      */
     class Chroma(
         val r: FloatArray,
@@ -77,15 +78,19 @@ class MangaColorizer(
     }
 
     /**
-     * يحضّر الصورة الرمادية ويمررها إلى النموذج.
-     * النموذج يعمل داخليًا على 512×512.
+     * يجهّز الصورة الرمادية بالحجم الذي يتطلبه النموذج،
+     * ثم يعيد تنبؤ النموذج في قنوات RGB.
      */
     fun predict(input: Bitmap): Chroma = Mats().use { mats ->
         val rgba = mats.mat()
         toMat(input, rgba)
 
         val gray = mats.mat()
-        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+        Imgproc.cvtColor(
+            rgba,
+            gray,
+            Imgproc.COLOR_RGBA2GRAY,
+        )
 
         val small = mats.mat()
         Imgproc.resize(
@@ -97,7 +102,7 @@ class MangaColorizer(
             Imgproc.INTER_AREA,
         )
 
-        // تطبيع قيم الصورة من [0, 255] إلى [-1, 1].
+        // تحويل نطاق الصورة من [0, 255] إلى [-1, 1].
         small.convertTo(
             small,
             CvType.CV_32F,
@@ -108,38 +113,36 @@ class MangaColorizer(
         val pixels = FloatArray(PLANE)
         small.get(0, 0, pixels)
 
-        val rgbPlanes = runModel(pixels)
+        val modelOutput = runModel(pixels)
 
         // تحويل خرج النموذج من [-1, 1] إلى [0, 255].
-        val rPlane = FloatArray(PLANE) { index ->
-            ((rgbPlanes[index] + 1f) * 127.5f)
+        val r = FloatArray(PLANE) { index ->
+            ((modelOutput[index] + 1f) * 127.5f)
                 .coerceIn(0f, 255f)
         }
 
-        val gPlane = FloatArray(PLANE) { index ->
-            ((rgbPlanes[PLANE + index] + 1f) * 127.5f)
+        val g = FloatArray(PLANE) { index ->
+            ((modelOutput[PLANE + index] + 1f) * 127.5f)
                 .coerceIn(0f, 255f)
         }
 
-        val bPlane = FloatArray(PLANE) { index ->
-            ((rgbPlanes[2 * PLANE + index] + 1f) * 127.5f)
+        val b = FloatArray(PLANE) { index ->
+            ((modelOutput[2 * PLANE + index] + 1f) * 127.5f)
                 .coerceIn(0f, 255f)
         }
 
-        Chroma(
-            r = rPlane,
-            g = gPlane,
-            b = bPlane,
-        )
+        Chroma(r = r, g = g, b = b)
     }
 
     /**
-     * ينشئ الصورة الملونة بأبعاد الصورة الداخلة.
+     * يعرض نتيجة التلوين بأبعاد الصورة المدخلة.
      *
      * intensity = 0: الصورة الأصلية.
-     * intensity = 1: خرج RGB الكامل من النموذج.
+     * intensity = 1: ألوان وإضاءة خرج النموذج، مع استعادة التفاصيل الدقيقة
+     *                من الصورة الأصلية.
      *
-     * القيم الأعلى من 1 تُحصر عند 1 لتجنب قصّ القنوات اللونية.
+     * تُقبل القيم حتى 1.2 للتوافق مع الإعدادات الحالية، لكن تُحصر فعليًا
+     * عند 1.0 لتجنب تجاوز نطاق المزج.
      */
     fun render(
         input: Bitmap,
@@ -149,7 +152,7 @@ class MangaColorizer(
         require(intensity.isFinite()) {
             "intensity must be a finite number"
         }
-        require(intensity >= 0f && intensity <= 1.2f) {
+        require(intensity in 0f..1.2f) {
             "intensity must be within 0..1.2"
         }
         require(
@@ -157,7 +160,7 @@ class MangaColorizer(
                 chroma.g.size == PLANE &&
                 chroma.b.size == PLANE,
         ) {
-            "Each chroma plane must contain $PLANE values"
+            "Each RGB plane must contain $PLANE values"
         }
 
         val width = input.width
@@ -165,75 +168,186 @@ class MangaColorizer(
         val amount = intensity.coerceIn(0f, 1f)
 
         return Mats().use { mats ->
-            val rgba = mats.mat()
-            toMat(input, rgba)
+            val inputRgba = mats.mat()
+            toMat(input, inputRgba)
 
             val originalRgb = mats.mat()
             Imgproc.cvtColor(
-                rgba,
+                inputRgba,
                 originalRgb,
                 Imgproc.COLOR_RGBA2RGB,
             )
 
             val resultRgb = mats.mat()
 
-            when {
-                amount <= 0f -> {
-                    originalRgb.copyTo(resultRgb)
+            if (amount <= 0f) {
+                originalRgb.copyTo(resultRgb)
+            } else {
+                // إعادة بناء خرج الموديل من قنوات RGB.
+                val rSmall = mats.mat(SIDE, SIDE, CvType.CV_32F).apply {
+                    put(0, 0, chroma.r)
+                }
+                val gSmall = mats.mat(SIDE, SIDE, CvType.CV_32F).apply {
+                    put(0, 0, chroma.g)
+                }
+                val bSmall = mats.mat(SIDE, SIDE, CvType.CV_32F).apply {
+                    put(0, 0, chroma.b)
                 }
 
-                else -> {
-                    val rSmall = mats.mat(SIDE, SIDE, CvType.CV_32F).apply {
-                        put(0, 0, chroma.r)
-                    }
+                val modelSmallFloat = mats.mat()
+                Core.merge(
+                    listOf(rSmall, gSmall, bSmall),
+                    modelSmallFloat,
+                )
 
-                    val gSmall = mats.mat(SIDE, SIDE, CvType.CV_32F).apply {
-                        put(0, 0, chroma.g)
-                    }
+                val modelSmallRgb = mats.mat()
+                modelSmallFloat.convertTo(
+                    modelSmallRgb,
+                    CvType.CV_8UC3,
+                )
 
-                    val bSmall = mats.mat(SIDE, SIDE, CvType.CV_32F).apply {
-                        put(0, 0, chroma.b)
-                    }
+                // تكبير خرج النموذج إلى أبعاد الصورة الداخلة.
+                val modelRgb = mats.mat()
+                Imgproc.resize(
+                    modelSmallRgb,
+                    modelRgb,
+                    Size(width.toDouble(), height.toDouble()),
+                    0.0,
+                    0.0,
+                    Imgproc.INTER_LANCZOS4,
+                )
 
-                    // القنوات بالترتيب RGB، كما يتوقع خرج النموذج.
-                    val mergedSmall = mats.mat()
-                    Core.merge(
-                        listOf(rSmall, gSmall, bSmall),
-                        mergedSmall,
-                    )
+                // فصل الإضاءة عن اللون باستخدام Lab.
+                val modelLab = mats.mat()
+                Imgproc.cvtColor(
+                    modelRgb,
+                    modelLab,
+                    Imgproc.COLOR_RGB2Lab,
+                )
 
-                    val small8 = mats.mat()
-                    mergedSmall.convertTo(
-                        small8,
-                        CvType.CV_8UC3,
-                    )
+                val originalLab = mats.mat()
+                Imgproc.cvtColor(
+                    originalRgb,
+                    originalLab,
+                    Imgproc.COLOR_RGB2Lab,
+                )
 
-                    // تكبير خرج الموديل إلى أبعاد الصورة الداخلة.
-                    val colorizedRgb = mats.mat()
-                    Imgproc.resize(
-                        small8,
-                        colorizedRgb,
-                        Size(width.toDouble(), height.toDouble()),
+                val modelL = mats.mat()
+                val modelA = mats.mat()
+                val modelB = mats.mat()
+                Core.extractChannel(modelLab, modelL, 0)
+                Core.extractChannel(modelLab, modelA, 1)
+                Core.extractChannel(modelLab, modelB, 2)
+
+                val originalL = mats.mat()
+                val originalA = mats.mat()
+                val originalB = mats.mat()
+                Core.extractChannel(originalLab, originalL, 0)
+                Core.extractChannel(originalLab, originalA, 1)
+                Core.extractChannel(originalLab, originalB, 2)
+
+                // مزج الإضاءة واللون حسب الشدة.
+                // عند intensity = 1، تبقى قنوات اللون وإضاءة الموديل.
+                val baseL = mats.mat()
+                val baseA = mats.mat()
+                val baseB = mats.mat()
+
+                if (amount >= 1f) {
+                    modelL.copyTo(baseL)
+                    modelA.copyTo(baseA)
+                    modelB.copyTo(baseB)
+                } else {
+                    val modelWeight = amount.toDouble()
+                    val originalWeight = (1f - amount).toDouble()
+
+                    Core.addWeighted(
+                        modelL,
+                        modelWeight,
+                        originalL,
+                        originalWeight,
                         0.0,
-                        0.0,
-                        Imgproc.INTER_LANCZOS4,
+                        baseL,
                     )
-
-                    if (amount >= 1f) {
-                        // الأهم: لا نركّب إضاءة الأصل على خرج الموديل عند الشدة الكاملة.
-                        colorizedRgb.copyTo(resultRgb)
-                    } else {
-                        // مزج تدريجي فقط عندما تكون الشدة أقل من 1.
-                        Core.addWeighted(
-                            colorizedRgb,
-                            amount.toDouble(),
-                            originalRgb,
-                            (1f - amount).toDouble(),
-                            0.0,
-                            resultRgb,
-                        )
-                    }
+                    Core.addWeighted(
+                        modelA,
+                        modelWeight,
+                        originalA,
+                        originalWeight,
+                        0.0,
+                        baseA,
+                    )
+                    Core.addWeighted(
+                        modelB,
+                        modelWeight,
+                        originalB,
+                        originalWeight,
+                        0.0,
+                        baseB,
+                    )
                 }
+
+                // استخراج تفاصيل الإضاءة الدقيقة من الصورة الأصلية:
+                // التفاصيل = الإضاءة الأصلية - نسخة مطموسة قليلًا منها.
+                // نستخدم Float حتى تبقى التفاصيل السالبة والموجبة محفوظة.
+                val originalLFloat = mats.mat()
+                originalL.convertTo(
+                    originalLFloat,
+                    CvType.CV_32F,
+                )
+
+                val blurredOriginalL = mats.mat()
+                Imgproc.GaussianBlur(
+                    originalLFloat,
+                    blurredOriginalL,
+                    Size(5.0, 5.0),
+                    DETAIL_SIGMA,
+                    DETAIL_SIGMA,
+                    Core.BORDER_REFLECT_101,
+                )
+
+                val originalDetails = mats.mat()
+                Core.subtract(
+                    originalLFloat,
+                    blurredOriginalL,
+                    originalDetails,
+                )
+
+                // إضافة تفاصيل الأصل فوق إضاءة الموديل فقط؛
+                // لا نستبدل إضاءة الموديل بإضاءة الأصل كاملةً.
+                val baseLFloat = mats.mat()
+                baseL.convertTo(
+                    baseLFloat,
+                    CvType.CV_32F,
+                )
+
+                val detailedLFloat = mats.mat()
+                Core.addWeighted(
+                    baseLFloat,
+                    1.0,
+                    originalDetails,
+                    (DETAIL_STRENGTH * amount).toDouble(),
+                    0.0,
+                    detailedLFloat,
+                )
+
+                // التحويل إلى 8-bit يحصر القيم تلقائيًا ضمن [0, 255].
+                val detailedL = mats.mat()
+                detailedLFloat.convertTo(
+                    detailedL,
+                    CvType.CV_8UC1,
+                )
+
+                val outputLab = mats.mat()
+                Core.merge(
+                    listOf(detailedL, baseA, baseB),
+                    outputLab,
+                )
+
+                Imgproc.cvtColor(
+                    outputLab,
+                    resultRgb,
+                    Imgproc.COLOR_Lab2RGB,
+                )
             }
 
             val outputRgba = mats.mat()
@@ -243,9 +357,9 @@ class MangaColorizer(
                 Imgproc.COLOR_RGB2RGBA,
             )
 
-            // الحفاظ على ألفا الصورة الأصلية.
+            // الاحتفاظ بقناة ألفا الأصلية.
             val alpha = mats.mat()
-            Core.extractChannel(rgba, alpha, 3)
+            Core.extractChannel(inputRgba, alpha, 3)
             Core.insertChannel(alpha, outputRgba, 3)
 
             Bitmap.createBitmap(
@@ -263,8 +377,8 @@ class MangaColorizer(
     }
 
     /**
-     * يعيد خرج النموذج في ثلاث قنوات متتابعة R ثم G ثم B،
-     * وكل القيم ضمن [-1, 1].
+     * يعيد خرج النموذج في ثلاثة مستويات متتابعة: R ثم G ثم B،
+     * وبالشكل [1, 3, 512, 512].
      */
     private fun runModel(image: FloatArray): FloatArray {
         val tensors = ArrayList<OnnxTensor>()
@@ -273,12 +387,15 @@ class MangaColorizer(
             fun tensor(
                 data: FloatArray,
                 vararg shape: Long,
-            ): OnnxTensor =
-                OnnxTensor.createTensor(
+            ): OnnxTensor {
+                val result = OnnxTensor.createTensor(
                     env,
                     FloatBuffer.wrap(data),
                     shape,
-                ).also(tensors::add)
+                )
+                tensors.add(result)
+                return result
+            }
 
             val inputs = mapOf(
                 INPUT_IMAGE to tensor(
@@ -384,6 +501,10 @@ class MangaColorizer(
     private companion object {
         const val SIDE = 512
         const val PLANE = SIDE * SIDE
+
+        // مقدار معتدل لتفاصيل الأصل؛ زيادته كثيرًا قد تُظهر هالات حول النصوص.
+        const val DETAIL_STRENGTH = 0.65f
+        const val DETAIL_SIGMA = 1.0
 
         const val INPUT_IMAGE = "L_bw"
         const val INPUT_SAM0 = "sam_level0"
