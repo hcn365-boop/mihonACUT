@@ -4,6 +4,7 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.graphics.Bitmap
+import logcat.LogPriority
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
@@ -12,11 +13,10 @@ import org.opencv.core.Mat
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
+import tachiyomi.core.common.util.system.logcat
 import java.io.Closeable
 import java.io.File
 import java.nio.FloatBuffer
-import logcat.LogPriority
-import tachiyomi.core.common.util.system.logcat
 
 /**
  * Runs the Manga Light V6 generator (v6_generator.onnx) on a page.
@@ -43,7 +43,7 @@ class MangaColorizer(
 
     init {
         check(OpenCVLoader.initLocal()) { "OpenCV native library failed to load" }
-        session = env.createSession(modelFile.absolutePath, OrtSession.SessionOptions())
+        session = OrtSessions.create(env, modelFile.absolutePath, acceleration, threads) //[span_1](start_span)[span_1](end_span)
         val expectedInputs = setOf(INPUT_IMAGE, INPUT_SAM0, INPUT_SAM1, INPUT_WD14)
         if (session.inputNames != expectedInputs || session.outputNames != setOf(OUTPUT_RGB)) {
             val message = "Not a Manga Light V6 generator: inputs=${session.inputNames}, outputs=${session.outputNames}"
@@ -165,14 +165,15 @@ class MangaColorizer(
             val lowGuide = m.mat()
             Imgproc.blur(guideY, lowGuide, Size(2.0 * LIGHT_RADIUS + 1.0, 2.0 * LIGHT_RADIUS + 1.0))
             Core.max(lowGuide, Scalar(LIGHT_FLOOR), lowGuide)
-            val detail = Mat()
-Core.divide(guideY, lowGuide, detail)
+            val detail = m.mat()
+            Core.divide(guideY, lowGuide, detail)
 
-// تقييد التفاصيل بحيث لا تتجاوز 1 (يمنع الهالة الفاتحة)
-val ones = Mat.ones(detail.size(), detail.type())
-Core.min(detail, ones, detail)
+            // تقييد التفاصيل بحيث لا تتجاوز 1 (يمنع الهالة الفاتحة)
+            val ones = m.mat(detail.rows(), detail.cols(), detail.type())
+            ones.setTo(Scalar(1.0))
+            Core.min(detail, ones, detail)
 
-Core.pow(detail, DETAIL_STRENGTH.toDouble(), detail)
+            Core.pow(detail, DETAIL_STRENGTH.toDouble(), detail)
 
             // 4. Final luminance = model lighting * original detail.
             val finalY = m.mat()
