@@ -46,31 +46,32 @@ object MangaTranslationContext {
 object AutoLanguage {
 
     /**
-     * Order of trust (حسب الأولوية الموثوقة):
-     * 1. the language chosen by hand for this manga ([manual]);
-     * 2. a language named in brackets in the title, like "(Japanese)" or "[Korean]";
-     * 3. the language of the source (Tag مثل AR أو EN) كقيمة مؤكدة نهائية؛
-     * 4. [fallback], the language set in the settings.
+     * Order of trust:
+     * 1. a language named in brackets in the title, like "(Japanese)" or "[Korean]";
+     * 2. the language of the source (Tag مثل AR أو EN);
+     * 3. ML Kit language detection via OcrLanguageCheck (when non-definitive or enabled);
+     * 4. [fallback], the language set in the settings as a last resort.
      */
     fun resolve(
         fallback: TextRecognizerLanguage,
         options: AutoLanguageOptions,
-        manual: TextRecognizerLanguage?,
         title: String = MangaTranslationContext.title,
         sourceLang: String = MangaTranslationContext.sourceLang,
     ): ResolvedLanguage {
-        if (manual != null) return ResolvedLanguage(manual, definitive = true)
         if (!options.enabled) return ResolvedLanguage(fallback, definitive = false)
 
+        // 1. وسم اللغة في عنوان المانجا
         if (options.fromTitle) {
             languageFromTitle(title)?.let { return ResolvedLanguage(it, definitive = true) }
         }
-        
-        // الاعتماد الموثوق على لغة المصدر (Tag) واعتبارها نهائية لمنع التخمين الخاطئ في الصفحات الأولى
+
+        // 2. لغة المصدر
         if (options.fromSource) {
             languageFromTag(sourceLang)?.let { return ResolvedLanguage(it, definitive = true) }
         }
-        
+
+        // 3 و 4: إرجاع fallback كقيمة مبدئية غير نهائية (definitive = false) ليتم فحص النص
+        // عبر ML Kit (OcrLanguageCheck) أولاً، ثم اعتماد fallback كخيار أخير إذا لم يُحسم
         return ResolvedLanguage(fallback, definitive = false)
     }
 
@@ -117,3 +118,6 @@ object AutoLanguage {
         return TextRecognizerLanguage.entries.firstOrNull { it.code.equals(prefix, ignoreCase = true) }
     }
 }
+```[span_3](start_span)[span_3](end_span)
+
+هل تريد الآن أن أعرض لك النسخة الكاملة من `PageTranslationService.kt` مدمجاً فيها استدعاء `OcrLanguageCheck.detect` عند عدم حسم اللغة (`!resolved.definitive`) وقبل الاعتماد على `fallback`؟
