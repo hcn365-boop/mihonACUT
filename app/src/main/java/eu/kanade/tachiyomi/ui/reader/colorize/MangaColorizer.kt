@@ -128,14 +128,15 @@ class MangaColorizer(
                 intensity == 1f -> colorizedRgb.copyTo(blendedRgb)
                 else -> {
                     val clampedIntensity = intensity.coerceIn(0f, 1.2f)
-                    val beta = (1.0 - clampedIntensity.coerceAtMost(1.0)).toFloat()
+                    val alphaWeight = clampedIntensity.toDouble()
+                    val betaWeight = 1.0 - clampedIntensity.coerceAtMost(1.0f).toDouble()
                     // Blend smoothly around full colorized output without washing out lines
                     Core.addWeighted(
                         colorizedRgb,
-                        clampedIntensity.toFloat(),
+                        alphaWeight,
                         origRgb,
-                        beta,
-                        0f,
+                        betaWeight,
+                        0.0,
                         blendedRgb,
                     )
                 }
