@@ -328,7 +328,7 @@ Core.pow(detail, DETAIL_STRENGTH.toDouble(), detail)
         const val GUIDE_EPS = 1e-3
         const val WEIGHT_FLOOR = 0.05
         const val LIGHT_RADIUS = 32
-        const val LIGHT_FLOOR = 0.02
+        const val LIGHT_FLOOR = 0.1
         const val Y_EPS = 1e-3
 
         /** Below 1.0 softens the original page's detail so it cannot overpower the printed color. */
