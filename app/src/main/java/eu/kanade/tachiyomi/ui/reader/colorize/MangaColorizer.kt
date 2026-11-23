@@ -23,8 +23,9 @@ import tachiyomi.core.common.util.system.logcat
  *
  * Two steps so the expensive part can be cached:
  *  - [predict] runs the model once and returns the predicted RGB at model resolution (small).
- *  - [render] takes luminance from the ORIGINAL page at full size and keeps the model's
- *    local light and shadow inside its color, normalized by the model's large-scale brightness.
+ *  - [render] takes its lighting from the MODEL, and only fine line detail from the ORIGINAL page.
+ *    Printed color comes from the model, so the original page's overall brightness
+ *    does not wash it out.
  *
  * Not thread safe: call it from one coroutine at a time.
  */
@@ -81,10 +82,10 @@ class MangaColorizer(
 
     /**
      * Builds the colored page.
-     * Luminance and edges come from [input] at full size. Color comes from the model,
-     * smoothed along the original edges with weights from the model's luminance.
-     * The model's local light and shadow are kept, normalized by its large-scale brightness,
-     * then the original luminance is applied. [intensity] scales saturation around gray.
+     *  1. Hue: model color smoothed along the original edges, then normalized to luminance 1.
+     *  2. Light: the model's own luminance, guided by the original edges. This sets brightness and shadows.
+     *  3. Detail: the original luminance divided by its large-scale blur. This keeps only lines and texture.
+     *  4. Final luminance = light * detail. Saturation is applied to the color before normalization.
      * Alpha is preserved.
      */
     fun render(input: Bitmap, chroma: Chroma, intensity: Float = 1f): Bitmap {
@@ -100,11 +101,11 @@ class MangaColorizer(
             val rgb = m.mat()
             rgb8.convertTo(rgb, CvType.CV_32FC3, 1.0 / 255.0)
 
-            // Original luminance (Rec.601), full size. It sets brightness and edges.
+            // Original luminance (Rec.601), full size. Used for edges and line detail only.
             val guideY = m.mat()
             luma(m, rgb, guideY)
 
-            // Model color and luminance at model resolution. Its shading is kept, not divided out.
+            // Model color and luminance at model resolution.
             val modelRgb = m.mat(SIDE, SIDE, CvType.CV_32FC3)
             modelRgb.put(0, 0, chroma.rgb)
             val modelY = m.mat()
@@ -120,8 +121,7 @@ class MangaColorizer(
             val fullY = m.mat()
             Imgproc.resize(modelY, fullY, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
 
-            // Color smoothed along original edges, weighted by model luminance
-            // so dark, unreliable pixels do not bleed into bright regions.
+            // 1. Hue: color smoothed along original edges, weighted by model luminance.
             val denom = guidedFilter(m, guideY, fullWeight, GUIDE_RADIUS, GUIDE_EPS)
             val channels = List(3) { m.mat() }
             Core.split(fullRgb, channels)
@@ -136,30 +136,47 @@ class MangaColorizer(
             val color = m.mat()
             Core.merge(smoothChannels, color)
 
-            // Large-scale brightness of the model, aligned to the original page edges.
-            // Dividing by it keeps local light and shadow inside the color, while the
-            // original page sets the overall brightness.
-            val lowY = guidedFilter(m, guideY, fullY, LIGHT_RADIUS, GUIDE_EPS)
-            Core.max(lowY, Scalar(LIGHT_FLOOR), lowY)
-            val lowY3 = m.mat()
-            Core.merge(listOf(lowY, lowY, lowY), lowY3)
-            val lit = m.mat()
-            Core.divide(color, lowY3, lit)
+            // Saturation: scale chroma around each pixel's gray value, before normalizing.
+            val colorY = m.mat()
+            luma(m, color, colorY)
+            val colorY3 = m.mat()
+            Core.merge(listOf(colorY, colorY, colorY), colorY3)
+            val satColor = m.mat()
+            Core.subtract(color, colorY3, satColor)
+            Core.multiply(satColor, Scalar(intensity.toDouble(), intensity.toDouble(), intensity.toDouble()), satColor)
+            Core.add(satColor, colorY3, satColor)
+            Core.max(satColor, Scalar(0.0, 0.0, 0.0), satColor)
+            Core.min(satColor, Scalar(1.0, 1.0, 1.0), satColor)
 
-            // Apply the original page's luminance (brightness and line detail).
-            val guide3 = m.mat()
-            Core.merge(listOf(guideY, guideY, guideY), guide3)
-            Core.multiply(lit, guide3, lit)
+            // Normalize to luminance 1 so only the hue/saturation remains.
+            val satY = m.mat()
+            luma(m, satColor, satY)
+            Core.max(satY, Scalar(Y_EPS), satY)
+            val satY3 = m.mat()
+            Core.merge(listOf(satY, satY, satY), satY3)
+            val hue = m.mat()
+            Core.divide(satColor, satY3, hue)
 
-            // Saturation: scale chroma around the gray value of each pixel.
-            val gray = m.mat()
-            luma(m, lit, gray)
-            val gray3 = m.mat()
-            Core.merge(listOf(gray, gray, gray), gray3)
+            // 2. Light: the model's own luminance, aligned to original edges. Sets brightness and shadows.
+            val light = guidedFilter(m, guideY, fullY, GUIDE_RADIUS, GUIDE_EPS)
+            Core.max(light, Scalar(LIGHT_FLOOR), light)
+
+            // 3. Detail: original luminance relative to its large-scale blur. Keeps lines and texture only.
+            val lowGuide = m.mat()
+            Imgproc.blur(guideY, lowGuide, Size(2.0 * LIGHT_RADIUS + 1.0, 2.0 * LIGHT_RADIUS + 1.0))
+            Core.max(lowGuide, Scalar(LIGHT_FLOOR), lowGuide)
+            val detail = m.mat()
+            Core.divide(guideY, lowGuide, detail)
+            Core.pow(detail, DETAIL_STRENGTH, detail)
+
+            // 4. Final luminance = model lighting * original detail.
+            val finalY = m.mat()
+            Core.multiply(light, detail, finalY)
+            val finalY3 = m.mat()
+            Core.merge(listOf(finalY, finalY, finalY), finalY3)
+
             val result = m.mat()
-            Core.subtract(lit, gray3, result)
-            Core.multiply(result, Scalar(intensity.toDouble(), intensity.toDouble(), intensity.toDouble()), result)
-            Core.add(result, gray3, result)
+            Core.multiply(hue, finalY3, result)
             Core.max(result, Scalar(0.0, 0.0, 0.0), result)
             Core.min(result, Scalar(1.0, 1.0, 1.0), result)
 
@@ -307,5 +324,9 @@ class MangaColorizer(
         const val WEIGHT_FLOOR = 0.05
         const val LIGHT_RADIUS = 32
         const val LIGHT_FLOOR = 0.02
+        const val Y_EPS = 1e-3
+
+        /** Below 1.0 softens the original page's detail so it cannot overpower the printed color. */
+        const val DETAIL_STRENGTH = 0.5
     }
 }
