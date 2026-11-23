@@ -260,11 +260,11 @@ class MangaColorizer(
         const val INPUT_WD14 = "wd14_embedding"
         const val OUTPUT_RGB = "rgb_pred"
 
-        const val LIGHT_RADIUS = 32
+        const val LIGHT_RADIUS = 16
         const val LIGHT_FLOOR = 0.1
         const val Y_EPS = 1e-3
 
         /** Below 1.0 softens the original page's detail so it cannot overpower the printed color. */
-        const val DETAIL_STRENGTH = 0.5
+        const val DETAIL_STRENGTH = 1.0
     }
 }
