@@ -186,7 +186,8 @@ class MangaColorizer(
         Core.multiply(guideY, detailShaped, sharpGuideWithDetail)
 
         val invMask = m.mat()
-        Core.subtract(Scalar(1.0), darkMask, invMask)
+        Core.multiply(darkMask, Scalar(-1.0), invMask)
+        Core.add(invMask, Scalar(1.0), invMask)
 
         val partLight = m.mat()
         Core.multiply(lightWithDetail, darkMask, partLight)
