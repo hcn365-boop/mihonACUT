@@ -23,9 +23,7 @@ import java.nio.FloatBuffer
  *
  * Two steps so the expensive part can be cached:
  *  - [predict] runs the model once and returns the predicted RGB at model resolution (small).
- *  - [render] takes its lighting from the MODEL, and only fine line detail from the ORIGINAL page.
- *    Printed color comes from the model, so the original page's overall brightness
- *    does not wash it out.
+ *  - [render] takes its lighting from the MODEL, and fine line detail from the ORIGINAL page.
  *
  * Not thread safe: call it from one coroutine at a time.
  */
@@ -43,7 +41,7 @@ class MangaColorizer(
 
     init {
         check(OpenCVLoader.initLocal()) { "OpenCV native library failed to load" }
-        session = OrtSessions.create(env, modelFile.absolutePath, acceleration, threads) //[span_1](start_span)[span_1](end_span)
+        session = OrtSessions.create(env, modelFile.absolutePath, acceleration, threads)
         val expectedInputs = setOf(INPUT_IMAGE, INPUT_SAM0, INPUT_SAM1, INPUT_WD14)
         if (session.inputNames != expectedInputs || session.outputNames != setOf(OUTPUT_RGB)) {
             val message = "Not a Manga Light V6 generator: inputs=${session.inputNames}, outputs=${session.outputNames}"
@@ -81,10 +79,10 @@ class MangaColorizer(
     }
 
     /**
-     * Builds the colored page.
-     *  1. Hue: model color smoothed along the original edges, then normalized to luminance 1.
-     *  2. Light: the model's own luminance, guided by the original edges. This sets brightness and shadows.
-     *  3. Detail: the original luminance divided by its large-scale blur. This keeps only lines and texture.
+     * Builds the colored page without guided filtering.
+     *  1. Hue: upscaled model color normalized to luminance 1.
+     *  2. Light: upscaled model luminance with floor applied.
+     *  3. Detail: original luminance divided by its large-scale blur. Keeps lines and texture.
      *  4. Final luminance = light * detail. Saturation is applied to the color before normalization.
      * Alpha is preserved.
      */
@@ -101,7 +99,7 @@ class MangaColorizer(
             val rgb = m.mat()
             rgb8.convertTo(rgb, CvType.CV_32FC3, 1.0 / 255.0)
 
-            // Original luminance (Rec.601), full size. Used for edges and line detail only.
+            // Original luminance (Rec.601), full size. Used for line detail.
             val guideY = m.mat()
             luma(m, rgb, guideY)
 
@@ -111,38 +109,19 @@ class MangaColorizer(
             val modelY = m.mat()
             luma(m, modelRgb, modelY)
 
-            // Upscale model color, luminance, and a confidence weight to page size.
-            val weight = m.mat()
-            Core.max(modelY, Scalar(WEIGHT_FLOOR), weight)
-            val fullWeight = m.mat()
-            Imgproc.resize(weight, fullWeight, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
+            // Upscale model color and luminance directly to page size.
             val fullRgb = m.mat()
             Imgproc.resize(modelRgb, fullRgb, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
             val fullY = m.mat()
             Imgproc.resize(modelY, fullY, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
 
-            // 1. Hue: color smoothed along original edges, weighted by model luminance.
-            val denom = guidedFilter(m, guideY, fullWeight, GUIDE_RADIUS, GUIDE_EPS)
-            val channels = List(3) { m.mat() }
-            Core.split(fullRgb, channels)
-            val smoothChannels = channels.map { ch ->
-                val weighted = m.mat()
-                Core.multiply(ch, fullWeight, weighted)
-                val num = guidedFilter(m, guideY, weighted, GUIDE_RADIUS, GUIDE_EPS)
-                val out = m.mat()
-                Core.divide(num, denom, out)
-                out
-            }
-            val color = m.mat()
-            Core.merge(smoothChannels, color)
-
             // Saturation: scale chroma around each pixel's gray value, before normalizing.
             val colorY = m.mat()
-            luma(m, color, colorY)
+            luma(m, fullRgb, colorY)
             val colorY3 = m.mat()
             Core.merge(listOf(colorY, colorY, colorY), colorY3)
             val satColor = m.mat()
-            Core.subtract(color, colorY3, satColor)
+            Core.subtract(fullRgb, colorY3, satColor)
             Core.multiply(satColor, Scalar(intensity.toDouble(), intensity.toDouble(), intensity.toDouble()), satColor)
             Core.add(satColor, colorY3, satColor)
             Core.max(satColor, Scalar(0.0, 0.0, 0.0), satColor)
@@ -157,8 +136,9 @@ class MangaColorizer(
             val hue = m.mat()
             Core.divide(satColor, satY3, hue)
 
-            // 2. Light: the model's own luminance, aligned to original edges. Sets brightness and shadows.
-            val light = guidedFilter(m, guideY, fullY, GUIDE_RADIUS, GUIDE_EPS)
+            // 2. Light: the model's own luminance directly upscaled. Sets brightness and shadows.
+            val light = m.mat()
+            fullY.copyTo(light)
             Core.max(light, Scalar(LIGHT_FLOOR), light)
 
             // 3. Detail: original luminance relative to its large-scale blur. Keeps lines and texture only.
@@ -213,7 +193,6 @@ class MangaColorizer(
 
             val inputs = mapOf(
                 INPUT_IMAGE to tensor(image, 1, 1, SIDE.toLong(), SIDE.toLong()),
-                // تم تعديل الأبعاد هنا لتتوافق مع مخرجات النموذج الجديد (64x64 و 32x32)
                 INPUT_SAM0 to tensor(guide?.level0 ?: FloatArray(256 * 64 * 64), 1, 256, 64, 64),
                 INPUT_SAM1 to tensor(guide?.level1 ?: FloatArray(256 * 32 * 32), 1, 256, 32, 32),
                 INPUT_WD14 to tensor(FloatArray(1024), 1, 1024),
@@ -244,50 +223,6 @@ class MangaColorizer(
         val kernel = m.mat(1, 3, CvType.CV_32F)
         kernel.put(0, 0, floatArrayOf(0.299f, 0.587f, 0.114f))
         Core.transform(rgb, dst, kernel)
-    }
-
-    /**
-     * Guided filter (He et al.) with a single-channel guide [guide] and input [p], both CV_32FC1.
-     * Edges of [p] follow edges of [guide].
-     */
-    private fun guidedFilter(m: Mats, guide: Mat, p: Mat, radius: Int, eps: Double): Mat {
-        val ksize = Size(2.0 * radius + 1.0, 2.0 * radius + 1.0)
-        fun box(src: Mat): Mat = m.mat().also { Imgproc.blur(src, it, ksize) }
-
-        val meanI = box(guide)
-        val meanP = box(p)
-
-        val ii = m.mat()
-        Core.multiply(guide, guide, ii)
-        val ip = m.mat()
-        Core.multiply(guide, p, ip)
-        val meanII = box(ii)
-        val meanIP = box(ip)
-
-        val tmp = m.mat()
-        Core.multiply(meanI, meanI, tmp)
-        val varI = m.mat()
-        Core.subtract(meanII, tmp, varI)
-
-        Core.multiply(meanI, meanP, tmp)
-        val cov = m.mat()
-        Core.subtract(meanIP, tmp, cov)
-
-        val denom = m.mat()
-        Core.add(varI, Scalar(eps), denom)
-        val a = m.mat()
-        Core.divide(cov, denom, a)
-
-        Core.multiply(a, meanI, tmp)
-        val b = m.mat()
-        Core.subtract(meanP, tmp, b)
-
-        val meanA = box(a)
-        val meanB = box(b)
-        Core.multiply(meanA, guide, tmp)
-        val q = m.mat()
-        Core.add(tmp, meanB, q)
-        return q
     }
 
     private fun toMat(bitmap: Bitmap, destination: Mat) {
@@ -325,9 +260,6 @@ class MangaColorizer(
         const val INPUT_WD14 = "wd14_embedding"
         const val OUTPUT_RGB = "rgb_pred"
 
-        const val GUIDE_RADIUS = 8
-        const val GUIDE_EPS = 1e-3
-        const val WEIGHT_FLOOR = 0.05
         const val LIGHT_RADIUS = 32
         const val LIGHT_FLOOR = 0.1
         const val Y_EPS = 1e-3
