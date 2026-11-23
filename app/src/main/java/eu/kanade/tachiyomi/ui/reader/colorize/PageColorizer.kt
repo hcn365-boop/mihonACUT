@@ -308,12 +308,12 @@ object PageColorizer {
             val upscale = doUpscale && !original.hasAlpha()
             val finalPass = wantFinal && acnetReady(context) && !original.hasAlpha()
             if (color && !looksGrayscale(working)) color = false
-            if (!color && !upscale && !finalPass && working === original) return null
+            if (!color && !upscale && !finalPass) return null
             if (estimateBytes(pixels, color, upscale, upscaleScale()) > AiConfig.memoryBudgetBytes) return null
 
             val processed = try {
                 mutex.withLock {
-                    var page = working
+                    var page = original
                     if (color) {
                         val colorModel = modelFile(context)
                         val chromaFile = chromaFile(context, imageHash, colorModel)
@@ -321,17 +321,17 @@ object PageColorizer {
                         val chroma = loadChroma(chromaFile) ?: engine.predict(working).also {
                             runCatching { saveChroma(context, chromaFile, it) }
                         }
-                        page = engine.render(working, chroma, intensity)
+                        page = engine.render(original, chroma, intensity)
                     }
                     if (upscale) {
                         val enlarged = (upscalerEngine(context) ?: error("No upscaler model"))
                             .process(page, AiConfig.upscaleMaxOutputPixels, PageResizer.MAX_SIDE)
-                        if (page !== working) page.recycle()
+                        if (page !== original) page.recycle()
                         page = enlarged
                     }
                     if (finalPass) {
                         val refined = acnetFinalPass(context, page)
-                        if (refined !== page && page !== working) page.recycle()
+                        if (refined !== page && page !== original) page.recycle()
                         page = refined
                     }
 
@@ -339,7 +339,7 @@ object PageColorizer {
                     val saturation = AiConfig.saturation
                     if (color && saturation != 1f) {
                         val saturated = applySaturation(page, saturation)
-                        if (saturated !== page && page !== working) page.recycle()
+                        if (saturated !== page && page !== original) page.recycle()
                         saturated
                     } else {
                         page
@@ -362,7 +362,7 @@ object PageColorizer {
             runCatching { saveCachedPage(file, encoded) }
             return encoded
         } finally {
-            result?.recycle()
+            if (result !== original && result !== working) result?.recycle()
             if (working !== original) working.recycle()
             original.recycle()
         }
