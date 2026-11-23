@@ -23,8 +23,8 @@ import tachiyomi.core.common.util.system.logcat
  *
  * Two steps so the expensive part can be cached:
  *  - [predict] runs the model once and returns the predicted RGB at model resolution (small).
- *  - [render] takes luminance from the ORIGINAL page at full size and applies the model's
- *    color as a luminance-independent ratio (channel / model luminance).
+ *  - [render] takes luminance from the ORIGINAL page at full size and keeps the model's
+ *    local light and shadow inside its color, normalized by the model's large-scale brightness.
  *
  * Not thread safe: call it from one coroutine at a time.
  */
@@ -81,15 +81,17 @@ class MangaColorizer(
 
     /**
      * Builds the colored page.
-     * Luminance comes from [input] at full size. Color comes from the model as
-     * ratio = model_RGB / model_Y, refined by a guided filter on the original luminance,
-     * then scaled by [intensity] around neutral (1.0) and multiplied by the original luminance.
+     * Luminance and edges come from [input] at full size. Color comes from the model,
+     * smoothed along the original edges with weights from the model's luminance.
+     * The model's local light and shadow are kept, normalized by its large-scale brightness,
+     * then the original luminance is applied. [intensity] scales saturation around gray.
      * Alpha is preserved.
      */
     fun render(input: Bitmap, chroma: Chroma, intensity: Float = 1f): Bitmap {
         require(intensity in 0f..1.2f) { "intensity must be within 0..1.2" }
         val width = input.width
         val height = input.height
+        val fullSize = Size(width.toDouble(), height.toDouble())
         return Mats().use { m ->
             val rgba = m.mat()
             toMat(input, rgba)
@@ -98,45 +100,66 @@ class MangaColorizer(
             val rgb = m.mat()
             rgb8.convertTo(rgb, CvType.CV_32FC3, 1.0 / 255.0)
 
-            // Original luminance (Rec.601), full size, used as the guide.
+            // Original luminance (Rec.601), full size. It sets brightness and edges.
             val guideY = m.mat()
             luma(m, rgb, guideY)
 
-            // Model color and its luminance at model resolution.
+            // Model color and luminance at model resolution. Its shading is kept, not divided out.
             val modelRgb = m.mat(SIDE, SIDE, CvType.CV_32FC3)
             modelRgb.put(0, 0, chroma.rgb)
             val modelY = m.mat()
             luma(m, modelRgb, modelY)
-            val modelY3 = m.mat()
-            Core.merge(listOf(modelY, modelY, modelY), modelY3)
-            Core.add(modelY3, Scalar(RATIO_EPS, RATIO_EPS, RATIO_EPS), modelY3)
 
-            // ratio = model_channel / model_Y, clamped to [0, MAX_RATIO].
-            val ratio = m.mat()
-            Core.divide(modelRgb, modelY3, ratio)
-            Core.max(ratio, Scalar(0.0, 0.0, 0.0), ratio)
-            Core.min(ratio, Scalar(MAX_RATIO, MAX_RATIO, MAX_RATIO), ratio)
+            // Upscale model color, luminance, and a confidence weight to page size.
+            val weight = m.mat()
+            Core.max(modelY, Scalar(WEIGHT_FLOOR), weight)
+            val fullWeight = m.mat()
+            Imgproc.resize(weight, fullWeight, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
+            val fullRgb = m.mat()
+            Imgproc.resize(modelRgb, fullRgb, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
+            val fullY = m.mat()
+            Imgproc.resize(modelY, fullY, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
 
-            // Upscale the ratio to page size, then align its edges with the original luminance.
-            val fullRatio = m.mat()
-            Imgproc.resize(ratio, fullRatio, Size(width.toDouble(), height.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+            // Color smoothed along original edges, weighted by model luminance
+            // so dark, unreliable pixels do not bleed into bright regions.
+            val denom = guidedFilter(m, guideY, fullWeight, GUIDE_RADIUS, GUIDE_EPS)
             val channels = List(3) { m.mat() }
-            Core.split(fullRatio, channels)
-            val smoothChannels = channels.map { guidedFilter(m, guideY, it, GUIDE_RADIUS, GUIDE_EPS) }
-            val smooth = m.mat()
-            Core.merge(smoothChannels, smooth)
+            Core.split(fullRgb, channels)
+            val smoothChannels = channels.map { ch ->
+                val weighted = m.mat()
+                Core.multiply(ch, fullWeight, weighted)
+                val num = guidedFilter(m, guideY, weighted, GUIDE_RADIUS, GUIDE_EPS)
+                val out = m.mat()
+                Core.divide(num, denom, out)
+                out
+            }
+            val color = m.mat()
+            Core.merge(smoothChannels, color)
 
-            // Saturation: move ratios away from neutral (1.0) by chromaScale.
-            val adjusted = m.mat()
-            Core.subtract(smooth, Scalar(1.0, 1.0, 1.0), adjusted)
-            Core.multiply(adjusted, Scalar(intensity.toDouble(), intensity.toDouble(), intensity.toDouble()), adjusted)
-            Core.add(adjusted, Scalar(1.0, 1.0, 1.0), adjusted)
+            // Large-scale brightness of the model, aligned to the original page edges.
+            // Dividing by it keeps local light and shadow inside the color, while the
+            // original page sets the overall brightness.
+            val lowY = guidedFilter(m, guideY, fullY, LIGHT_RADIUS, GUIDE_EPS)
+            Core.max(lowY, Scalar(LIGHT_FLOOR), lowY)
+            val lowY3 = m.mat()
+            Core.merge(listOf(lowY, lowY, lowY), lowY3)
+            val lit = m.mat()
+            Core.divide(color, lowY3, lit)
 
-            // Final color = adjusted ratio * original luminance.
+            // Apply the original page's luminance (brightness and line detail).
             val guide3 = m.mat()
             Core.merge(listOf(guideY, guideY, guideY), guide3)
+            Core.multiply(lit, guide3, lit)
+
+            // Saturation: scale chroma around the gray value of each pixel.
+            val gray = m.mat()
+            luma(m, lit, gray)
+            val gray3 = m.mat()
+            Core.merge(listOf(gray, gray, gray), gray3)
             val result = m.mat()
-            Core.multiply(adjusted, guide3, result)
+            Core.subtract(lit, gray3, result)
+            Core.multiply(result, Scalar(intensity.toDouble(), intensity.toDouble(), intensity.toDouble()), result)
+            Core.add(result, gray3, result)
             Core.max(result, Scalar(0.0, 0.0, 0.0), result)
             Core.min(result, Scalar(1.0, 1.0, 1.0), result)
 
@@ -279,9 +302,10 @@ class MangaColorizer(
         const val INPUT_WD14 = "wd14_embedding"
         const val OUTPUT_RGB = "rgb_pred"
 
-        const val RATIO_EPS = 1e-3
-        const val MAX_RATIO = 4.0
         const val GUIDE_RADIUS = 8
         const val GUIDE_EPS = 1e-3
+        const val WEIGHT_FLOOR = 0.05
+        const val LIGHT_RADIUS = 32
+        const val LIGHT_FLOOR = 0.02
     }
 }
