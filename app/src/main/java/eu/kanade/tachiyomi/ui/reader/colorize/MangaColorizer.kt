@@ -18,11 +18,12 @@ import java.io.File
 import java.nio.FloatBuffer
 
 /**
- * يشغّل نموذج Manga Light V6 لتلوين الصفحة.
+ * Manga Light V6 colorizer.
  *
- * النموذج يتنبأ عند 512×512. عند العرض، تُكبّر النتيجة إلى أبعاد
- * الصورة المدخلة، ثم تُضاف إليها تفاصيل الإضاءة الدقيقة من الأصل
- * للمساعدة في الحفاظ على حدة النصوص والخطوط.
+ * The model predicts RGB at 512x512. Its result is resized to the input bitmap's
+ * dimensions. At full intensity, the model's color channels are retained, while
+ * dark text/ink luminance from the original image is restored without sharpening
+ * or blurring, which avoids introducing edge halos.
  */
 class MangaColorizer(
     modelFile: File,
@@ -31,10 +32,7 @@ class MangaColorizer(
     private val guide: SamFeatures? = null,
 ) : Closeable {
 
-    /**
-     * قنوات RGB المتنبأ بها من النموذج، كل قناة بحجم 512×512
-     * وقيمها في النطاق [0, 255].
-     */
+    /** Model-predicted RGB planes at 512x512, values in [0, 255]. */
     class Chroma(
         val r: FloatArray,
         val g: FloatArray,
@@ -78,8 +76,8 @@ class MangaColorizer(
     }
 
     /**
-     * يجهّز الصورة الرمادية بالحجم الذي يتطلبه النموذج،
-     * ثم يعيد تنبؤ النموذج في قنوات RGB.
+     * Converts the input to grayscale, resizes it to the model input size,
+     * runs inference, and returns the predicted RGB planes.
      */
     fun predict(input: Bitmap): Chroma = Mats().use { mats ->
         val rgba = mats.mat()
@@ -102,7 +100,7 @@ class MangaColorizer(
             Imgproc.INTER_AREA,
         )
 
-        // تحويل نطاق الصورة من [0, 255] إلى [-1, 1].
+        // Normalize [0, 255] to [-1, 1].
         small.convertTo(
             small,
             CvType.CV_32F,
@@ -113,36 +111,29 @@ class MangaColorizer(
         val pixels = FloatArray(PLANE)
         small.get(0, 0, pixels)
 
-        val modelOutput = runModel(pixels)
+        val output = runModel(pixels)
 
-        // تحويل خرج النموذج من [-1, 1] إلى [0, 255].
+        // Denormalize model output from [-1, 1] to [0, 255].
         val r = FloatArray(PLANE) { index ->
-            ((modelOutput[index] + 1f) * 127.5f)
-                .coerceIn(0f, 255f)
+            ((output[index] + 1f) * 127.5f).coerceIn(0f, 255f)
         }
-
         val g = FloatArray(PLANE) { index ->
-            ((modelOutput[PLANE + index] + 1f) * 127.5f)
-                .coerceIn(0f, 255f)
+            ((output[PLANE + index] + 1f) * 127.5f).coerceIn(0f, 255f)
         }
-
         val b = FloatArray(PLANE) { index ->
-            ((modelOutput[2 * PLANE + index] + 1f) * 127.5f)
-                .coerceIn(0f, 255f)
+            ((output[2 * PLANE + index] + 1f) * 127.5f).coerceIn(0f, 255f)
         }
 
         Chroma(r = r, g = g, b = b)
     }
 
     /**
-     * يعرض نتيجة التلوين بأبعاد الصورة المدخلة.
+     * Renders the predicted colors at the input bitmap's dimensions.
      *
-     * intensity = 0: الصورة الأصلية.
-     * intensity = 1: ألوان وإضاءة خرج النموذج، مع استعادة التفاصيل الدقيقة
-     *                من الصورة الأصلية.
+     * intensity = 0: original image.
+     * intensity = 1: full model color, with dark original ink/text restored.
      *
-     * تُقبل القيم حتى 1.2 للتوافق مع الإعدادات الحالية، لكن تُحصر فعليًا
-     * عند 1.0 لتجنب تجاوز نطاق المزج.
+     * Values above 1 are accepted for compatibility, but clamped to 1.
      */
     fun render(
         input: Bitmap,
@@ -171,28 +162,32 @@ class MangaColorizer(
             val inputRgba = mats.mat()
             toMat(input, inputRgba)
 
+            // Keep the source alpha channel for the output.
+            val alpha = mats.mat()
+            Core.extractChannel(inputRgba, alpha, 3)
+
             val originalRgb = mats.mat()
             Imgproc.cvtColor(
                 inputRgba,
                 originalRgb,
                 Imgproc.COLOR_RGBA2RGB,
             )
+            mats.release(inputRgba)
 
             val resultRgb = mats.mat()
 
             if (amount <= 0f) {
                 originalRgb.copyTo(resultRgb)
             } else {
-                // إعادة بناء خرج الموديل من قنوات RGB.
-                val rSmall = mats.mat(SIDE, SIDE, CvType.CV_32F).apply {
-                    put(0, 0, chroma.r)
-                }
-                val gSmall = mats.mat(SIDE, SIDE, CvType.CV_32F).apply {
-                    put(0, 0, chroma.g)
-                }
-                val bSmall = mats.mat(SIDE, SIDE, CvType.CV_32F).apply {
-                    put(0, 0, chroma.b)
-                }
+                // Rebuild the model's 512x512 RGB output.
+                val rSmall = mats.mat(SIDE, SIDE, CvType.CV_32F)
+                rSmall.put(0, 0, chroma.r)
+
+                val gSmall = mats.mat(SIDE, SIDE, CvType.CV_32F)
+                gSmall.put(0, 0, chroma.g)
+
+                val bSmall = mats.mat(SIDE, SIDE, CvType.CV_32F)
+                bSmall.put(0, 0, chroma.b)
 
                 val modelSmallFloat = mats.mat()
                 Core.merge(
@@ -200,13 +195,18 @@ class MangaColorizer(
                     modelSmallFloat,
                 )
 
+                mats.release(rSmall)
+                mats.release(gSmall)
+                mats.release(bSmall)
+
                 val modelSmallRgb = mats.mat()
                 modelSmallFloat.convertTo(
                     modelSmallRgb,
                     CvType.CV_8UC3,
                 )
+                mats.release(modelSmallFloat)
 
-                // تكبير خرج النموذج إلى أبعاد الصورة الداخلة.
+                // Resize only the model output to the input bitmap dimensions.
                 val modelRgb = mats.mat()
                 Imgproc.resize(
                     modelSmallRgb,
@@ -216,14 +216,32 @@ class MangaColorizer(
                     0.0,
                     Imgproc.INTER_LANCZOS4,
                 )
+                mats.release(modelSmallRgb)
 
-                // فصل الإضاءة عن اللون باستخدام Lab.
-                val modelLab = mats.mat()
+                val colorRgb: Mat
+                if (amount >= 1f) {
+                    colorRgb = modelRgb
+                } else {
+                    colorRgb = mats.mat()
+                    Core.addWeighted(
+                        modelRgb,
+                        amount.toDouble(),
+                        originalRgb,
+                        (1f - amount).toDouble(),
+                        0.0,
+                        colorRgb,
+                    )
+                    mats.release(modelRgb)
+                }
+
+                // Convert the colorized page and original to Lab.
+                val colorLab = mats.mat()
                 Imgproc.cvtColor(
-                    modelRgb,
-                    modelLab,
+                    colorRgb,
+                    colorLab,
                     Imgproc.COLOR_RGB2Lab,
                 )
+                mats.release(colorRgb)
 
                 val originalLab = mats.mat()
                 Imgproc.cvtColor(
@@ -231,123 +249,71 @@ class MangaColorizer(
                     originalLab,
                     Imgproc.COLOR_RGB2Lab,
                 )
+                mats.release(originalRgb)
 
+                // The model's a/b color channels stay unchanged.
+                // Only its L channel is adjusted to recover dark source ink.
                 val modelL = mats.mat()
-                val modelA = mats.mat()
-                val modelB = mats.mat()
-                Core.extractChannel(modelLab, modelL, 0)
-                Core.extractChannel(modelLab, modelA, 1)
-                Core.extractChannel(modelLab, modelB, 2)
+                Core.extractChannel(colorLab, modelL, 0)
 
                 val originalL = mats.mat()
-                val originalA = mats.mat()
-                val originalB = mats.mat()
                 Core.extractChannel(originalLab, originalL, 0)
-                Core.extractChannel(originalLab, originalA, 1)
-                Core.extractChannel(originalLab, originalB, 2)
+                mats.release(originalLab)
 
-                // مزج الإضاءة واللون حسب الشدة.
-                // عند intensity = 1، تبقى قنوات اللون وإضاءة الموديل.
-                val baseL = mats.mat()
-                val baseA = mats.mat()
-                val baseB = mats.mat()
+                val pixelCount = Math.multiplyExact(width, height)
+                val modelLight = ByteArray(pixelCount)
+                val originalLight = ByteArray(pixelCount)
 
-                if (amount >= 1f) {
-                    modelL.copyTo(baseL)
-                    modelA.copyTo(baseA)
-                    modelB.copyTo(baseB)
-                } else {
-                    val modelWeight = amount.toDouble()
-                    val originalWeight = (1f - amount).toDouble()
+                modelL.get(0, 0, modelLight)
+                originalL.get(0, 0, originalLight)
 
-                    Core.addWeighted(
-                        modelL,
-                        modelWeight,
-                        originalL,
-                        originalWeight,
-                        0.0,
-                        baseL,
-                    )
-                    Core.addWeighted(
-                        modelA,
-                        modelWeight,
-                        originalA,
-                        originalWeight,
-                        0.0,
-                        baseA,
-                    )
-                    Core.addWeighted(
-                        modelB,
-                        modelWeight,
-                        originalB,
-                        originalWeight,
-                        0.0,
-                        baseB,
-                    )
+                for (i in 0 until pixelCount) {
+                    val modelValue = modelLight[i].toInt() and 0xFF
+                    val sourceValue = originalLight[i].toInt() and 0xFF
+
+                    /*
+                     * A smooth per-pixel ink mask:
+                     * - dark source pixels get strong ink restoration;
+                     * - light source pixels are left untouched.
+                     *
+                     * No blur, edge sharpening, or high-pass filter is used.
+                     */
+                    val t = (
+                        (INK_MASK_LIGHT_LIMIT - sourceValue).toFloat() /
+                            (INK_MASK_LIGHT_LIMIT - INK_MASK_DARK_LIMIT)
+                        ).coerceIn(0f, 1f)
+
+                    val inkMask = t * t * (3f - 2f * t)
+                    val weight = INK_RESTORE_STRENGTH * amount * inkMask
+
+                    // Only move toward a darker original value; never brighten
+                    // an edge pixel, which helps avoid bright halos.
+                    val restoredValue = if (sourceValue < modelValue) {
+                        modelValue - (modelValue - sourceValue) * weight
+                    } else {
+                        modelValue.toFloat()
+                    }
+
+                    modelLight[i] =
+                        (restoredValue + 0.5f)
+                            .toInt()
+                            .coerceIn(0, 255)
+                            .toByte()
                 }
 
-                // استخراج تفاصيل الإضاءة الدقيقة من الصورة الأصلية:
-                // التفاصيل = الإضاءة الأصلية - نسخة مطموسة قليلًا منها.
-                // نستخدم Float حتى تبقى التفاصيل السالبة والموجبة محفوظة.
-                val originalLFloat = mats.mat()
-                originalL.convertTo(
-                    originalLFloat,
-                    CvType.CV_32F,
-                )
+                modelL.put(0, 0, modelLight)
 
-                val blurredOriginalL = mats.mat()
-                Imgproc.GaussianBlur(
-                    originalLFloat,
-                    blurredOriginalL,
-                    Size(5.0, 5.0),
-                    DETAIL_SIGMA,
-                    DETAIL_SIGMA,
-                    Core.BORDER_REFLECT_101,
-                )
-
-                val originalDetails = mats.mat()
-                Core.subtract(
-                    originalLFloat,
-                    blurredOriginalL,
-                    originalDetails,
-                )
-
-                // إضافة تفاصيل الأصل فوق إضاءة الموديل فقط؛
-                // لا نستبدل إضاءة الموديل بإضاءة الأصل كاملةً.
-                val baseLFloat = mats.mat()
-                baseL.convertTo(
-                    baseLFloat,
-                    CvType.CV_32F,
-                )
-
-                val detailedLFloat = mats.mat()
-                Core.addWeighted(
-                    baseLFloat,
-                    1.0,
-                    originalDetails,
-                    (DETAIL_STRENGTH * amount).toDouble(),
-                    0.0,
-                    detailedLFloat,
-                )
-
-                // التحويل إلى 8-bit يحصر القيم تلقائيًا ضمن [0, 255].
-                val detailedL = mats.mat()
-                detailedLFloat.convertTo(
-                    detailedL,
-                    CvType.CV_8UC1,
-                )
-
-                val outputLab = mats.mat()
-                Core.merge(
-                    listOf(detailedL, baseA, baseB),
-                    outputLab,
-                )
+                // Replace only Lab's L channel; retain the model's a/b channels.
+                Core.insertChannel(modelL, colorLab, 0)
+                mats.release(modelL)
 
                 Imgproc.cvtColor(
-                    outputLab,
+                    colorLab,
                     resultRgb,
                     Imgproc.COLOR_Lab2RGB,
                 )
+                mats.release(colorLab)
+                mats.release(originalL)
             }
 
             val outputRgba = mats.mat()
@@ -356,11 +322,10 @@ class MangaColorizer(
                 outputRgba,
                 Imgproc.COLOR_RGB2RGBA,
             )
+            mats.release(resultRgb)
 
-            // الاحتفاظ بقناة ألفا الأصلية.
-            val alpha = mats.mat()
-            Core.extractChannel(inputRgba, alpha, 3)
             Core.insertChannel(alpha, outputRgba, 3)
+            mats.release(alpha)
 
             Bitmap.createBitmap(
                 width,
@@ -376,10 +341,7 @@ class MangaColorizer(
         session.close()
     }
 
-    /**
-     * يعيد خرج النموذج في ثلاثة مستويات متتابعة: R ثم G ثم B،
-     * وبالشكل [1, 3, 512, 512].
-     */
+    /** Returns model output planes in R, G, B order, each in [-1, 1]. */
     private fun runModel(image: FloatArray): FloatArray {
         val tensors = ArrayList<OnnxTensor>()
 
@@ -388,13 +350,13 @@ class MangaColorizer(
                 data: FloatArray,
                 vararg shape: Long,
             ): OnnxTensor {
-                val result = OnnxTensor.createTensor(
+                val created = OnnxTensor.createTensor(
                     env,
                     FloatBuffer.wrap(data),
                     shape,
                 )
-                tensors.add(result)
-                return result
+                tensors.add(created)
+                return created
             }
 
             val inputs = mapOf(
@@ -493,8 +455,17 @@ class MangaColorizer(
         ): Mat =
             Mat(rows, cols, type).also(owned::add)
 
+        fun release(mat: Mat) {
+            val index = owned.indexOfFirst { it === mat }
+            if (index >= 0) {
+                owned.removeAt(index)
+                mat.release()
+            }
+        }
+
         override fun close() {
             owned.forEach { it.release() }
+            owned.clear()
         }
     }
 
@@ -502,9 +473,10 @@ class MangaColorizer(
         const val SIDE = 512
         const val PLANE = SIDE * SIDE
 
-        // مقدار معتدل لتفاصيل الأصل؛ زيادته كثيرًا قد تُظهر هالات حول النصوص.
-        const val DETAIL_STRENGTH = 0.65f
-        const val DETAIL_SIGMA = 1.0
+        // Smoothly restore source ink in dark regions only.
+        const val INK_MASK_DARK_LIMIT = 95
+        const val INK_MASK_LIGHT_LIMIT = 220
+        const val INK_RESTORE_STRENGTH = 0.90f
 
         const val INPUT_IMAGE = "L_bw"
         const val INPUT_SAM0 = "sam_level0"
