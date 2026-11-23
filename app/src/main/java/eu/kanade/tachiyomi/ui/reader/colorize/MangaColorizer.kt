@@ -332,6 +332,6 @@ Core.pow(detail, DETAIL_STRENGTH.toDouble(), detail)
         const val Y_EPS = 1e-3
 
         /** Below 1.0 softens the original page's detail so it cannot overpower the printed color. */
-        const val DETAIL_STRENGTH = 0.4
+        const val DETAIL_STRENGTH = 0.2
     }
 }
