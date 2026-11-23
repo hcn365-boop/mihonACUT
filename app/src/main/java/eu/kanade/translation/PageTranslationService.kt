@@ -2,11 +2,13 @@ package eu.kanade.translation
 
 import android.content.Context
 import android.graphics.Bitmap
+import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
 import eu.kanade.translation.TranslationStore.Kind
 import eu.kanade.translation.model.PageTranslation
 import eu.kanade.translation.recognizer.TextRecognizerLanguage
 import eu.kanade.translation.translator.TextTranslator
 import eu.kanade.translation.translator.TranslatorSettings
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -19,8 +21,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import logcat.LogPriority
 import tachiyomi.core.common.util.system.logcat
-import kotlin.coroutines.cancellation.CancellationException
-import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
 
 /**
  * How pages are grouped into translator requests. A request is sent as soon as one limit is reached,
@@ -166,10 +166,10 @@ object PageTranslationService {
         val ocrName = "${imageHash}_${TranslationStore.key(settings.from.name, ocrMode.name)}"
         val filter = AiConfig.translation?.filter
         val skipSame = filter?.skipSameLanguage == true && !AiConfig.forceTranslate(MangaTranslationContext.mangaId)
-        
+
         // The page is already in the target language, and nobody asked for a translation.
         if (skipSame && settings.from.name.equals(settings.to.name, ignoreCase = true)) return Prepared.Ready(null)
-        
+
         // [تعديل هنا]: ربط مفتاح الكاش صراحةً بلغة الهدف (Target Language) لضمان عدم تداخل الترجمات القديمة عند تغيير اللغة
         val targetLangCode = settings.to.name
         val translationName = "${ocrName}_lang_${targetLangCode}_${TranslationStore.key(settings.to.name, settings.engine.name, settings.model, filter?.signature.orEmpty())}"
@@ -179,7 +179,19 @@ object PageTranslationService {
         }
         synchronized(pendingLock) { pending[translationName] }?.let { return Prepared.Waiting(it) }
 
-        val confirm = AiConfig.translation?.auto?.confirmPerPage == true
+        val translationConfig = AiConfig.translation
+        val isDefinitiveFromTitleOrSource = translationConfig?.let { cfg ->
+            AutoLanguage.resolve(
+                fallback = cfg.settings.from,
+                options = cfg.auto,
+                title = AiConfig.mangaTitle,
+                sourceLang = AiConfig.mangaSourceLang,
+            ).definitive
+        } == true
+
+        // لا يتم تشغيل فحص لغة الصفحة بعد القراءة إذا نجح إيجاد اللغة من العنوان أو المصدر
+        val confirm = translationConfig?.auto?.confirmPerPage == true && !isDefinitiveFromTitleOrSource
+
         val ocrPage = ocrMutex.withLock {
             TranslationStore.load(context, Kind.OCR, ocrName) ?: run {
                 val bitmap = loadBitmap() ?: return Prepared.Ready(null)
@@ -212,10 +224,10 @@ object PageTranslationService {
         val usedName = TranslationStore.loadText(context, Kind.LANGUAGE, ocrName)
         val used = TextRecognizerLanguage.entries.firstOrNull { it.name == usedName } ?: settings.from
         val effective = if (used == settings.from) settings else settings.copy(from = used)
-        
+
         // The language check after OCR may have found that the page is already in the target language.
         if (skipSame && effective.from.name.equals(effective.to.name, ignoreCase = true)) return Prepared.Ready(null)
-        
+
         val entry = synchronized(pendingLock) {
             pending.getOrPut(translationName) { Pending(context, translationName, page, effective) }
         }
