@@ -13,6 +13,7 @@ import eu.kanade.translation.PageTranslationService
 import eu.kanade.translation.TranslationStore
 import eu.kanade.translation.translator.TranslatorSettings
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import logcat.LogPriority
 import okio.Buffer
 import okio.BufferedSource
@@ -372,7 +373,7 @@ object PageColorizer {
         val canvas = Canvas(output)
         val paint = Paint().apply {
             colorFilter = ColorMatrixColorFilter(
-                ColorMatrix().apply { setSaturation(saturation) }
+                ColorMatrix().apply { setSaturation(saturation) },
             )
         }
         canvas.drawBitmap(bitmap, 0f, 0f, paint)
