@@ -165,9 +165,14 @@ class MangaColorizer(
             val lowGuide = m.mat()
             Imgproc.blur(guideY, lowGuide, Size(2.0 * LIGHT_RADIUS + 1.0, 2.0 * LIGHT_RADIUS + 1.0))
             Core.max(lowGuide, Scalar(LIGHT_FLOOR), lowGuide)
-            val detail = m.mat()
-            Core.divide(guideY, lowGuide, detail)
-            Core.pow(detail, DETAIL_STRENGTH, detail)
+            val detail = Mat()
+Core.divide(guideY, lowGuide, detail)
+
+// تقييد التفاصيل بحيث لا تتجاوز 1 (يمنع الهالة الفاتحة)
+val ones = Mat.ones(detail.size(), detail.type())
+Core.min(detail, ones, detail)
+
+Core.pow(detail, DETAIL_STRENGTH.toDouble(), detail)
 
             // 4. Final luminance = model lighting * original detail.
             val finalY = m.mat()
@@ -327,6 +332,6 @@ class MangaColorizer(
         const val Y_EPS = 1e-3
 
         /** Below 1.0 softens the original page's detail so it cannot overpower the printed color. */
-        const val DETAIL_STRENGTH = 0.5
+        const val DETAIL_STRENGTH = 0.4
     }
 }
