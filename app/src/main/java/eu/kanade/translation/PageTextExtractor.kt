@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
+import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
 import eu.kanade.translation.model.PageTranslation
 import eu.kanade.translation.model.TranslationBlock
 import eu.kanade.translation.recognizer.HybridTextRecognizer
@@ -14,9 +15,8 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 import kotlin.math.sqrt
-import tachiyomi.core.common.util.system.logcat
 import logcat.LogPriority
-import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
+import tachiyomi.core.common.util.system.logcat
 
 enum class OcrMode { MLKIT, PADDLE, HYBRID }
 
@@ -88,8 +88,8 @@ class PageTextExtractor(
                                 text = result.text,
                                 width = result.box.width.toFloat(),
                                 height = result.box.height.toFloat(),
-                                symWidth = DEFAULT_SYMBOL,
-                                symHeight = DEFAULT_SYMBOL,
+                                symWidth = result.box.symWidth,
+                                symHeight = result.box.symHeight,
                                 angle = result.box.angle,
                                 x = result.box.x.toFloat(),
                                 y = result.box.y.toFloat()
@@ -181,9 +181,9 @@ internal object TextBlockMerger {
     private val symbolsFilterPattern = Regex("""[_~•°^@#$&|\\-]""")
 
     fun merge(
-        blocks: List<TranslationBlock>, 
-        imgWidth: Float, 
-        imgHeight: Float, 
+        blocks: List<TranslationBlock>,
+        imgWidth: Float,
+        imgHeight: Float,
         collisionPaddingFactor: Float = 1.3f,
         isHybrid: Boolean = false
     ): MutableList<TranslationBlock> {
@@ -287,9 +287,9 @@ internal object TextBlockMerger {
                     var movingBlock = blocks[movingIdx]
 
                     val overlapRight = (staticBlock.x + staticBlock.width) - movingBlock.x
-                    val overlapLeft  = (movingBlock.x + movingBlock.width) - staticBlock.x
-                    val overlapDown  = (staticBlock.y + staticBlock.height) - movingBlock.y
-                    val overlapUp    = (movingBlock.y + movingBlock.height) - staticBlock.y
+                    val overlapLeft = (movingBlock.x + movingBlock.width) - staticBlock.x
+                    val overlapDown = (staticBlock.y + staticBlock.height) - movingBlock.y
+                    val overlapUp = (movingBlock.y + movingBlock.height) - staticBlock.y
 
                     val isAngled = abs(movingBlock.angle) > 20f && abs(movingBlock.angle) < 160f
                     val directions = buildDirections(overlapLeft, overlapRight, overlapUp, overlapDown, isAngled, movingBlock.angle)
@@ -323,14 +323,15 @@ internal object TextBlockMerger {
                         val newW = movingBlock.width * shrinkFactor
                         val newH = movingBlock.height * shrinkFactor
                         movingBlock = movingBlock.copy(
-                            width = newW, height = newH,
+                            width = newW,
+                            height = newH,
                             x = movingBlock.x + (movingBlock.width - newW) / 2f,
                             y = movingBlock.y + (movingBlock.height - newH) / 2f,
                         )
                         val overlapRight2 = (staticBlock.x + staticBlock.width) - movingBlock.x
-                        val overlapLeft2  = (movingBlock.x + movingBlock.width) - staticBlock.x
-                        val overlapDown2  = (staticBlock.y + staticBlock.height) - movingBlock.y
-                        val overlapUp2    = (movingBlock.y + movingBlock.height) - staticBlock.y
+                        val overlapLeft2 = (movingBlock.x + movingBlock.width) - staticBlock.x
+                        val overlapDown2 = (staticBlock.y + staticBlock.height) - movingBlock.y
+                        val overlapUp2 = (movingBlock.y + movingBlock.height) - staticBlock.y
                         val dirs2 = buildDirections(overlapLeft2, overlapRight2, overlapUp2, overlapDown2, isAngled, movingBlock.angle)
                         for ((dx, dy) in dirs2) {
                             val testX = (movingBlock.x + dx).coerceIn(0f, imgWidth - movingBlock.width)
@@ -340,7 +341,10 @@ internal object TextBlockMerger {
                             for (k in blocks.indices) { if (k != movingIdx && isOverlapping(tested, blocks[k])) nc++ }
                             val dist = abs(dx) + abs(dy)
                             if (nc < bestCollisions || (nc == bestCollisions && dist < bestDist)) {
-                                bestCollisions = nc; bestDist = dist; bestX = testX; bestY = testY
+                                bestCollisions = nc
+                                bestDist = dist
+                                bestX = testX
+                                bestY = testY
                             }
                         }
                     }
@@ -352,14 +356,22 @@ internal object TextBlockMerger {
     }
 
     private fun buildDirections(
-        overlapLeft: Float, overlapRight: Float, overlapUp: Float, overlapDown: Float,
-        isAngled: Boolean, angle: Float,
+        overlapLeft: Float,
+        overlapRight: Float,
+        overlapUp: Float,
+        overlapDown: Float,
+        isAngled: Boolean,
+        angle: Float,
     ): List<Pair<Float, Float>> {
         val baseDirections = listOf(
-            Pair(-overlapLeft, 0f), Pair(overlapRight, 0f),
-            Pair(0f, -overlapUp), Pair(0f, overlapDown),
-            Pair(-overlapLeft, -overlapUp), Pair(overlapRight, -overlapUp),
-            Pair(-overlapLeft, overlapDown), Pair(overlapRight, overlapDown),
+            Pair(-overlapLeft, 0f),
+            Pair(overlapRight, 0f),
+            Pair(0f, -overlapUp),
+            Pair(0f, overlapDown),
+            Pair(-overlapLeft, -overlapUp),
+            Pair(overlapRight, -overlapUp),
+            Pair(-overlapLeft, overlapDown),
+            Pair(overlapRight, overlapDown),
         )
         return if (isAngled) {
             val rad = Math.toRadians(angle.toDouble())
@@ -435,7 +447,7 @@ internal object TextBlockMerger {
         val gapMultiplier = 1.2f
         val maxAllowedGapX = sW * gapMultiplier // المسافة الأفقية تبقى طبيعية
         val maxAllowedGapY = if (isHybrid) sH * 1.5f else sH * gapMultiplier // زيادة المسافة العمودية فقط عند تفعيل Hybrid
-        
+
         val yOverlap = max(0f, min(r1Bottom, r2Bottom) - max(r1.y, r2.y))
         val xOverlap = max(0f, min(r1Right, r2Right) - max(r1.x, r2.x))
 
@@ -511,9 +523,9 @@ internal object TextBlockMerger {
         return TranslationBlock(
             text = joinedText,
             translation = joinedTranslation,
-            width = maxX - minX, 
-            height = maxY - minY, 
-            x = minX, 
+            width = maxX - minX,
+            height = maxY - minY,
+            x = minX,
             y = minY,
             angle = if (a.text.length >= b.text.length) a.angle else b.angle,
             symWidth = (a.symWidth * a.text.length + b.symWidth * b.text.length) / totalLen,
