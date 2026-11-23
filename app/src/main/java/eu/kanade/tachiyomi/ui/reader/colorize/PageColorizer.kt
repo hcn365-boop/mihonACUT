@@ -7,11 +7,12 @@ import android.graphics.Canvas
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
+import eu.kanade.translation.MangaTranslationContext
 import eu.kanade.translation.PageTranslationRenderer
 import eu.kanade.translation.PageTranslationService
 import eu.kanade.translation.TranslationStore
+import eu.kanade.translation.translator.TranslatorSettings
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import logcat.LogPriority
 import okio.Buffer
 import okio.BufferedSource
@@ -20,11 +21,11 @@ import tachiyomi.core.common.util.system.logcat
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.MessageDigest
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.math.roundToInt
-import eu.kanade.translation.translator.TranslatorSettings
-import eu.kanade.translation.MangaTranslationContext
 
 /**
  * Processes a manga page for the reader: colorize, then upscale, then translate (text drawn into the
@@ -45,7 +46,7 @@ object PageColorizer {
     private const val CHROMA_CACHE_DIR = "colorizer_cache"
     private const val PAGE_CACHE_DIR = "ai_pages"
 
-    // Chroma is predicted at 512x512 per channel.
+    // Color plane is predicted at 512x512 per channel (R, G, B).
     private const val CHROMA_SIZE = 512 * 512
     private const val MAX_CHROMA_CACHE_BYTES = 256L * 1024 * 1024
     private const val JPEG_QUALITY = 95
@@ -270,9 +271,9 @@ object PageColorizer {
         if (pixels * (14 + 4 * 21) > AiConfig.memoryBudgetBytes) return page
         val acceleration = if (acceleratorFailed) Acceleration.CPU else AiConfig.upscaleAcceleration
         val key = "${acceleration}_${AiConfig.aiThreads}"
-        
+
         val engine = acnetManager.getOrPut(key) { Anime4kUpscaler(context, acceleration, AiConfig.aiThreads) }
-        
+
         val enlarged = engine.upscale(page)
         if (!AiConfig.upscaleFinalPassKeepSize) return capSize(enlarged)
         val restored = PageResizer.resizeTo(enlarged, page.width, page.height)
@@ -332,7 +333,7 @@ object PageColorizer {
                         if (refined !== page && page !== working) page.recycle()
                         page = refined
                     }
-                    
+
                     // Optional: stronger colors (applied only if colorized and saturation != 1f)
                     val saturation = AiConfig.saturation
                     if (color && saturation != 1f) {
@@ -559,29 +560,37 @@ object PageColorizer {
     }
 
     private fun chromaFile(context: Context, imageHash: String, model: File): File =
-        File(File(context.cacheDir, CHROMA_CACHE_DIR), imageHash + "_" + model.length() + (if (samActive(context)) "_sam" else ""))
+        File(File(context.cacheDir, CHROMA_CACHE_DIR), imageHash + "_" + model.length() + (if (samActive(context)) "_sam" else "") + "_rgb32f")
 
     private fun loadChroma(file: File): MangaColorizer.Chroma? {
         if (!file.isFile) return null
+        val expectedBytes = CHROMA_SIZE * 3 * Float.SIZE_BYTES
         val data = file.readBytes()
-        if (data.size != CHROMA_SIZE * 2) return null
+        if (data.size != expectedBytes) return null
         file.setLastModified(System.currentTimeMillis())
-        return MangaColorizer.Chroma(
-            FloatArray(CHROMA_SIZE) { data[it].toFloat() },
-            FloatArray(CHROMA_SIZE) { data[CHROMA_SIZE + it].toFloat() },
-        )
+
+        val floatBuffer = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN).asFloatBuffer()
+        val r = FloatArray(CHROMA_SIZE)
+        val g = FloatArray(CHROMA_SIZE)
+        val b = FloatArray(CHROMA_SIZE)
+        floatBuffer.get(r)
+        floatBuffer.get(g)
+        floatBuffer.get(b)
+        return MangaColorizer.Chroma(r = r, g = g, b = b)
     }
 
     private fun saveChroma(context: Context, file: File, chroma: MangaColorizer.Chroma) {
         val dir = file.parentFile ?: return
         dir.mkdirs()
-        val data = ByteArray(CHROMA_SIZE * 2)
-        for (i in 0 until CHROMA_SIZE) {
-            data[i] = chroma.a[i].coerceIn(-127f, 127f).roundToInt().toByte()
-            data[CHROMA_SIZE + i] = chroma.b[i].coerceIn(-127f, 127f).roundToInt().toByte()
-        }
+        val totalFloats = CHROMA_SIZE * 3
+        val byteBuffer = ByteBuffer.allocate(totalFloats * Float.SIZE_BYTES).order(ByteOrder.BIG_ENDIAN)
+        val floatBuffer = byteBuffer.asFloatBuffer()
+        floatBuffer.put(chroma.r)
+        floatBuffer.put(chroma.g)
+        floatBuffer.put(chroma.b)
+
         val temp = File(dir, "${file.name}.${System.nanoTime()}.tmp")
-        temp.writeBytes(data)
+        temp.writeBytes(byteBuffer.array())
         temp.renameTo(file)
         trimCache(dir, MAX_CHROMA_CACHE_BYTES)
     }
