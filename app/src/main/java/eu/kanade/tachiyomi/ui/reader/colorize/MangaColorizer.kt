@@ -19,13 +19,11 @@ import logcat.LogPriority
 import tachiyomi.core.common.util.system.logcat
 
 /**
- * Runs the Manga Light V6 generator (v6_generator.onnx) on a page.
- *
- * Two steps so the expensive part can be cached:
- *  - [predict] runs the model once and returns only the predicted chroma at model resolution (small).
- *  - [render] combines that chroma with the ORIGINAL page luminance at full size.
- *
- * Not thread safe: call it from one coroutine at a time.
+ * Runs the Manga Light V6 generator (v6_generator.onnx) on a page,
+ * matching the original Python ONNX inference pipeline:
+ *  - Grayscale input resized to 512x512 (INTER_AREA) and normalized to [-1, 1].
+ *  - Model output rgb_pred in [-1, 1] denormalized directly to RGB [0, 255].
+ *  - Resized back to target page dimensions using INTER_LANCZOS4.
  */
 class MangaColorizer(
     modelFile: File,
@@ -33,15 +31,28 @@ class MangaColorizer(
     threads: Int = 0,
     private val guide: SamFeatures? = null,
 ) : Closeable {
-    /** Predicted Lab a/b channels at 512x512, in float Lab units. About 2 MB per page. */
-    class Chroma(val a: FloatArray, val b: FloatArray)
+
+    /**
+     * Stores predicted RGB planes (R, G, B) at 512x512 in [0f, 255f] float space,
+     * matching the original source denormalization without lossy Byte truncation.
+     */
+    class Chroma(
+        val r: FloatArray,
+        val g: FloatArray,
+        val b: FloatArray,
+    )
 
     private val env = OrtEnvironment.getEnvironment()
     private val session: OrtSession
 
     init {
         check(OpenCVLoader.initLocal()) { "OpenCV native library failed to load" }
-        session = env.createSession(modelFile.absolutePath, OrtSession.SessionOptions())
+        val options = OrtSession.SessionOptions().apply {
+            if (threads > 0) {
+                setIntraOpNumThreads(threads)
+            }
+        }
+        session = env.createSession(modelFile.absolutePath, options)
         val expectedInputs = setOf(INPUT_IMAGE, INPUT_SAM0, INPUT_SAM1, INPUT_WD14)
         if (session.inputNames != expectedInputs || session.outputNames != setOf(OUTPUT_RGB)) {
             val message = "Not a Manga Light V6 generator: inputs=${session.inputNames}, outputs=${session.outputNames}"
@@ -53,61 +64,85 @@ class MangaColorizer(
     fun predict(input: Bitmap): Chroma = Mats().use { m ->
         val rgba = m.mat()
         toMat(input, rgba)
+
         val gray = m.mat()
         Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+
         val small = m.mat()
         Imgproc.resize(gray, small, Size(SIDE.toDouble(), SIDE.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
-        // Model input range is [-1, 1].
+
+        // Normalize to [-1, 1] just like (L_bw / 127.5) - 1.0 in inference.py
         small.convertTo(small, CvType.CV_32F, 1.0 / 127.5, -1.0)
         val pixels = FloatArray(PLANE)
         small.get(0, 0, pixels)
 
         val rgbPlanes = runModel(pixels)
-        val planes = List(3) { c ->
-            m.mat(SIDE, SIDE, CvType.CV_32F).also { it.put(0, 0, rgbPlanes.copyOfRange(c * PLANE, (c + 1) * PLANE)) }
-        }
-        val merged = m.mat()
-        Core.merge(planes, merged)
-        // Model output range is [-1, 1]; bring it to [0, 1] and clamp.
-        merged.convertTo(merged, CvType.CV_32F, 0.5, 0.5)
-        Core.max(merged, Scalar(0.0, 0.0, 0.0), merged)
-        Core.min(merged, Scalar(1.0, 1.0, 1.0), merged)
 
-        val lab = m.mat()
-        Imgproc.cvtColor(merged, lab, Imgproc.COLOR_RGB2Lab)
-        val a = m.mat()
-        val b = m.mat()
-        Core.extractChannel(lab, a, 1)
-        Core.extractChannel(lab, b, 2)
-        Chroma(a.toFloatArray(), b.toFloatArray())
+        // Denormalize [-1, 1] -> [0, 255] and clamp, matching denormalize_rgb()
+        val rPlane = FloatArray(PLANE) { i ->
+            ((rgbPlanes[i] + 1.0f) * 127.5f).coerceIn(0f, 255f)
+        }
+        val gPlane = FloatArray(PLANE) { i ->
+            ((rgbPlanes[PLANE + i] + 1.0f) * 127.5f).coerceIn(0f, 255f)
+        }
+        val bPlane = FloatArray(PLANE) { i ->
+            ((rgbPlanes[2 * PLANE + i] + 1.0f) * 127.5f).coerceIn(0f, 255f)
+        }
+
+        Chroma(r = rPlane, g = gPlane, b = bPlane)
     }
 
     /**
-     * Builds the colored page: luminance from [input], chroma from [chroma] scaled by [intensity]
-     * (0 = no color, 1 = model color, up to 1.2). Alpha is preserved.
+     * Builds the colored page matching the original pipeline:
+     * resizes predicted 512x512 RGB to full page size using INTER_LANCZOS4,
+     * blends with [input] according to [intensity] (0 = original, 1 = full model color),
+     * and preserves alpha channel if present.
      */
     fun render(input: Bitmap, chroma: Chroma, intensity: Float = 1f): Bitmap {
         require(intensity in 0f..1.2f) { "intensity must be within 0..1.2" }
         val width = input.width
         val height = input.height
+
         return Mats().use { m ->
+            val rSmall = m.mat(SIDE, SIDE, CvType.CV_32F).apply { put(0, 0, chroma.r) }
+            val gSmall = m.mat(SIDE, SIDE, CvType.CV_32F).apply { put(0, 0, chroma.g) }
+            val bSmall = m.mat(SIDE, SIDE, CvType.CV_32F).apply { put(0, 0, chroma.b) }
+
+            val mergedSmall = m.mat()
+            Core.merge(listOf(rSmall, gSmall, bSmall), mergedSmall)
+
+            val small8 = m.mat()
+            mergedSmall.convertTo(small8, CvType.CV_8UC3)
+
+            // Resize back to original page resolution using Lanczos4 (same as inference.py)
+            val colorizedRgb = m.mat()
+            Imgproc.resize(small8, colorizedRgb, Size(width.toDouble(), height.toDouble()), 0.0, 0.0, Imgproc.INTER_LANCZOS4)
+
             val rgba = m.mat()
             toMat(input, rgba)
-            val rgb = m.mat()
-            Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB)
-            // 8-bit Lab: L is 0..255, a and b are offset by 128. Kept 8-bit to save memory on big pages.
-            val lab = m.mat()
-            Imgproc.cvtColor(rgb, lab, Imgproc.COLOR_RGB2Lab)
-            val luminance = m.mat()
-            Core.extractChannel(lab, luminance, 0)
+            val origRgb = m.mat()
+            Imgproc.cvtColor(rgba, origRgb, Imgproc.COLOR_RGBA2RGB)
 
-            val a = scaledChroma(m, chroma.a, intensity, width, height)
-            val b = scaledChroma(m, chroma.b, intensity, width, height)
-            Core.merge(listOf(luminance, a, b), lab)
-            Imgproc.cvtColor(lab, rgb, Imgproc.COLOR_Lab2RGB)
+            val blendedRgb = m.mat()
+            when {
+                intensity <= 0f -> origRgb.copyTo(blendedRgb)
+                intensity == 1f -> colorizedRgb.copyTo(blendedRgb)
+                else -> {
+                    // Blend smoothly around full colorized output without washing out lines
+                    Core.addWeighted(
+                        colorizedRgb,
+                        intensity.coerceIn(0f, 1.2f).toDouble(),
+                        origRgb,
+                        (1.0 - intensity.coerceIn(0f, 1.2f).coerceAtMost(1.0)),
+                        0.0,
+                        blendedRgb,
+                    )
+                }
+            }
 
             val out = m.mat()
-            Imgproc.cvtColor(rgb, out, Imgproc.COLOR_RGB2RGBA)
+            Imgproc.cvtColor(blendedRgb, out, Imgproc.COLOR_RGB2RGBA)
+
             val alpha = m.mat()
             Core.extractChannel(rgba, alpha, 3)
             Core.insertChannel(alpha, out, 3)
@@ -131,7 +166,6 @@ class MangaColorizer(
 
             val inputs = mapOf(
                 INPUT_IMAGE to tensor(image, 1, 1, SIDE.toLong(), SIDE.toLong()),
-                // تم تعديل الأبعاد هنا لتتوافق مع مخرجات النموذج الجديد (64x64 و 32x32)
                 INPUT_SAM0 to tensor(guide?.level0 ?: FloatArray(256 * 64 * 64), 1, 256, 64, 64),
                 INPUT_SAM1 to tensor(guide?.level1 ?: FloatArray(256 * 32 * 32), 1, 256, 32, 32),
                 INPUT_WD14 to tensor(FloatArray(1024), 1, 1024),
@@ -140,7 +174,9 @@ class MangaColorizer(
                 val output = result[0] as OnnxTensor
                 val expected = longArrayOf(1, 3, SIDE.toLong(), SIDE.toLong())
                 if (!output.info.shape.contentEquals(expected)) {
-                    logcat(LogPriority.ERROR) { "SAM encoder: unexpected shapes or failed to output expected shape (got ${output.info.shape.joinToString()})" }
+                    logcat(LogPriority.ERROR) {
+                        "Generator: unexpected output shape (got ${output.info.shape.joinToString()})"
+                    }
                 }
                 require(output.info.shape.contentEquals(expected)) {
                     "Unexpected model output shape: ${output.info.shape.joinToString()}"
@@ -150,21 +186,11 @@ class MangaColorizer(
                 return values
             }
         } catch (e: Throwable) {
-            logcat(LogPriority.ERROR, e) { "SAM encoder: failed to process features" }
+            logcat(LogPriority.ERROR, e) { "Generator: failed to run inference" }
             throw e
         } finally {
             tensors.forEach { it.close() }
         }
-    }
-
-    private fun scaledChroma(m: Mats, values: FloatArray, intensity: Float, width: Int, height: Int): Mat {
-        val small = m.mat(SIDE, SIDE, CvType.CV_32F)
-        small.put(0, 0, values)
-        val small8 = m.mat()
-        small.convertTo(small8, CvType.CV_8U, intensity.toDouble(), 128.0)
-        val full = m.mat()
-        Imgproc.resize(small8, full, Size(width.toDouble(), height.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
-        return full
     }
 
     private fun toMat(bitmap: Bitmap, destination: Mat) {
@@ -180,9 +206,6 @@ class MangaColorizer(
         }
     }
 
-    private fun Mat.toFloatArray(): FloatArray = FloatArray(PLANE).also { get(0, 0, it) }
-
-    /** Releases every Mat created through it, even if processing throws. */
     private class Mats : Closeable {
         private val owned = ArrayList<Mat>()
 
