@@ -265,6 +265,6 @@ class MangaColorizer(
         const val Y_EPS = 1e-3
 
         /** Below 1.0 softens the original page's detail so it cannot overpower the printed color. */
-        const val DETAIL_STRENGTH = 0.7
+        const val DETAIL_STRENGTH = 0.5
     }
 }
