@@ -60,18 +60,14 @@ object AutoLanguage {
     ): ResolvedLanguage {
         if (!options.enabled) return ResolvedLanguage(fallback, definitive = false)
 
-        // 1. وسم اللغة في عنوان المانجا
         if (options.fromTitle) {
             languageFromTitle(title)?.let { return ResolvedLanguage(it, definitive = true) }
         }
 
-        // 2. لغة المصدر
         if (options.fromSource) {
             languageFromTag(sourceLang)?.let { return ResolvedLanguage(it, definitive = true) }
         }
 
-        // 3 و 4: إرجاع fallback كقيمة مبدئية غير نهائية (definitive = false) ليتم فحص النص
-        // عبر ML Kit (OcrLanguageCheck) أولاً، ثم اعتماد fallback كخيار أخير إذا لم يُحسم
         return ResolvedLanguage(fallback, definitive = false)
     }
 
@@ -118,6 +114,3 @@ object AutoLanguage {
         return TextRecognizerLanguage.entries.firstOrNull { it.code.equals(prefix, ignoreCase = true) }
     }
 }
-```[span_3](start_span)[span_3](end_span)
-
-هل تريد الآن أن أعرض لك النسخة الكاملة من `PageTranslationService.kt` مدمجاً فيها استدعاء `OcrLanguageCheck.detect` عند عدم حسم اللغة (`!resolved.definitive`) وقبل الاعتماد على `fallback`؟
