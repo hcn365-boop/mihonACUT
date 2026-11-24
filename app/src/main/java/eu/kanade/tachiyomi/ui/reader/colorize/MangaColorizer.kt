@@ -44,6 +44,14 @@ class MangaColorizer(
     private val zeroSam1: FloatArray? = if (guide?.level1 == null) FloatArray(256 * 32 * 32) else null
     private val zeroWd14 = FloatArray(1024)
 
+    // Reusable buffers for 512x512 inference to avoid repeated allocations across pages.
+    private val modelInputBuffer = FloatArray(PLANE)
+    private val modelOutputBuffer = FloatArray(3 * PLANE)
+    private val chromaOutBuffer = FloatArray(3 * PLANE)
+
+    // Reusable 1x3 Rec.601 luminance kernel.
+    private val lumaWeights = floatArrayOf(0.299f, 0.587f, 0.114f)
+
     init {
         check(OpenCVLoader.initLocal()) { "OpenCV native library failed to load" }
         session = OrtSessions.create(env, modelFile.absolutePath, acceleration, threads)
@@ -65,26 +73,33 @@ class MangaColorizer(
         val gray = m.mat()
         Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
         val small = m.mat()
-        Imgproc.resize(gray, small, Size(SIDE.toDouble(), SIDE.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        Imgproc.resize(gray, small, SIDE_SIZE, 0.0, 0.0, Imgproc.INTER_AREA)
+        m.free(gray)
+
         // Model input range is [-1, 1].
         small.convertTo(small, CvType.CV_32F, 1.0 / 127.5, -1.0)
-        val pixels = FloatArray(PLANE)
-        small.get(0, 0, pixels)
+        small.get(0, 0, modelInputBuffer)
+        m.free(small)
 
-        val rgbPlanes = runModel(pixels)
-        val planes = List(3) { c ->
-            m.mat(SIDE, SIDE, CvType.CV_32F).also { it.put(0, 0, rgbPlanes.copyOfRange(c * PLANE, (c + 1) * PLANE)) }
+        runModel(modelInputBuffer, modelOutputBuffer)
+
+        val planes = ArrayList<Mat>(3)
+        for (c in 0 until 3) {
+            val planeMat = m.mat(SIDE, SIDE, CvType.CV_32F)
+            planeMat.put(0, 0, modelOutputBuffer, c * PLANE, PLANE)
+            planes.add(planeMat)
         }
         val merged = m.mat(SIDE, SIDE, CvType.CV_32FC3)
         Core.merge(planes, merged)
+        planes.forEach { m.free(it) }
+
         // Model output range is [-1, 1]; bring it to [0, 1] and clamp.
         merged.convertTo(merged, CvType.CV_32FC3, 0.5, 0.5)
-        Core.max(merged, Scalar(0.0, 0.0, 0.0), merged)
-        Core.min(merged, Scalar(1.0, 1.0, 1.0), merged)
+        Core.max(merged, ZERO_SCALAR_3, merged)
+        Core.min(merged, ONE_SCALAR_3, merged)
 
-        val out = FloatArray(3 * PLANE)
-        merged.get(0, 0, out)
-        return Chroma(out)
+        merged.get(0, 0, chromaOutBuffer)
+        return Chroma(chromaOutBuffer.copyOf())
     }
 
     /**
@@ -115,12 +130,12 @@ class MangaColorizer(
     ): Bitmap {
         require(intensity in 0f..1.2f) { "intensity must be within 0..1.2" }
         val fullSize = Size(width.toDouble(), height.toDouble())
-        val rgb8 = m.mat()
-        Imgproc.cvtColor(rgba, rgb8, Imgproc.COLOR_RGBA2RGB)
-        val rgb = m.mat()
-        rgb8.convertTo(rgb, CvType.CV_32FC3, 1.0 / 255.0)
 
-        // Original luminance (Rec.601), full size.
+        // Original luminance (Rec.601), full size, computed directly from RGBA without extra RGB8 copy.
+        val rgb = m.mat()
+        Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB)
+        rgb.convertTo(rgb, CvType.CV_32FC3, 1.0 / 255.0)
+
         val guideY = m.mat()
         luma(m, rgb, guideY)
 
@@ -133,86 +148,114 @@ class MangaColorizer(
         // Upscale model color and luminance directly to page size.
         val fullRgb = m.mat()
         Imgproc.resize(modelRgb, fullRgb, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
+        m.free(modelRgb)
+
         val fullY = m.mat()
         Imgproc.resize(modelY, fullY, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
+        m.free(modelY)
 
         // Saturation: scale chroma around upscaled model luminance, before normalizing.
         val colorY3 = m.mat()
         Core.merge(listOf(fullY, fullY, fullY), colorY3)
+
         val satColor = m.mat()
         Core.subtract(fullRgb, colorY3, satColor)
-        Core.multiply(satColor, Scalar(intensity.toDouble(), intensity.toDouble(), intensity.toDouble()), satColor)
+        m.free(fullRgb)
+
+        val intensityScalar = Scalar(intensity.toDouble(), intensity.toDouble(), intensity.toDouble())
+        Core.multiply(satColor, intensityScalar, satColor)
         Core.add(satColor, colorY3, satColor)
-        Core.max(satColor, Scalar(0.0, 0.0, 0.0), satColor)
-        Core.min(satColor, Scalar(1.0, 1.0, 1.0), satColor)
+        Core.max(satColor, ZERO_SCALAR_3, satColor)
+        Core.min(satColor, ONE_SCALAR_3, satColor)
 
         // Normalize to luminance 1 so only the hue/saturation remains.
         val satY = m.mat()
         luma(m, satColor, satY)
-        Core.max(satY, Scalar(Y_EPS), satY)
+        Core.max(satY, Y_EPS_SCALAR_1, satY)
+
         val satY3 = m.mat()
         Core.merge(listOf(satY, satY, satY), satY3)
-        val hue = m.mat()
+        m.free(satY)
+
+        val hue = rgb // Reuse `rgb` Mat for normalized hue.
         Core.divide(satColor, satY3, hue)
+        m.free(satColor)
+        m.free(satY3)
 
         // 2. Model lighting (upscaled from 512x512).
-        val light = m.mat()
-        fullY.copyTo(light)
-        Core.max(light, Scalar(LIGHT_FLOOR), light)
+        val light = fullY // Reuse `fullY` Mat for model lighting.
+        Core.max(light, LIGHT_FLOOR_SCALAR_1, light)
 
         // 3. Detail ratio from original luminance vs local blur.
         val lowGuide = m.mat()
-        Imgproc.blur(guideY, lowGuide, Size(2.0 * LIGHT_RADIUS + 1.0, 2.0 * LIGHT_RADIUS + 1.0))
-        Core.max(lowGuide, Scalar(LIGHT_FLOOR), lowGuide)
+        Imgproc.blur(guideY, lowGuide, BLUR_KERNEL_SIZE)
+        Core.max(lowGuide, LIGHT_FLOOR_SCALAR_1, lowGuide)
+
         val detail = m.mat()
         Core.divide(guideY, lowGuide, detail)
+        m.free(lowGuide)
 
-        Core.min(detail, Scalar(1.0), detail)
-        Core.max(detail, Scalar(0.0), detail)
+        Core.min(detail, ONE_SCALAR_1, detail)
+        Core.max(detail, ZERO_SCALAR_1, detail)
 
         val detailShaped = m.mat()
         Core.pow(detail, DETAIL_STRENGTH.toDouble(), detailShaped)
+        m.free(detail)
 
         // 4. Weight model lighting by original luminance guideY so dark text/strokes
         //    are not blurred by low-res upscaled `light`.
         val darkMask = m.mat()
-        Core.min(guideY, Scalar(1.0), darkMask)
-        Core.max(darkMask, Scalar(0.0), darkMask)
+        Core.min(guideY, ONE_SCALAR_1, darkMask)
+        Core.max(darkMask, ZERO_SCALAR_1, darkMask)
 
-        val lightWithDetail = m.mat()
-        Core.multiply(light, detailShaped, lightWithDetail)
+        // lightWithDetail = light * detailShaped (reusing `light` buffer)
+        Core.multiply(light, detailShaped, light)
 
-        val sharpGuideWithDetail = m.mat()
-        Core.multiply(guideY, detailShaped, sharpGuideWithDetail)
+        // sharpGuideWithDetail = guideY * detailShaped (reusing `detailShaped` buffer)
+        Core.multiply(guideY, detailShaped, detailShaped)
+        m.free(guideY)
 
-        val invMask = m.mat()
-        Core.multiply(darkMask, Scalar(-1.0), invMask)
-        Core.add(invMask, Scalar(1.0), invMask)
+        // invMask = 1.0 - darkMask (reusing `colorY3` buffer)
+        val invMask = colorY3
+        Core.multiply(darkMask, NEG_ONE_SCALAR_1, invMask)
+        Core.add(invMask, ONE_SCALAR_1, invMask)
 
-        val partLight = m.mat()
-        Core.multiply(lightWithDetail, darkMask, partLight)
+        // partLight = light * darkMask (reusing `light` buffer)
+        Core.multiply(light, darkMask, light)
+        m.free(darkMask)
 
-        val partSharp = m.mat()
-        Core.multiply(sharpGuideWithDetail, invMask, partSharp)
+        // partSharp = sharpGuideWithDetail * invMask (reusing `detailShaped` buffer)
+        Core.multiply(detailShaped, invMask, detailShaped)
+        m.free(invMask)
 
-        val finalY = m.mat()
-        Core.add(partLight, partSharp, finalY)
+        // finalY = partLight + partSharp (reusing `light` buffer)
+        val finalY = light
+        Core.add(light, detailShaped, finalY)
+        m.free(detailShaped)
 
         val finalY3 = m.mat()
         Core.merge(listOf(finalY, finalY, finalY), finalY3)
+        m.free(finalY)
 
         val result = m.mat()
         Core.multiply(hue, finalY3, result)
-        Core.max(result, Scalar(0.0, 0.0, 0.0), result)
-        Core.min(result, Scalar(1.0, 1.0, 1.0), result)
+        m.free(hue)
+        m.free(finalY3)
+        Core.max(result, ZERO_SCALAR_3, result)
+        Core.min(result, ONE_SCALAR_3, result)
 
         val out8 = m.mat()
         result.convertTo(out8, CvType.CV_8UC3, 255.0)
+        m.free(result)
+
         val out = m.mat()
         Imgproc.cvtColor(out8, out, Imgproc.COLOR_RGB2RGBA)
+        m.free(out8)
+
         val alpha = m.mat()
         Core.extractChannel(rgba, alpha, 3)
         Core.insertChannel(alpha, out, 3)
+        m.free(alpha)
 
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         Utils.matToBitmap(out, bitmap)
@@ -223,9 +266,9 @@ class MangaColorizer(
         session.close()
     }
 
-    /** Returns the model output as 3 consecutive 512x512 planes (R, G, B), values in [-1, 1]. */
-    private fun runModel(image: FloatArray): FloatArray {
-        val tensors = ArrayList<OnnxTensor>()
+    /** Runs the ONNX model and writes 3 consecutive 512x512 planes (R, G, B) in [-1, 1] into [outValues]. */
+    private fun runModel(image: FloatArray, outValues: FloatArray) {
+        val tensors = ArrayList<OnnxTensor>(4)
         try {
             fun tensor(data: FloatArray, vararg shape: Long): OnnxTensor =
                 OnnxTensor.createTensor(env, FloatBuffer.wrap(data), shape).also { tensors.add(it) }
@@ -240,14 +283,16 @@ class MangaColorizer(
                 val output = result[0] as OnnxTensor
                 val expected = longArrayOf(1, 3, SIDE.toLong(), SIDE.toLong())
                 if (!output.info.shape.contentEquals(expected)) {
-                    logcat(LogPriority.ERROR) { "SAM encoder: unexpected shapes or failed to output expected shape (got ${output.info.shape.joinToString()})" }
+                    logcat(LogPriority.ERROR) {
+                        "SAM encoder: unexpected shapes or failed to output expected shape (got ${output.info.shape.joinToString()})"
+                    }
                 }
                 require(output.info.shape.contentEquals(expected)) {
                     "Unexpected model output shape: ${output.info.shape.joinToString()}"
                 }
-                val values = FloatArray(3 * PLANE)
-                output.floatBuffer.get(values)
-                return values
+                val buf = output.floatBuffer
+                buf.rewind()
+                buf.get(outValues, 0, 3 * PLANE)
             }
         } catch (e: Throwable) {
             logcat(LogPriority.ERROR, e) { "SAM encoder: failed to process features" }
@@ -260,8 +305,9 @@ class MangaColorizer(
     /** Rec.601 luminance: 0.299R + 0.587G + 0.114B. Input CV_32FC3, output CV_32FC1. */
     private fun luma(m: Mats, rgb: Mat, dst: Mat) {
         val kernel = m.mat(1, 3, CvType.CV_32F)
-        kernel.put(0, 0, floatArrayOf(0.299f, 0.587f, 0.114f))
+        kernel.put(0, 0, lumaWeights)
         Core.transform(rgb, dst, kernel)
+        m.free(kernel)
     }
 
     internal fun toMat(bitmap: Bitmap, destination: Mat) {
@@ -279,20 +325,31 @@ class MangaColorizer(
 
     /** Releases every Mat created through it, even if processing throws. */
     internal class Mats : Closeable {
-        private val owned = ArrayList<Mat>()
+        private val owned = ArrayList<Mat>(32)
 
         fun mat(): Mat = Mat().also { owned.add(it) }
 
         fun mat(rows: Int, cols: Int, type: Int): Mat = Mat(rows, cols, type).also { owned.add(it) }
 
+        fun free(mat: Mat) {
+            if (owned.remove(mat)) {
+                mat.release()
+            }
+        }
+
         override fun close() {
-            owned.forEach { it.release() }
+            for (i in owned.indices) {
+                owned[i].release()
+            }
+            owned.clear()
         }
     }
 
     private companion object {
         const val SIDE = 512
         const val PLANE = SIDE * SIDE
+        val SIDE_SIZE = Size(SIDE.toDouble(), SIDE.toDouble())
+
         const val INPUT_IMAGE = "L_bw"
         const val INPUT_SAM0 = "sam_level0"
         const val INPUT_SAM1 = "sam_level1"
@@ -302,6 +359,15 @@ class MangaColorizer(
         const val LIGHT_RADIUS = 16
         const val LIGHT_FLOOR = 0.1
         const val Y_EPS = 1e-3
+
+        val BLUR_KERNEL_SIZE = Size(2.0 * LIGHT_RADIUS + 1.0, 2.0 * LIGHT_RADIUS + 1.0)
+        val ZERO_SCALAR_1 = Scalar(0.0)
+        val ONE_SCALAR_1 = Scalar(1.0)
+        val NEG_ONE_SCALAR_1 = Scalar(-1.0)
+        val LIGHT_FLOOR_SCALAR_1 = Scalar(LIGHT_FLOOR)
+        val Y_EPS_SCALAR_1 = Scalar(Y_EPS)
+        val ZERO_SCALAR_3 = Scalar(0.0, 0.0, 0.0)
+        val ONE_SCALAR_3 = Scalar(1.0, 1.0, 1.0)
 
         /** Below 1.0 softens the original page's detail so it cannot overpower the printed color. */
         const val DETAIL_STRENGTH = 0.99
