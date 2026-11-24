@@ -13,6 +13,14 @@ import eu.kanade.translation.PageTranslationRenderer
 import eu.kanade.translation.PageTranslationService
 import eu.kanade.translation.TranslationStore
 import eu.kanade.translation.model.PageTranslation
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
+import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.MessageDigest
+import kotlin.coroutines.cancellation.CancellationException
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,14 +34,6 @@ import okio.Buffer
 import okio.BufferedSource
 import tachiyomi.core.common.util.system.ImageUtil
 import tachiyomi.core.common.util.system.logcat
-import java.io.ByteArrayOutputStream
-import java.io.Closeable
-import java.io.File
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.security.MessageDigest
-import kotlin.coroutines.cancellation.CancellationException
-import kotlin.math.roundToInt
 
 /**
  * Pipeline order:
@@ -99,7 +99,9 @@ object PageColorizer {
         fun reset() {
             synchronized(sessions) {
                 sessions.values.forEach {
-                    try { it.close() } catch (_: Throwable) {}
+                    try {
+                        it.close()
+                    } catch (_: Throwable) {}
                 }
                 sessions.clear()
             }
@@ -143,7 +145,7 @@ object PageColorizer {
 
     suspend fun processForDisplay(context: Context, source: BufferedSource): DisplayResult {
         return try {
-            run(context.applicationContext, source, display = true) ?: DisplayResult.Source(source)
+            run(context.applicationContext, source, display = true)?.displayResult ?: DisplayResult.Source(source)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
@@ -154,12 +156,12 @@ object PageColorizer {
 
     suspend fun processToBytes(context: Context, source: BufferedSource): ByteArray? {
         val result = run(context.applicationContext, source, display = true) ?: return null
-        return result.source.readByteArray()
+        return result.source?.readByteArray()
     }
 
     suspend fun processImagesToBytes(context: Context, source: BufferedSource): ByteArray? {
         val result = run(context.applicationContext, source, display = false, translate = false) ?: return null
-        return result.source.readByteArray()
+        return result.source?.readByteArray()
     }
 
     fun contentHash(bytes: ByteArray): String = hash(bytes)
@@ -274,8 +276,14 @@ object PageColorizer {
             val finalName = translationConfig?.let { config ->
                 val s = effective!!
                 val key = TranslationStore.key(
-                    s.from.name, s.to.name, s.engine.name, s.model, config.ocrMode.name, config.font.name,
-                    config.filter.signature, AiConfig.forceTranslate(MangaTranslationContext.mangaId).toString(),
+                    s.from.name,
+                    s.to.name,
+                    s.engine.name,
+                    s.model,
+                    config.ocrMode.name,
+                    config.font.name,
+                    config.filter.signature,
+                    AiConfig.forceTranslate(MangaTranslationContext.mangaId).toString(),
                 )
                 "${baseName}_T$key"
             }
@@ -681,7 +689,7 @@ object PageColorizer {
         val canvas = Canvas(output)
         val paint = Paint().apply {
             colorFilter = ColorMatrixColorFilter(
-                ColorMatrix().apply { setSaturation(saturation) }
+                ColorMatrix().apply { setSaturation(saturation) },
             )
         }
         canvas.drawBitmap(bitmap, 0f, 0f, paint)
