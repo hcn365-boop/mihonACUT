@@ -16,7 +16,7 @@ class HybridTextRecognizer(
     override val language: TextRecognizerLanguage,
 ) : TextRecognizer {
 
-    private val TAG = "HybridTextRecognizer"
+    private val tag = "HybridTextRecognizer"
 
     private val appContext = context.applicationContext
     private val mlKitRecognizer = MlKitTextRecognizer(language)
@@ -124,7 +124,7 @@ class HybridTextRecognizer(
 
             return results
         } catch (e: Exception) {
-            Log.e(TAG, "فشل في تشغيل النظام الهجين", e)
+            Log.e(tag, "فشل في تشغيل النظام الهجين", e)
             return emptyList()
         }
     }
@@ -183,7 +183,7 @@ class HybridTextRecognizer(
             if (cropped != null && !cropped.isRecycled) {
                 cropped.recycle()
             }
-            Log.e(TAG, "خطأ في قص الصندوق", e)
+            Log.e(tag, "خطأ في قص الصندوق", e)
             null
         }
     }
@@ -193,7 +193,7 @@ class HybridTextRecognizer(
             val input = InputImage.fromBitmap(bitmap, 0)
             paddleRecognizer.recognize(input)
         } catch (e: Exception) {
-            Log.e(TAG, "خطأ في تشغيل Paddle", e)
+            Log.e(tag, "خطأ في تشغيل Paddle", e)
             ""
         }
     }
@@ -203,7 +203,7 @@ class HybridTextRecognizer(
             mlKitRecognizer.close()
             paddleRecognizer.close()
         } catch (e: Exception) {
-            Log.e(TAG, "خطأ أثناء إغلاق محركات HybridTextRecognizer", e)
+            Log.e(tag, "خطأ أثناء إغلاق محركات HybridTextRecognizer", e)
         }
     }
 }
