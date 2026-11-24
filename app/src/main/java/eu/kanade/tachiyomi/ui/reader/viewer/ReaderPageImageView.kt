@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.ui.reader.viewer
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.PointF
 import android.graphics.RectF
 import android.graphics.drawable.Animatable
@@ -150,6 +151,12 @@ open class ReaderPageImageView @JvmOverloads constructor(
         }
     }
 
+    fun setImage(bitmap: Bitmap, config: Config) {
+        this.config = config
+        prepareNonAnimatedImageView()
+        setNonAnimatedImage(bitmap, config)
+    }
+
     fun setImage(source: BufferedSource, isAnimated: Boolean, config: Config) {
         this.config = config
         if (isAnimated) {
@@ -287,6 +294,10 @@ open class ReaderPageImageView @JvmOverloads constructor(
         )
 
         when (data) {
+            is Bitmap -> {
+                setImage(ImageSource.bitmap(data))
+                isVisible = true
+            }
             is BitmapDrawable -> {
                 setImage(ImageSource.bitmap(data.bitmap))
                 isVisible = true
