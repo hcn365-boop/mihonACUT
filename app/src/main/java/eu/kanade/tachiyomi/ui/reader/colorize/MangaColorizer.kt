@@ -4,6 +4,9 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.graphics.Bitmap
+import java.io.Closeable
+import java.io.File
+import java.nio.FloatBuffer
 import logcat.LogPriority
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
@@ -14,9 +17,6 @@ import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import tachiyomi.core.common.util.system.logcat
-import java.io.Closeable
-import java.io.File
-import java.nio.FloatBuffer
 
 /**
  * Runs the Manga Light V6 generator (v6_generator.onnx) on a page.
@@ -86,7 +86,8 @@ class MangaColorizer(
         val planes = ArrayList<Mat>(3)
         for (c in 0 until 3) {
             val planeMat = m.mat(SIDE, SIDE, CvType.CV_32F)
-            planeMat.put(0, 0, modelOutputBuffer, c * PLANE, PLANE)
+            val start = c * PLANE
+            planeMat.put(0, 0, modelOutputBuffer.copyOfRange(start, start + PLANE))
             planes.add(planeMat)
         }
         val merged = m.mat(SIDE, SIDE, CvType.CV_32FC3)
