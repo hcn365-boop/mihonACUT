@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
+import eu.kanade.translation.recognizer.HybridTextRecognizer
 import eu.kanade.translation.recognizer.MlKitTextRecognizer
 import eu.kanade.translation.recognizer.PaddleTextRecognizer
 import eu.kanade.translation.recognizer.TextRecognizerLanguage
@@ -26,6 +27,10 @@ class OcrSession(
         Log.e("OcrSession", ">>> Paddle engine LAZY-INITIALIZED for $language <<<")
         PaddleTextRecognizer(context, language)
     }
+    private val hybridEngine = lazy {
+        Log.e("OcrSession", ">>> Hybrid engine LAZY-INITIALIZED for $language <<<")
+        HybridTextRecognizer(context, language)
+    }
 
     private val effectiveMode = when {
         mode == OcrMode.MLKIT -> mode
@@ -33,14 +38,14 @@ class OcrSession(
         else -> OcrMode.MLKIT
     }
 
-    // ✅ تمرير context و recognizerLanguage إلى PageTextExtractor
     val extractor = PageTextExtractor(
         mode = effectiveMode,
         isRtl = language == TextRecognizerLanguage.JAPANESE || language == TextRecognizerLanguage.KOREAN,
         mlKit = if (effectiveMode == OcrMode.PADDLE) null else this::runMlKit,
         paddle = if (effectiveMode == OcrMode.MLKIT) null else this::runPaddle,
-        context = context,              // ✅ إضافة هذا
-        recognizerLanguage = language   // ✅ إضافة هذا
+        hybrid = if (effectiveMode == OcrMode.HYBRID) this::runHybrid else null,
+        context = context,
+        recognizerLanguage = language,
     )
 
     private suspend fun runMlKit(image: InputImage): Text {
@@ -57,8 +62,15 @@ class OcrSession(
         }
     }
 
+    private suspend fun runHybrid(image: InputImage): List<HybridTextRecognizer.HybridResult> {
+        return withContext(Dispatchers.Default) {
+            hybridEngine.value.recognizeWithBoxes(image)
+        }
+    }
+
     override fun close() {
         if (mlKitEngine.isInitialized()) mlKitEngine.value.close()
         if (paddleEngine.isInitialized()) paddleEngine.value.close()
+        if (hybridEngine.isInitialized()) hybridEngine.value.close()
     }
 }
