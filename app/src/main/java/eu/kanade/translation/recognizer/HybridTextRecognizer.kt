@@ -12,14 +12,16 @@ import kotlin.math.max
 import kotlin.math.min
 
 class HybridTextRecognizer(
-    private val context: Context,
+    context: Context,
     override val language: TextRecognizerLanguage,
 ) : TextRecognizer {
 
     private val TAG = "HybridTextRecognizer"
 
+    private val appContext = context.applicationContext
     private val mlKitRecognizer = MlKitTextRecognizer(language)
-    private val paddleRecognizer = PaddleTextRecognizer(context, language, forceHorizontal = true)
+    private val paddleRecognizer = PaddleTextRecognizer(appContext, language, forceHorizontal = true)
+    private val rotateMatrix = Matrix()
 
     data class HybridBox(
         val x: Int,
@@ -55,21 +57,31 @@ class HybridTextRecognizer(
                 val angle = line?.angle ?: 0f
 
                 // حساب أبعاد الرموز من كل البلوك
-                val symbolBoxes = block.lines
-                    .flatMap { it.elements }
-                    .flatMap { it.symbols }
-                    .mapNotNull { it.boundingBox }
+                var symWidthSum = 0.0
+                var symWidthCount = 0
+                var symHeightSum = 0.0
+                var symHeightCount = 0
 
-                val symWidth = if (symbolBoxes.isNotEmpty()) {
-                    symbolBoxes.map { it.width().toFloat() }.average().toFloat()
-                        .coerceAtLeast(4f)
+                for (l in block.lines) {
+                    for (el in l.elements) {
+                        for (sym in el.symbols) {
+                            val symBox = sym.boundingBox ?: continue
+                            symWidthSum += symBox.width().toDouble()
+                            symWidthCount++
+                            symHeightSum += symBox.height().toDouble()
+                            symHeightCount++
+                        }
+                    }
+                }
+
+                val symWidth = if (symWidthCount > 0) {
+                    (symWidthSum / symWidthCount).toFloat().coerceAtLeast(4f)
                 } else {
                     PageTextExtractor.DEFAULT_SYMBOL
                 }
 
-                val symHeight = if (symbolBoxes.isNotEmpty()) {
-                    symbolBoxes.map { it.height().toFloat() }.average().toFloat()
-                        .coerceAtLeast(4f)
+                val symHeight = if (symHeightCount > 0) {
+                    (symHeightSum / symHeightCount).toFloat().coerceAtLeast(4f)
                 } else {
                     PageTextExtractor.DEFAULT_SYMBOL
                 }
@@ -92,22 +104,21 @@ class HybridTextRecognizer(
                     val paddleText = runPaddleOnCrop(croppedData.rotated)
 
                     if (paddleText.isNotBlank()) {
-                        // دمج كل النتائج في نص واحد مع الحفاظ على الأسطر
-                        val mergedText = paddleText.trim()
-
                         results.add(
                             HybridResult(
-                                text = mergedText,
+                                text = paddleText.trim(),
                                 box = croppedData.adjustedBox,
                             ),
                         )
                     }
                 } finally {
                     // تنظيف الذاكرة في جميع الحالات
-                    if (croppedData.rotated != croppedData.cropped) {
+                    if (croppedData.rotated !== croppedData.cropped && !croppedData.rotated.isRecycled) {
                         croppedData.rotated.recycle()
                     }
-                    croppedData.cropped.recycle()
+                    if (!croppedData.cropped.isRecycled) {
+                        croppedData.cropped.recycle()
+                    }
                 }
             }
 
@@ -157,18 +168,21 @@ class HybridTextRecognizer(
             symHeight = box.symHeight,
         )
 
+        var cropped: Bitmap? = null
         return try {
-            val cropped = Bitmap.createBitmap(bitmap, finalStartX, finalStartY, finalCropW, finalCropH)
+            cropped = Bitmap.createBitmap(bitmap, finalStartX, finalStartY, finalCropW, finalCropH)
             val rotated = if (abs(box.angle) > 1f) {
-                val matrix = Matrix().apply {
-                    postRotate(-box.angle, finalCropW / 2f, finalCropH / 2f)
-                }
-                Bitmap.createBitmap(cropped, 0, 0, finalCropW, finalCropH, matrix, true)
+                rotateMatrix.reset()
+                rotateMatrix.postRotate(-box.angle, finalCropW / 2f, finalCropH / 2f)
+                Bitmap.createBitmap(cropped, 0, 0, finalCropW, finalCropH, rotateMatrix, true)
             } else {
                 cropped
             }
             CropResult(cropped, rotated, adjustedBox)
         } catch (e: Exception) {
+            if (cropped != null && !cropped.isRecycled) {
+                cropped.recycle()
+            }
             Log.e(TAG, "خطأ في قص الصندوق", e)
             null
         }
