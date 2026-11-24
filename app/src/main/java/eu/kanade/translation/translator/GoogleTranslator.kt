@@ -27,6 +27,7 @@ class GoogleTranslator(
     }
     private val urlPattern = Regex("(?i)(https?://\\S+|www\\.\\S+|\\S+\\.(com|net|org|io|me|cc|tv|info))")
     private val symbolsFilterPattern = Regex("""[_~•°^@#$&|\\-]""")
+    private val multiSpacePattern = Regex("""\s+""")
     private val SAFE_SEPARATOR = " . "
 
     // يكتشف الكلمات اللاتينية/الإنجليزية المتبقية في النص المترجم
@@ -85,17 +86,6 @@ class GoogleTranslator(
     private val shouldFixUntranslated = nonLatinLanguages.contains(toLang)
 
     override suspend fun translate(pages: MutableMap<String, PageTranslation>) {
-        val rtlLanguages = setOf(
-            TextTranslatorLanguage.ARABIC,
-            TextTranslatorLanguage.PERSIAN,
-            TextTranslatorLanguage.HEBREW,
-            TextTranslatorLanguage.URDU,
-            TextTranslatorLanguage.PUSHTO_PASHTO,
-            TextTranslatorLanguage.SINDHI,
-            TextTranslatorLanguage.UIGHUR_UYGHUR,
-            TextTranslatorLanguage.YIDDISH,
-            TextTranslatorLanguage.KURDISH,
-        )
         val rtlMarker = if (rtlLanguages.contains(toLang)) "\u200F" else ""
 
         // 1. The blocks that can be translated.
@@ -116,11 +106,14 @@ class GoogleTranslator(
         }
         if (valid.isEmpty()) return
 
-        // 2. A phrase translated before (a sound effect, "yes", a name) needs no request.
+        // 2. Clean once per block and reuse across cache lookup, batching, and request building.
+        val cleanedByBlock = IdentityHashMap<TranslationBlock, String>(valid.size)
         val translations = IdentityHashMap<TranslationBlock, String>()
         val pending = mutableListOf<TranslationBlock>()
         for (block in valid) {
-            val known = cachedPhrase(cleanSymbols(block.text))
+            val cleaned = cleanSymbols(block.text)
+            cleanedByBlock[block] = cleaned
+            val known = cachedPhrase(cleaned)
             if (known != null) translations[block] = known else pending.add(block)
         }
 
@@ -129,7 +122,8 @@ class GoogleTranslator(
         var current = mutableListOf<TranslationBlock>()
         var length = 0
         for (block in pending) {
-            val size = cleanSymbols(block.text).length + SAFE_SEPARATOR.length
+            val cleaned = cleanedByBlock[block].orEmpty()
+            val size = cleaned.length + SAFE_SEPARATOR.length
             if (length + size > MAX_BATCH_CHARS && current.isNotEmpty()) {
                 batches.add(current)
                 current = mutableListOf()
@@ -145,7 +139,7 @@ class GoogleTranslator(
         var lastError: Exception? = null
         for (batch in batches) {
             try {
-                val lines = translateBatch(batch)
+                val lines = translateBatch(batch, cleanedByBlock)
                 batch.forEachIndexed { index, block ->
                     val line = lines.getOrNull(index)
                     if (!line.isNullOrBlank()) fresh[block] = line
@@ -169,7 +163,7 @@ class GoogleTranslator(
         val fixed = fixUntranslatedWordsBatch(blocks.map { fresh.getValue(it) }, toLang.code)
         blocks.forEachIndexed { index, block ->
             translations[block] = fixed[index]
-            rememberPhrase(cleanSymbols(block.text), fixed[index])
+            rememberPhrase(cleanedByBlock[block].orEmpty(), fixed[index])
         }
 
         // 6. Every block gets its translation.
@@ -183,14 +177,20 @@ class GoogleTranslator(
      * If the service merges or splits lines, the batch is cut in two and each half is translated apart, so every
      * bubble gets its own text and never the text of its neighbour.
      */
-    private suspend fun translateBatch(batch: List<TranslationBlock>): List<String> {
-        val merged = batch.joinToString("\n") { cleanSymbols(it.text) + SAFE_SEPARATOR }
+    private suspend fun translateBatch(
+        batch: List<TranslationBlock>,
+        cleanedByBlock: Map<TranslationBlock, String>,
+    ): List<String> {
+        val merged = batch.joinToString("\n") {
+            (cleanedByBlock[it] ?: cleanSymbols(it.text)) + SAFE_SEPARATOR
+        }
         val translated = translateText(toLang.code, merged)
         val lines = translated.split("\n").map { it.trim() }.filter { it.isNotEmpty() }
         if (lines.size == batch.size) return lines.map { tidy(it) }
         if (batch.size == 1) return listOf(tidy(lines.joinToString(" ")))
         val half = batch.size / 2
-        return translateBatch(batch.subList(0, half)) + translateBatch(batch.subList(half, batch.size))
+        return translateBatch(batch.subList(0, half), cleanedByBlock) +
+            translateBatch(batch.subList(half, batch.size), cleanedByBlock)
     }
 
     private fun tidy(text: String): String = text.removeSuffix(".").removeSuffix(" .").trim()
@@ -220,24 +220,25 @@ class GoogleTranslator(
             ""
         }
 
-        val translationMap = mutableMapOf<String, String>()
+        val regexReplacements = mutableListOf<Pair<Regex, String>>()
         if (translatedWordsMerged.isNotBlank()) {
             val translatedWordsList = translatedWordsMerged.split("\n").map { it.trim() }
             allUntranslatedWords.forEachIndexed { index, word ->
                 if (index < translatedWordsList.size) {
                     val single = tidy(translatedWordsList[index])
                     if (single.isNotBlank() && !untranslatedWordPattern.containsMatchIn(single)) {
-                        translationMap[word] = single
+                        regexReplacements.add(Regex("""\b${Regex.escape(word)}\b""") to single)
                     }
                 }
             }
         }
 
+        if (regexReplacements.isEmpty()) return translatedTexts
+
         return translatedTexts.map { originalText ->
             var fixedText = originalText
-            translationMap.forEach { (word, translatedWord) ->
-                // Word boundaries keep a word from being replaced inside another word.
-                fixedText = fixedText.replace(Regex("""\b$word\b"""), translatedWord)
+            for ((regex, translatedWord) in regexReplacements) {
+                fixedText = fixedText.replace(regex, translatedWord)
             }
             fixedText
         }
@@ -246,7 +247,7 @@ class GoogleTranslator(
     private fun cleanSymbols(rawText: String): String {
         return rawText.replace("\n", " ")
             .replace(symbolsFilterPattern, " ")
-            .replace(Regex("""\s+"""), " ")
+            .replace(multiSpacePattern, " ")
             .trim()
     }
 
@@ -341,6 +342,18 @@ class GoogleTranslator(
 
         private const val MAX_BATCH_CHARS = 1700
         private const val MAX_PHRASES = 1000
+
+        private val rtlLanguages = setOf(
+            TextTranslatorLanguage.ARABIC,
+            TextTranslatorLanguage.PERSIAN,
+            TextTranslatorLanguage.HEBREW,
+            TextTranslatorLanguage.URDU,
+            TextTranslatorLanguage.PUSHTO_PASHTO,
+            TextTranslatorLanguage.SINDHI,
+            TextTranslatorLanguage.UIGHUR_UYGHUR,
+            TextTranslatorLanguage.YIDDISH,
+            TextTranslatorLanguage.KURDISH,
+        )
 
         /** Phrases already translated, per target language, to avoid sending the same text again. */
         private val phrases = object : LinkedHashMap<String, String>(256, 0.75f, true) {
