@@ -7,12 +7,12 @@ import android.graphics.Canvas
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
+import android.os.SystemClock
 import eu.kanade.translation.MangaTranslationContext
 import eu.kanade.translation.PageTranslationRenderer
 import eu.kanade.translation.PageTranslationService
 import eu.kanade.translation.TranslationStore
 import eu.kanade.translation.model.PageTranslation
-import eu.kanade.translation.translator.TranslatorSettings
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
@@ -107,6 +107,7 @@ object PageColorizer {
     private fun acnetReady(context: Context): Boolean = true
 
     fun releaseEngines() {
+        logcat(LogPriority.DEBUG) { "[Perf] Releasing AI engines" }
         colorizerManager.reset()
         upscalerManager.reset()
         acnetManager.reset()
@@ -141,11 +142,25 @@ object PageColorizer {
     suspend fun prefetch(context: Context, source: BufferedSource, full: Boolean, translate: Boolean = false) {
         try {
             val app = context.applicationContext
+            logcat(LogPriority.DEBUG) { "[Perf] START -> prefetch(full=$full, translate=$translate)" }
+            val startMs = SystemClock.elapsedRealtime()
             if (full) run(app, source, display = false, translate = translate) else warmChroma(app, source)
+            logcat(LogPriority.DEBUG) { "[Perf] END   -> prefetch(full=$full) took ${SystemClock.elapsedRealtime() - startMs}ms" }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
             logcat(LogPriority.ERROR, e)
+        }
+    }
+
+    private inline fun <T> logStep(name: String, block: () -> T): T {
+        val startMs = SystemClock.elapsedRealtime()
+        logcat(LogPriority.DEBUG) { "[Perf] START -> $name" }
+        return try {
+            block()
+        } finally {
+            val elapsedMs = SystemClock.elapsedRealtime() - startMs
+            logcat(LogPriority.DEBUG) { "[Perf] END   -> $name (${elapsedMs}ms)" }
         }
     }
 
@@ -155,122 +170,173 @@ object PageColorizer {
         display: Boolean,
         translate: Boolean = true,
     ): BufferedSource? = coroutineScope {
-        if (display && !AiConfig.isPost && AiConfig.usePostProcessed() && PostProcessStore.maybeHasResults) {
-            val original = source.peek().readByteArray()
-            val originalHash = hash(original)
-            PostProcessStore.lookup(context, originalHash)?.let { found ->
-                return@coroutineScope PostRead.compose(context, originalHash, original, found)
-            }
-        }
+        val totalStartMs = SystemClock.elapsedRealtime()
+        logcat(LogPriority.DEBUG) { "[Perf] START -> PageColorizer.run(display=$display, translate=$translate)" }
 
-        val colorModel = modelFile(context)
-        val intensity = AiConfig.colorizeIntensity
-        val wantColor = AiConfig.colorizeEnabled && intensity > 0f && colorModel.length() > 0
-        val wantUpscale = AiConfig.upscaleEnabled && upscaleReady(context)
-        val wantFinal = AiConfig.upscaleFinalPassEnabled && acnetReady(context)
-        val translation = if (translate) AiConfig.translation else null
-        val wantShrink = AiConfig.normalizeSide > 0
-        if (!wantColor && !wantUpscale && !wantShrink && !wantFinal && translation == null) return@coroutineScope null
-        if (ImageUtil.isAnimatedAndSupported(source)) return@coroutineScope null
-
-        val bytes = source.peek().readByteArray()
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@coroutineScope null
-        val pixels = bounds.outWidth.toLong() * bounds.outHeight
-
-        val doColor = wantColor && pixels <= AiConfig.colorizeMaxPixels
-        val shortSide = minOf(bounds.outWidth, bounds.outHeight)
-        val normalize = AiConfig.normalizeSide
-        val upscaleInputPixels = if (normalize in 1 until shortSide) {
-            val ratio = normalize.toDouble() / shortSide
-            (pixels * ratio * ratio).toLong()
-        } else {
-            pixels
-        }
-        val doUpscale = wantUpscale && upscaleInputPixels <= AiConfig.upscaleMaxPixels
-        val doShrink = normalize in 1 until shortSide
-        val translationConfig = translation?.takeIf { pixels <= AiConfig.colorizeMaxPixels }
-        if (!doColor && !doUpscale && !doShrink && !wantFinal && translationConfig == null) return@coroutineScope null
-
-        val imageHash = hash(bytes)
-        val shrinkSide = if (doShrink) normalize else 0
-        val baseName = baseName(context, imageHash, if (doColor) intensity else -1f, doUpscale, shrinkSide, colorModel, samActive(context))
-        val effective = translationConfig?.effectiveSettings()
-        val finalName = translationConfig?.let { config ->
-            val s = effective!!
-            val key = TranslationStore.key(
-                s.from.name, s.to.name, s.engine.name, s.model, config.ocrMode.name, config.font.name,
-                config.filter.signature, AiConfig.forceTranslate(MangaTranslationContext.mangaId).toString(),
-            )
-            "${baseName}_T$key"
-        }
-
-        if (display && finalName != null) readCachedPage(cacheFile(context, finalName))?.let { return@coroutineScope it }
-
-        // 1. Upscale first (on uncolored page).
-        val upscaledBytes = if (doUpscale || doShrink || wantFinal) {
-            upscaleFirst(context, bytes, imageHash, doUpscale, shrinkSide, pixels, wantFinal)
-        } else {
-            null
-        }
-        val inputForOcrAndColor = upscaledBytes ?: bytes
-
-        // 2. OCR & Translation (starts in parallel without blocking colorization).
-        val translationDeferred = if (translationConfig != null && display) {
-            async {
-                var ocrBitmap: Bitmap? = null
-                try {
-                    PageTranslationService.translateNow(
-                        context,
-                        effective!!,
-                        translationConfig.ocrMode,
-                        imageHash,
-                        translationConfig.limits,
-                    ) { decode(inputForOcrAndColor).also { ocrBitmap = it } }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Throwable) {
-                    logcat(LogPriority.ERROR, e)
-                    null
-                } finally {
-                    ocrBitmap?.recycle()
+        try {
+            if (display && !AiConfig.isPost && AiConfig.usePostProcessed() && PostProcessStore.maybeHasResults) {
+                val original = logStep("postProcess.readBytes") { source.peek().readByteArray() }
+                val originalHash = logStep("postProcess.hash") { hash(original) }
+                PostProcessStore.lookup(context, originalHash)?.let { found ->
+                    logcat(LogPriority.DEBUG) { "[Perf] CACHE HIT -> PostProcessStore(hash=$originalHash)" }
+                    return@coroutineScope logStep("postProcess.compose(hash=$originalHash)") {
+                        PostRead.compose(context, originalHash, original, found)
+                    }
                 }
             }
-        } else {
-            if (translationConfig != null) {
-                var ocrBitmap: Bitmap? = null
-                try {
-                    PageTranslationService.enqueue(
-                        context,
-                        effective!!,
-                        translationConfig.ocrMode,
-                        imageHash,
-                        translationConfig.limits,
-                    ) { decode(inputForOcrAndColor).also { ocrBitmap = it } }
-                } finally {
-                    ocrBitmap?.recycle()
+
+            val colorModel = modelFile(context)
+            val intensity = AiConfig.colorizeIntensity
+            val wantColor = AiConfig.colorizeEnabled && intensity > 0f && colorModel.length() > 0
+            val wantUpscale = AiConfig.upscaleEnabled && upscaleReady(context)
+            val wantFinal = AiConfig.upscaleFinalPassEnabled && acnetReady(context)
+            val translation = if (translate) AiConfig.translation else null
+            val wantShrink = AiConfig.normalizeSide > 0
+            if (!wantColor && !wantUpscale && !wantShrink && !wantFinal && translation == null) {
+                logcat(LogPriority.DEBUG) { "[Perf] SKIP -> No AI/translation operations enabled" }
+                return@coroutineScope null
+            }
+            if (ImageUtil.isAnimatedAndSupported(source)) {
+                logcat(LogPriority.DEBUG) { "[Perf] SKIP -> Animated image not supported" }
+                return@coroutineScope null
+            }
+
+            val bytes = logStep("readSourceBytes") { source.peek().readByteArray() }
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            logStep("decodeBounds") {
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            }
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                logcat(LogPriority.DEBUG) { "[Perf] SKIP -> Invalid image dimensions (${bounds.outWidth}x${bounds.outHeight})" }
+                return@coroutineScope null
+            }
+            val pixels = bounds.outWidth.toLong() * bounds.outHeight
+
+            val doColor = wantColor && pixels <= AiConfig.colorizeMaxPixels
+            val shortSide = minOf(bounds.outWidth, bounds.outHeight)
+            val normalize = AiConfig.normalizeSide
+            val upscaleInputPixels = if (normalize in 1 until shortSide) {
+                val ratio = normalize.toDouble() / shortSide
+                (pixels * ratio * ratio).toLong()
+            } else {
+                pixels
+            }
+            val doUpscale = wantUpscale && upscaleInputPixels <= AiConfig.upscaleMaxPixels
+            val doShrink = normalize in 1 until shortSide
+            val translationConfig = translation?.takeIf { pixels <= AiConfig.colorizeMaxPixels }
+            if (!doColor && !doUpscale && !doShrink && !wantFinal && translationConfig == null) {
+                logcat(LogPriority.DEBUG) { "[Perf] SKIP -> Image exceeds pixel limits for enabled operations (${bounds.outWidth}x${bounds.outHeight})" }
+                return@coroutineScope null
+            }
+
+            val imageHash = logStep("hashImage") { hash(bytes) }
+            val shrinkSide = if (doShrink) normalize else 0
+            val baseName = baseName(context, imageHash, if (doColor) intensity else -1f, doUpscale, shrinkSide, colorModel, samActive(context))
+            val effective = translationConfig?.effectiveSettings()
+            val finalName = translationConfig?.let { config ->
+                val s = effective!!
+                val key = TranslationStore.key(
+                    s.from.name, s.to.name, s.engine.name, s.model, config.ocrMode.name, config.font.name,
+                    config.filter.signature, AiConfig.forceTranslate(MangaTranslationContext.mangaId).toString(),
+                )
+                "${baseName}_T$key"
+            }
+
+            if (display && finalName != null) {
+                val cached = logStep("readCachedPage(name=$finalName)") {
+                    readCachedPage(cacheFile(context, finalName))
+                }
+                if (cached != null) {
+                    logcat(LogPriority.DEBUG) { "[Perf] CACHE HIT -> finalPage(name=$finalName)" }
+                    return@coroutineScope cached
                 }
             }
-            null
+
+            // 1. Upscale first (on uncolored page).
+            val upscaledBytes = if (doUpscale || doShrink || wantFinal) {
+                logStep("1.upscaleFirst(hash=$imageHash, w=${bounds.outWidth}, h=${bounds.outHeight}, upscale=$doUpscale, shrink=$shrinkSide, final=$wantFinal)") {
+                    upscaleFirst(context, bytes, imageHash, doUpscale, shrinkSide, pixels, wantFinal)
+                }
+            } else {
+                null
+            }
+            val inputForOcrAndColor = upscaledBytes ?: bytes
+
+            // 2. OCR & Translation (starts in parallel without blocking colorization).
+            val translationDeferred = if (translationConfig != null && display) {
+                async {
+                    logStep("2.translateNow(hash=$imageHash, mode=${translationConfig.ocrMode})") {
+                        var ocrBitmap: Bitmap? = null
+                        try {
+                            PageTranslationService.translateNow(
+                                context,
+                                effective!!,
+                                translationConfig.ocrMode,
+                                imageHash,
+                                translationConfig.limits,
+                            ) {
+                                logStep("2a.decodeForOcr(hash=$imageHash)") {
+                                    decode(inputForOcrAndColor).also { ocrBitmap = it }
+                                }
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            logcat(LogPriority.ERROR, e)
+                            null
+                        } finally {
+                            ocrBitmap?.recycle()
+                        }
+                    }
+                }
+            } else {
+                if (translationConfig != null) {
+                    logStep("2.enqueueTranslation(hash=$imageHash, mode=${translationConfig.ocrMode})") {
+                        var ocrBitmap: Bitmap? = null
+                        try {
+                            PageTranslationService.enqueue(
+                                context,
+                                effective!!,
+                                translationConfig.ocrMode,
+                                imageHash,
+                                translationConfig.limits,
+                            ) {
+                                logStep("2a.decodeForEnqueueOcr(hash=$imageHash)") {
+                                    decode(inputForOcrAndColor).also { ocrBitmap = it }
+                                }
+                            }
+                        } finally {
+                            ocrBitmap?.recycle()
+                        }
+                    }
+                }
+                null
+            }
+
+            // 3. Colorize immediately without waiting for translation.
+            val coloredBytes = if (doColor) {
+                logStep("3.colorizeOnly(hash=$imageHash, intensity=$intensity)") {
+                    colorizeOnly(context, inputForOcrAndColor, imageHash, baseName, intensity, pixels)
+                }
+            } else {
+                upscaledBytes
+            }
+
+            if (translationConfig == null || translationDeferred == null) {
+                return@coroutineScope coloredBytes?.let { Buffer().write(it) }
+            }
+
+            // Apply translation after colorization finishes (awaits only if translation is still running).
+            val translatedPage = logStep("4.awaitTranslation(hash=$imageHash)") {
+                translationDeferred.await()
+            } ?: return@coroutineScope coloredBytes?.let { Buffer().write(it) }
+
+            return@coroutineScope logStep("5.drawTranslation(hash=$imageHash)") {
+                drawTranslation(context, translationConfig, translatedPage, coloredBytes ?: bytes, finalName!!)
+            } ?: coloredBytes?.let { Buffer().write(it) }
+        } finally {
+            logcat(LogPriority.DEBUG) { "[Perf] END   -> PageColorizer.run(display=$display) total=${SystemClock.elapsedRealtime() - totalStartMs}ms" }
         }
-
-        // 3. Colorize immediately without waiting for translation.
-        val coloredBytes = if (doColor) {
-            colorizeOnly(context, inputForOcrAndColor, imageHash, baseName, intensity, pixels)
-        } else {
-            upscaledBytes
-        }
-
-        if (translationConfig == null || translationDeferred == null) {
-            return@coroutineScope coloredBytes?.let { Buffer().write(it) }
-        }
-
-        // Apply translation after colorization finishes (awaits only if translation is still running).
-        val translatedPage = translationDeferred.await() ?: return@coroutineScope coloredBytes?.let { Buffer().write(it) }
-
-        return@coroutineScope drawTranslation(context, translationConfig, translatedPage, coloredBytes ?: bytes, finalName!!)
-            ?: coloredBytes?.let { Buffer().write(it) }
     }
 
     /** Step 1: Upscale/refine uncolored image before OCR and colorization. */
@@ -283,33 +349,44 @@ object PageColorizer {
         pixels: Long,
         wantFinal: Boolean,
     ): ByteArray? {
-        val original = decode(bytes) ?: return null
-        val working = if (shrinkSide > 0) PageResizer.shrink(original, shrinkSide) else original
+        val original = logStep("1a.decodeOriginal(hash=$imageHash)") { decode(bytes) } ?: return null
+        val working = if (shrinkSide > 0) {
+            logStep("1b.shrink(hash=$imageHash, side=$shrinkSide)") { PageResizer.shrink(original, shrinkSide) }
+        } else {
+            original
+        }
         var current: Bitmap = working
         try {
             val upscale = doUpscale && !original.hasAlpha()
             val finalPass = wantFinal && acnetReady(context) && !original.hasAlpha()
             if (!upscale && !finalPass && working === original) return null
             if (estimateBytes(pixels, color = false, upscale = upscale, scale = upscaleScale()) > AiConfig.memoryBudgetBytes) {
-                return if (working !== original) encode(working, original.hasAlpha()) else null
+                logcat(LogPriority.DEBUG) { "[Perf] 1.upscaleFirst memory budget exceeded -> returning shrunk/original" }
+                return if (working !== original) logStep("1c.encodeShrunk(hash=$imageHash)") { encode(working, original.hasAlpha()) } else null
             }
 
-            mutex.withLock {
-                if (upscale) {
-                    val enlarged = (upscalerEngine(context) ?: error("No upscaler model"))
-                        .process(current, AiConfig.upscaleMaxOutputPixels, PageResizer.MAX_SIDE)
-                    if (current !== working) current.recycle()
-                    current = enlarged
-                }
-                if (finalPass) {
-                    val refined = acnetFinalPass(context, current)
-                    if (refined !== current && current !== working) current.recycle()
-                    current = refined
+            logStep("1d.upscaleMutexLock(hash=$imageHash)") {
+                mutex.withLock {
+                    if (upscale) {
+                        val enlarged = logStep("1e.upscalerEngine.process(hash=$imageHash)") {
+                            (upscalerEngine(context) ?: error("No upscaler model"))
+                                .process(current, AiConfig.upscaleMaxOutputPixels, PageResizer.MAX_SIDE)
+                        }
+                        if (current !== working) current.recycle()
+                        current = enlarged
+                    }
+                    if (finalPass) {
+                        val refined = logStep("1f.acnetFinalPass(hash=$imageHash)") {
+                            acnetFinalPass(context, current)
+                        }
+                        if (refined !== current && current !== working) current.recycle()
+                        current = refined
+                    }
                 }
             }
 
             if (current === original) return null
-            return encode(current, original.hasAlpha())
+            return logStep("1g.encodeUpscaled(hash=$imageHash)") { encode(current, original.hasAlpha()) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
@@ -338,32 +415,52 @@ object PageColorizer {
         val file = cacheFile(context, baseName)
         if (file.isFile && file.length() > 0L) {
             file.setLastModified(System.currentTimeMillis())
-            return file.readBytes()
+            logcat(LogPriority.DEBUG) { "[Perf] 3.colorizeOnly CACHE HIT (name=$baseName)" }
+            return logStep("3a.readColorCache(name=$baseName)") { file.readBytes() }
         }
 
-        val sourceBitmap = decode(inputBytes) ?: return null
+        val sourceBitmap = logStep("3b.decodeSource(hash=$imageHash)") { decode(inputBytes) } ?: return null
         var result: Bitmap? = null
         try {
-            if (!looksGrayscale(sourceBitmap)) return null
-            if (estimateBytes(pixels, color = true, upscale = false, scale = 1) > AiConfig.memoryBudgetBytes) return null
+            val grayscale = logStep("3c.looksGrayscale(hash=$imageHash)") { looksGrayscale(sourceBitmap) }
+            if (!grayscale) {
+                logcat(LogPriority.DEBUG) { "[Perf] 3.colorizeOnly SKIP -> Image is not grayscale" }
+                return null
+            }
+            if (estimateBytes(pixels, color = true, upscale = false, scale = 1) > AiConfig.memoryBudgetBytes) {
+                logcat(LogPriority.DEBUG) { "[Perf] 3.colorizeOnly SKIP -> Memory budget exceeded" }
+                return null
+            }
 
             val processed = try {
-                mutex.withLock {
-                    val colorModel = modelFile(context)
-                    val chromaFile = chromaFile(context, imageHash, colorModel)
-                    val engine = colorizerEngine(context, colorModel)
-                    val chroma = loadChroma(chromaFile) ?: engine.predict(sourceBitmap).also {
-                        runCatching { saveChroma(context, chromaFile, it) }
-                    }
-                    var page = engine.render(sourceBitmap, chroma, intensity)
+                logStep("3d.colorizeMutexLock(hash=$imageHash)") {
+                    mutex.withLock {
+                        val colorModel = modelFile(context)
+                        val chromaFile = chromaFile(context, imageHash, colorModel)
+                        val engine = logStep("3e.colorizerEngine(hash=$imageHash)") {
+                            colorizerEngine(context, colorModel)
+                        }
+                        val chroma = logStep("3f.loadOrPredictChroma(hash=$imageHash)") {
+                            loadChroma(chromaFile) ?: engine.predict(sourceBitmap).also {
+                                logStep("3g.saveChroma(hash=$imageHash)") {
+                                    runCatching { saveChroma(context, chromaFile, it) }
+                                }
+                            }
+                        }
+                        var page = logStep("3h.engine.render(hash=$imageHash)") {
+                            engine.render(sourceBitmap, chroma, intensity)
+                        }
 
-                    val saturation = AiConfig.saturation
-                    if (saturation != 1f) {
-                        val saturated = applySaturation(page, saturation)
-                        if (saturated !== page) page.recycle()
-                        page = saturated
+                        val saturation = AiConfig.saturation
+                        if (saturation != 1f) {
+                            val saturated = logStep("3i.applySaturation(hash=$imageHash, sat=$saturation)") {
+                                applySaturation(page, saturation)
+                            }
+                            if (saturated !== page) page.recycle()
+                            page = saturated
+                        }
+                        page
                     }
-                    page
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -376,8 +473,10 @@ object PageColorizer {
             }
             result = processed
 
-            val encoded = encode(processed, sourceBitmap.hasAlpha())
-            runCatching { saveCachedPage(file, encoded) }
+            val encoded = logStep("3j.encodeColored(hash=$imageHash)") { encode(processed, sourceBitmap.hasAlpha()) }
+            logStep("3k.saveColorCache(name=$baseName)") {
+                runCatching { saveCachedPage(file, encoded) }
+            }
             return encoded
         } finally {
             result?.recycle()
@@ -396,9 +495,13 @@ object PageColorizer {
 
         val engine = acnetManager.getOrPut(key) { Anime4kUpscaler(context, acceleration, AiConfig.aiThreads) }
 
-        val enlarged = engine.upscale(page)
+        val enlarged = logStep("1f1.acnet.upscale(${page.width}x${page.height})") {
+            engine.upscale(page)
+        }
         if (!AiConfig.upscaleFinalPassKeepSize) return capSize(enlarged)
-        val restored = PageResizer.resizeTo(enlarged, page.width, page.height)
+        val restored = logStep("1f2.acnet.resizeTo(${page.width}x${page.height})") {
+            PageResizer.resizeTo(enlarged, page.width, page.height)
+        }
         if (restored !== enlarged) enlarged.recycle()
         return restored
     }
@@ -422,13 +525,17 @@ object PageColorizer {
         targetBytes: ByteArray,
         finalName: String,
     ): BufferedSource? {
-        val target = decode(targetBytes) ?: return null
+        val target = logStep("5a.decodeTarget") { decode(targetBytes) } ?: return null
         var drawn: Bitmap? = null
         try {
-            val result = PageTranslationRenderer.render(target, translatedPage, config.font.typeface(context))
+            val result = logStep("5b.renderer.render(blocks=${translatedPage.blocks.size})") {
+                PageTranslationRenderer.render(target, translatedPage, config.font.typeface(context))
+            }
             if (result !== target) drawn = result
-            val encoded = encode(result, target.hasAlpha())
-            runCatching { saveCachedPage(cacheFile(context, finalName), encoded) }
+            val encoded = logStep("5c.encodeTranslated") { encode(result, target.hasAlpha()) }
+            logStep("5d.saveFinalCache(name=$finalName)") {
+                runCatching { saveCachedPage(cacheFile(context, finalName), encoded) }
+            }
             return Buffer().write(encoded)
         } finally {
             drawn?.recycle()
@@ -447,13 +554,21 @@ object PageColorizer {
         val pixels = bounds.outWidth.toLong() * bounds.outHeight
         if (pixels > AiConfig.colorizeMaxPixels) return
         if (estimateBytes(pixels, true, false, 1) > AiConfig.memoryBudgetBytes) return
-        val chromaFile = chromaFile(context, hash(bytes), model)
+        val imageHash = hash(bytes)
+        val chromaFile = chromaFile(context, imageHash, model)
         if (chromaFile.isFile) return
-        val original = decode(bytes) ?: return
+        val original = logStep("warmChroma.decode(hash=$imageHash)") { decode(bytes) } ?: return
         try {
             if (!looksGrayscale(original)) return
             mutex.withLock {
-                if (!chromaFile.isFile) saveChroma(context, chromaFile, colorizerEngine(context, model).predict(original))
+                if (!chromaFile.isFile) {
+                    val chroma = logStep("warmChroma.predict(hash=$imageHash)") {
+                        colorizerEngine(context, model).predict(original)
+                    }
+                    logStep("warmChroma.save(hash=$imageHash)") {
+                        saveChroma(context, chromaFile, chroma)
+                    }
+                }
             }
         } finally {
             original.recycle()
@@ -485,6 +600,7 @@ object PageColorizer {
         val setup = "$acceleration/${AiConfig.aiThreads}/sam=$sam"
         val key = "${model.absolutePath}_${setup}_${model.lastModified()}"
         return colorizerManager.getOrPut(key) {
+            logcat(LogPriority.DEBUG) { "[Perf] Creating MangaColorizer engine ($setup)" }
             val guide = if (sam) {
                 try {
                     SamFeatureProvider.load(context)
@@ -517,7 +633,10 @@ object PageColorizer {
         if (files.isEmpty() || files.any { it.length() == 0L }) return null
         val acceleration = if (acceleratorFailed) Acceleration.CPU else AiConfig.upscaleAcceleration
         val key = "models_${files.joinToString("|") { "${it.name}_${it.lastModified()}" }}_${acceleration}_${AiConfig.aiThreads}"
-        return upscalerManager.getOrPut(key) { Anime4kStageUpscaler(files, acceleration, AiConfig.aiThreads) }
+        return upscalerManager.getOrPut(key) {
+            logcat(LogPriority.DEBUG) { "[Perf] Creating Anime4kStageUpscaler engine ($acceleration, threads=${AiConfig.aiThreads})" }
+            Anime4kStageUpscaler(files, acceleration, AiConfig.aiThreads)
+        }
     }
 
     private fun looksGrayscale(bitmap: Bitmap): Boolean {
