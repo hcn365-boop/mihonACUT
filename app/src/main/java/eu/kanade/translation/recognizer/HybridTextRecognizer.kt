@@ -13,7 +13,7 @@ import kotlin.math.min
 
 class HybridTextRecognizer(
     private val context: Context,
-    override val language: TextRecognizerLanguage
+    override val language: TextRecognizerLanguage,
 ) : TextRecognizer {
 
     private val TAG = "HybridTextRecognizer"
@@ -28,12 +28,12 @@ class HybridTextRecognizer(
         val height: Int,
         val angle: Float,
         val symWidth: Float = PageTextExtractor.DEFAULT_SYMBOL,
-        val symHeight: Float = PageTextExtractor.DEFAULT_SYMBOL
+        val symHeight: Float = PageTextExtractor.DEFAULT_SYMBOL,
     )
 
     data class HybridResult(
         val text: String,
-        val box: HybridBox
+        val box: HybridBox,
     )
 
     override fun recognize(image: InputImage): String {
@@ -81,32 +81,34 @@ class HybridTextRecognizer(
                     height = box.height(),
                     angle = angle,
                     symWidth = symWidth,
-                    symHeight = symHeight
+                    symHeight = symHeight,
                 )
 
                 // قص المنطقة وتدويرها
                 val croppedData = cropAndRotateBox(bitmap, rawBox) ?: continue
-                
-                // تشغيل Paddle على المنطقة المقصوصة
-                val paddleText = runPaddleOnCrop(croppedData.bitmap)
-                
-                if (paddleText.isNotBlank()) {
-                    // دمج كل النتائج في نص واحد مع الحفاظ على الأسطر
-                    val mergedText = paddleText.trim()
-                    
-                    results.add(
-                        HybridResult(
-                            text = mergedText,
-                            box = croppedData.adjustedBox
+
+                try {
+                    // تشغيل Paddle على المنطقة المقصوصة والمدوّرة
+                    val paddleText = runPaddleOnCrop(croppedData.rotated)
+
+                    if (paddleText.isNotBlank()) {
+                        // دمج كل النتائج في نص واحد مع الحفاظ على الأسطر
+                        val mergedText = paddleText.trim()
+
+                        results.add(
+                            HybridResult(
+                                text = mergedText,
+                                box = croppedData.adjustedBox,
+                            ),
                         )
-                    )
+                    }
+                } finally {
+                    // تنظيف الذاكرة في جميع الحالات
+                    if (croppedData.rotated != croppedData.cropped) {
+                        croppedData.rotated.recycle()
+                    }
+                    croppedData.cropped.recycle()
                 }
-                
-                // تنظيف الذاكرة
-                if (croppedData.rotated != croppedData.cropped) {
-                    croppedData.rotated.recycle()
-                }
-                croppedData.cropped.recycle()
             }
 
             return results
@@ -119,7 +121,7 @@ class HybridTextRecognizer(
     private data class CropResult(
         val cropped: Bitmap,
         val rotated: Bitmap,
-        val adjustedBox: HybridBox
+        val adjustedBox: HybridBox,
     )
 
     private fun cropAndRotateBox(bitmap: Bitmap, box: HybridBox): CropResult? {
@@ -152,7 +154,7 @@ class HybridTextRecognizer(
             height = finalCropH,
             angle = box.angle,
             symWidth = box.symWidth,
-            symHeight = box.symHeight
+            symHeight = box.symHeight,
         )
 
         return try {
