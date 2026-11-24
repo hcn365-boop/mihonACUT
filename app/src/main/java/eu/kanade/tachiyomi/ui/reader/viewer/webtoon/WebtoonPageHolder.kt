@@ -1,8 +1,7 @@
 package eu.kanade.tachiyomi.ui.reader.viewer.webtoon
 
-import eu.kanade.tachiyomi.ui.reader.colorize.AiPrefetcher
-import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
 import android.content.res.Resources
+import android.graphics.Bitmap
 import android.view.LayoutInflater
 import android.view.ViewGroup
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
@@ -15,10 +14,12 @@ import com.davemorrissey.labs.subscaleview.SubsamplingScaleImageView
 import eu.kanade.presentation.util.formattedMessage
 import eu.kanade.tachiyomi.databinding.ReaderErrorBinding
 import eu.kanade.tachiyomi.source.model.Page
+import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
+import eu.kanade.tachiyomi.ui.reader.colorize.AiPrefetcher
+import eu.kanade.tachiyomi.ui.reader.colorize.PageColorizer
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderPageImageView
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
-import eu.kanade.tachiyomi.ui.reader.colorize.PageColorizer
 import eu.kanade.tachiyomi.ui.webview.WebViewActivity
 import eu.kanade.tachiyomi.util.system.dpToPx
 import kotlinx.coroutines.Job
@@ -184,6 +185,11 @@ class WebtoonPageHolder(
         removeErrorLayout()
     }
 
+    private sealed interface PreparedImage {
+        class DirectBitmap(val bitmap: Bitmap) : PreparedImage
+        class Source(val source: BufferedSource, val isAnimated: Boolean) : PreparedImage
+    }
+
     /**
      * Called when the page is ready.
      */
@@ -193,26 +199,58 @@ class WebtoonPageHolder(
         val streamFn = page?.stream ?: return
 
         try {
-            val (source, isAnimated) = withIOContext {
-                    val source = streamFn().use { stream ->
-                    val original = Buffer().readFrom(stream)
-                    val colored = if (AiConfig.anyEnabled) PageColorizer.process(context, original) else original
-                    process(colored)
+            val prepared = withIOContext {
+                val canUseDirectBitmap = AiConfig.anyEnabled &&
+                    !viewer.config.dualPageRotateToFit &&
+                    !viewer.config.dualPageSplit &&
+                    !viewer.config.imageCropBorders
+
+                val colorizerResult: PageColorizer.DisplayResult? = if (AiConfig.anyEnabled) {
+                    streamFn().use { stream ->
+                        val original = Buffer().readFrom(stream)
+                        PageColorizer.processForDisplay(context, original)
+                    }
+                } else {
+                    null
                 }
-                val isAnimated = ImageUtil.isAnimatedAndSupported(source)
-                Pair(source, isAnimated)
+
+                if (canUseDirectBitmap && colorizerResult is PageColorizer.DisplayResult.DirectBitmap) {
+                    val bmp = colorizerResult.bitmap
+                    if (!bmp.isRecycled) {
+                        return@withIOContext PreparedImage.DirectBitmap(bmp)
+                    }
+                }
+
+                val baseSource: BufferedSource = when (colorizerResult) {
+                    is PageColorizer.DisplayResult.Source -> colorizerResult.source
+                    is PageColorizer.DisplayResult.DirectBitmap -> {
+                        streamFn().use { stream ->
+                            Buffer().readFrom(stream)
+                        }
+                    }
+                    null -> {
+                        streamFn().use { stream ->
+                            Buffer().readFrom(stream)
+                        }
+                    }
+                }
+
+                val finalSource = process(baseSource)
+                val isAnimated = ImageUtil.isAnimatedAndSupported(finalSource)
+                PreparedImage.Source(finalSource, isAnimated)
             }
+
             withUIContext {
                 page?.let { AiPrefetcher.onPageShown(context, it) }
-                frame.setImage(
-                    source,
-                    isAnimated,
-                    ReaderPageImageView.Config(
-                        zoomDuration = viewer.config.doubleTapAnimDuration,
-                        minimumScaleType = SubsamplingScaleImageView.SCALE_TYPE_FIT_WIDTH,
-                        cropBorders = viewer.config.imageCropBorders,
-                    ),
+                val imageConfig = ReaderPageImageView.Config(
+                    zoomDuration = viewer.config.doubleTapAnimDuration,
+                    minimumScaleType = SubsamplingScaleImageView.SCALE_TYPE_FIT_WIDTH,
+                    cropBorders = viewer.config.imageCropBorders,
                 )
+                when (prepared) {
+                    is PreparedImage.DirectBitmap -> frame.setImage(prepared.bitmap, imageConfig)
+                    is PreparedImage.Source -> frame.setImage(prepared.source, prepared.isAnimated, imageConfig)
+                }
                 removeErrorLayout()
             }
         } catch (e: Throwable) {
