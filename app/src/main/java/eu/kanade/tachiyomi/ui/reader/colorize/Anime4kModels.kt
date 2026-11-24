@@ -95,7 +95,7 @@ object Anime4kModels {
                 // Opening the model checks its input and output, and finds its scale.
                 try {
                     Anime4kStageUpscaler.validate(temp)
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     throw IOException("This is not a usable Anime4K model: ${e.message}", e)
                 }
                 if (!temp.renameTo(target)) temp.copyTo(target, overwrite = true)
