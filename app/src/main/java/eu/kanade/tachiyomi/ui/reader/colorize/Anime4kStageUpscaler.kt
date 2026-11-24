@@ -51,7 +51,7 @@ class Anime4kStageUpscaler(files: List<File>, acceleration: Acceleration, thread
 
     init {
         check(OpenCVLoader.initLocal()) { "OpenCV native library failed to load" }
-        val opened = ArrayList<Stage>()
+        val opened = ArrayList<Stage>(files.size)
         stages = try {
             files.map { openStage(it, acceleration, threads).also { stage -> opened.add(stage) } }
         } catch (e: Throwable) {
@@ -86,6 +86,7 @@ class Anime4kStageUpscaler(files: List<File>, acceleration: Acceleration, thread
         }
         val out = m.mat()
         Imgproc.cvtColor(current, out, Imgproc.COLOR_RGB2RGBA)
+        m.free(current)
         val bitmap = Bitmap.createBitmap(out.cols(), out.rows(), Bitmap.Config.ARGB_8888)
         Utils.matToBitmap(out, bitmap)
         bitmap
@@ -99,6 +100,12 @@ class Anime4kStageUpscaler(files: List<File>, acceleration: Acceleration, thread
     private fun runStage(stage: Stage, input: Mat, m: Mats): Mat {
         val s = stage.scale
         val output = m.own(Mat(input.rows() * s, input.cols() * s, CvType.CV_8UC3))
+        val plane = TILE * TILE
+        val tileInputBuffer = FloatArray(3 * plane)
+        val channelRowBuffer = FloatArray(plane)
+        val outSize = TILE * s
+        val outPlane = outSize * outSize
+
         var y = 0
         while (y < input.rows()) {
             val h = min(CORE, input.rows() - y)
@@ -121,32 +128,33 @@ class Anime4kStageUpscaler(files: List<File>, acceleration: Acceleration, thread
                     )
                     val tile32 = t.mat()
                     tile8.convertTo(tile32, CvType.CV_32F, 1.0 / 255.0)
+                    t.free(tile8)
 
                     // Mat data is interleaved (RGBRGB...); the model wants planes (RR..GG..BB..).
-                    val planes = ArrayList<Mat>()
+                    val planes = ArrayList<Mat>(3)
                     Core.split(tile32, planes)
-                    val plane = TILE * TILE
-                    val data = FloatArray(3 * plane)
-                    val row = FloatArray(plane)
+                    t.free(tile32)
                     planes.forEachIndexed { c, p ->
-                        p.get(0, 0, row)
-                        row.copyInto(data, c * plane)
+                        p.get(0, 0, channelRowBuffer)
+                        channelRowBuffer.copyInto(tileInputBuffer, c * plane)
                         p.release()
                     }
 
-                    val out = runTile(stage.session, stage.inputName, stage.half, data, TILE, TILE)
-                    val outSize = TILE * s
-                    val outPlane = outSize * outSize
-                    val outPlanes = List(3) { c ->
-                        t.mat(outSize, outSize, CvType.CV_32F).also {
-                            it.put(0, 0, out.values.copyOfRange(c * outPlane, (c + 1) * outPlane))
-                        }
+                    val out = runTile(stage.session, stage.inputName, stage.half, tileInputBuffer, TILE, TILE)
+                    val outPlanes = ArrayList<Mat>(3)
+                    for (c in 0 until 3) {
+                        val planeMat = t.mat(outSize, outSize, CvType.CV_32F)
+                        planeMat.put(0, 0, out.values, c * outPlane, outPlane)
+                        outPlanes.add(planeMat)
                     }
                     val merged = t.mat()
                     Core.merge(outPlanes, merged)
+                    outPlanes.forEach { t.free(it) }
+
                     val tileOut8 = t.mat()
                     // Converting to 8-bit saturates, so values outside 0..1 are clamped.
                     merged.convertTo(tileOut8, CvType.CV_8U, 255.0)
+                    t.free(merged)
 
                     val crop = t.own(Mat(tileOut8, Rect(PAD * s, PAD * s, w * s, h * s)))
                     val destination = t.own(Mat(output, Rect(x * s, y * s, w * s, h * s)))
@@ -220,7 +228,7 @@ class Anime4kStageUpscaler(files: List<File>, acceleration: Acceleration, thread
 
     /** Releases every Mat created through it, even if processing throws. */
     private class Mats : Closeable {
-        private val owned = ArrayList<Mat>()
+        private val owned = ArrayList<Mat>(16)
 
         fun mat(): Mat = Mat().also { owned.add(it) }
 
@@ -230,12 +238,16 @@ class Anime4kStageUpscaler(files: List<File>, acceleration: Acceleration, thread
 
         /** Frees a big image as soon as it is no longer needed. */
         fun free(mat: Mat) {
-            owned.remove(mat)
-            mat.release()
+            if (owned.remove(mat)) {
+                mat.release()
+            }
         }
 
         override fun close() {
-            owned.forEach { it.release() }
+            for (i in owned.indices) {
+                owned[i].release()
+            }
+            owned.clear()
         }
     }
 
