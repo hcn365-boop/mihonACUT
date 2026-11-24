@@ -12,11 +12,11 @@ import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.Rect
+import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.io.Closeable
 import java.io.File
 import java.nio.FloatBuffer
-import org.opencv.core.Size
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -31,9 +31,9 @@ import kotlin.math.roundToInt
 class Anime4kUpscaler(
     context: Context,
     acceleration: Acceleration = Acceleration.CPU,
-    threads: Int = 0
+    threads: Int = 0,
 ) : PageUpscaler {
-    
+
     private class Spec(val inputName: String, val tileWidth: Int, val tileHeight: Int, val scale: Int)
 
     private class TileResult(val shape: LongArray, val values: FloatArray)
@@ -48,17 +48,24 @@ class Anime4kUpscaler(
 
     init {
         check(OpenCVLoader.initLocal()) { "OpenCV native library failed to load" }
-        
-        // المسار الثابت للموديل داخل مجلد الـ assets
+
+        // Keep model inside cache directory while verifying asset availability cleanly.
         val assetPath = "anime4k/anime4k_acnet.onnx"
         val modelFile = File(context.cacheDir, "anime4k_acnet.onnx")
-        
-        // نسخ الموديل إلى ذاكرة المؤقتة (Cache) إن لم يكن موجوداً لكي تقرأه مكتبة ONNX
-        if (!modelFile.exists()) {
-            context.assets.open(assetPath).use { input ->
-                modelFile.outputStream().use { output ->
-                    input.copyTo(output)
+
+        if (!modelFile.exists() || modelFile.length() == 0L) {
+            val temp = File(context.cacheDir, "anime4k_acnet.onnx.${System.nanoTime()}.tmp")
+            try {
+                context.assets.open(assetPath).use { input ->
+                    temp.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
                 }
+                if (!temp.renameTo(modelFile)) {
+                    temp.copyTo(modelFile, overwrite = true)
+                }
+            } finally {
+                temp.delete()
             }
         }
 
@@ -81,8 +88,7 @@ class Anime4kUpscaler(
         toMat(input, rgba)
         val rgb = m.mat()
         Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB)
-        val ycrcb = m.mat()
-        Imgproc.cvtColor(rgb, ycrcb, Imgproc.COLOR_RGB2YCrCb)
+        m.free(rgba)
 
         if (maxShortSide > 0) {
             val shortSide = min(rgb.cols(), rgb.rows())
@@ -96,26 +102,41 @@ class Anime4kUpscaler(
             }
         }
 
+        val ycrcb = m.mat()
+        Imgproc.cvtColor(rgb, ycrcb, Imgproc.COLOR_RGB2YCrCb)
+        m.free(rgb)
+
         val luma = m.mat()
         Core.extractChannel(ycrcb, luma, 0)
         luma.convertTo(luma, CvType.CV_32F, 1.0 / 255.0)
         val lumaUp = upscaleLuma(luma, m)
+        m.free(luma)
+
         // Converting to 8-bit saturates, so values outside 0..1 are clamped.
         val lumaUp8 = m.mat()
         lumaUp.convertTo(lumaUp8, CvType.CV_8U, 255.0)
+        m.free(lumaUp)
 
         val size = lumaUp8.size()
         val cr = m.mat()
         val cb = m.mat()
         Core.extractChannel(ycrcb, cr, 1)
         Core.extractChannel(ycrcb, cb, 2)
+        m.free(ycrcb)
+
         Imgproc.resize(cr, cr, size, 0.0, 0.0, Imgproc.INTER_LINEAR)
         Imgproc.resize(cb, cb, size, 0.0, 0.0, Imgproc.INTER_LINEAR)
-        Core.merge(listOf(lumaUp8, cr, cb), ycrcb)
-        Imgproc.cvtColor(ycrcb, rgb, Imgproc.COLOR_YCrCb2RGB)
+
+        val merged = m.mat()
+        Core.merge(listOf(lumaUp8, cr, cb), merged)
+        m.free(lumaUp8)
+        m.free(cr)
+        m.free(cb)
 
         val out = m.mat()
-        Imgproc.cvtColor(rgb, out, Imgproc.COLOR_RGB2RGBA)
+        Imgproc.cvtColor(merged, out, Imgproc.COLOR_YCrCb2RGBA)
+        m.free(merged)
+
         val bitmap = Bitmap.createBitmap(out.cols(), out.rows(), Bitmap.Config.ARGB_8888)
         Utils.matToBitmap(out, bitmap)
         bitmap
@@ -133,6 +154,7 @@ class Anime4kUpscaler(
         val coreWidth = tileWidth - 2 * PAD
         val coreHeight = tileHeight - 2 * PAD
         val output = m.own(Mat(source.rows() * scale, source.cols() * scale, CvType.CV_32F))
+        val tileBuffer = FloatArray(tileHeight * tileWidth)
 
         var y = 0
         while (y < source.rows()) {
@@ -159,10 +181,9 @@ class Anime4kUpscaler(
                         tileWidth - left - region.cols(),
                         Core.BORDER_REPLICATE,
                     )
-                    val data = FloatArray(tileHeight * tileWidth)
-                    tile.get(0, 0, data)
+                    tile.get(0, 0, tileBuffer)
 
-                    val result = runTile(session, spec.inputName, data, tileHeight, tileWidth)
+                    val result = runTile(session, spec.inputName, tileBuffer, tileHeight, tileWidth)
                     val predicted = t.mat(tileHeight * scale, tileWidth * scale, CvType.CV_32F)
                     predicted.put(0, 0, result.values)
 
@@ -229,7 +250,7 @@ class Anime4kUpscaler(
 
     /** Releases every Mat created through it, even if processing throws. */
     private class Mats : Closeable {
-        private val owned = ArrayList<Mat>()
+        private val owned = ArrayList<Mat>(16)
 
         fun mat(): Mat = Mat().also { owned.add(it) }
 
@@ -237,8 +258,17 @@ class Anime4kUpscaler(
 
         fun own(mat: Mat): Mat = mat.also { owned.add(it) }
 
+        fun free(mat: Mat) {
+            if (owned.remove(mat)) {
+                mat.release()
+            }
+        }
+
         override fun close() {
-            owned.forEach { it.release() }
+            for (i in owned.indices) {
+                owned[i].release()
+            }
+            owned.clear()
         }
     }
 
