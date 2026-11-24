@@ -17,6 +17,19 @@ internal object PageResizer {
     /** Longest side allowed for a processed page. JPEG cannot store more than 65,535 pixels on a side. */
     const val MAX_SIDE = 30_000
 
+    @Volatile
+    private var openCvLoaded = false
+
+    private fun ensureOpenCv() {
+        if (openCvLoaded) return
+        synchronized(this) {
+            if (!openCvLoaded) {
+                check(OpenCVLoader.initLocal()) { "OpenCV native library failed to load" }
+                openCvLoaded = true
+            }
+        }
+    }
+
     /**
      * How much an image of this size must be scaled so that it has at most [maxPixels] pixels and its
      * longest side is at most [maxSide]. 1.0 means it already fits.
@@ -58,7 +71,7 @@ internal object PageResizer {
 
     /** A new bitmap of exactly [width] x [height] pixels. [bitmap] is not changed. */
     fun resizeTo(bitmap: Bitmap, width: Int, height: Int): Bitmap {
-        check(OpenCVLoader.initLocal()) { "OpenCV native library failed to load" }
+        ensureOpenCv()
         val w = max(1, width)
         val h = max(1, height)
         val source = Mat()
