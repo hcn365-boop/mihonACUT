@@ -6,14 +6,6 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
 import android.graphics.Bitmap
-import org.opencv.android.OpenCVLoader
-import org.opencv.android.Utils
-import org.opencv.core.Core
-import org.opencv.core.CvType
-import org.opencv.core.Mat
-import org.opencv.core.Rect
-import org.opencv.core.Size
-import org.opencv.imgproc.Imgproc
 import java.io.Closeable
 import java.io.File
 import java.nio.ByteBuffer
@@ -22,6 +14,14 @@ import java.nio.FloatBuffer
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import org.opencv.android.OpenCVLoader
+import org.opencv.android.Utils
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.Rect
+import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
 
 /** Something that enlarges (or cleans) a page bitmap. */
 interface PageUpscaler : Closeable {
@@ -144,7 +144,8 @@ class Anime4kStageUpscaler(files: List<File>, acceleration: Acceleration, thread
                     val outPlanes = ArrayList<Mat>(3)
                     for (c in 0 until 3) {
                         val planeMat = t.mat(outSize, outSize, CvType.CV_32F)
-                        planeMat.put(0, 0, out.values, c * outPlane, outPlane)
+                        val start = c * outPlane
+                        planeMat.put(0, 0, out.values.copyOfRange(start, start + outPlane))
                         outPlanes.add(planeMat)
                     }
                     val merged = t.mat()
