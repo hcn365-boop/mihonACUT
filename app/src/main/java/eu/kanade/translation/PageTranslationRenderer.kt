@@ -74,8 +74,8 @@ object PageTranslationRenderer {
     }
 
     private fun drawTranslatedText(canvas: Canvas, block: TranslationBlock, scale: Float, typeface: Typeface) {
-        val paddingX = block.width * scale * 0.08f
-        val paddingY = block.height * scale * 0.08f
+        val paddingX = block.width * scale * 0.02f
+        val paddingY = block.height * scale * 0.02f
 
         val left = max(block.x * scale + paddingX, 0f)
         val top = max(block.y * scale + paddingY, 0f)
