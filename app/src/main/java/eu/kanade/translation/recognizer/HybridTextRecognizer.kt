@@ -41,20 +41,20 @@ class HybridTextRecognizer(
         return results.joinToString("\n") { it.text }
     }
 
-    // استخراج الصناديق وأبعاد الرموز من ML Kit ثم قراءة النصوص الداخلية عبر PaddleOCR بعد توسيع الصندوق 10%
+    // دمج كل نتائج Paddle داخل صندوق ML Kit الواحد في فقاعة واحدة
     fun recognizeWithBoxes(image: InputImage): List<HybridResult> {
         val bitmap = image.bitmapInternal ?: return emptyList()
         val results = mutableListOf<HybridResult>()
 
         try {
             val mlKitResult: Text = mlKitRecognizer.process(image)
-            val rawBoxes = mutableListOf<HybridBox>()
 
             for (block in mlKitResult.textBlocks) {
                 val box = block.boundingBox ?: continue
                 val line = block.lines.firstOrNull()
                 val angle = line?.angle ?: 0f
 
+                // حساب أبعاد الرموز من كل البلوك
                 val symbolBoxes = block.lines
                     .flatMap { it.elements }
                     .flatMap { it.symbols }
@@ -74,85 +74,111 @@ class HybridTextRecognizer(
                     PageTextExtractor.DEFAULT_SYMBOL
                 }
 
-                rawBoxes.add(
-                    HybridBox(
-                        x = box.left,
-                        y = box.top,
-                        width = box.width(),
-                        height = box.height(),
-                        angle = angle,
-                        symWidth = symWidth,
-                        symHeight = symHeight
+                val rawBox = HybridBox(
+                    x = box.left,
+                    y = box.top,
+                    width = box.width(),
+                    height = box.height(),
+                    angle = angle,
+                    symWidth = symWidth,
+                    symHeight = symHeight
+                )
+
+                // قص المنطقة وتدويرها
+                val croppedData = cropAndRotateBox(bitmap, rawBox) ?: continue
+                
+                // تشغيل Paddle على المنطقة المقصوصة
+                val paddleText = runPaddleOnCrop(croppedData.bitmap)
+                
+                if (paddleText.isNotBlank()) {
+                    // دمج كل النتائج في نص واحد مع الحفاظ على الأسطر
+                    val mergedText = paddleText.trim()
+                    
+                    results.add(
+                        HybridResult(
+                            text = mergedText,
+                            box = croppedData.adjustedBox
+                        )
                     )
-                )
-            }
-
-            // معالجة القص والتدوير لكل صندوق وقراءته بواسطة PaddleOCR مباشرة
-            for (box in rawBoxes) {
-                val startX = max(0, box.x)
-                val startY = max(0, box.y)
-                val endX = min(bitmap.width, box.x + box.width)
-                val endY = min(bitmap.height, box.y + box.height)
-
-                val cropW = endX - startX
-                val cropH = endY - startY
-                if (cropW < 10 || cropH < 10) continue
-
-                // توسيع الصندوق بنسبة 10% لتجنب قص حواف النصوص
-                val padX = (cropW * 0.10f).toInt()
-                val padY = (cropH * 0.10f).toInt()
-
-                val finalStartX = max(0, startX - padX)
-                val finalStartY = max(0, startY - padY)
-                val finalEndX = min(bitmap.width, endX + padX)
-                val finalEndY = min(bitmap.height, endY + padY)
-
-                val finalCropW = finalEndX - finalStartX
-                val finalCropH = finalEndY - finalStartY
-                if (finalCropW < 10 || finalCropH < 10) continue
-
-                val adjustedBox = HybridBox(
-                    x = finalStartX,
-                    y = finalStartY,
-                    width = finalCropW,
-                    height = finalCropH,
-                    angle = box.angle,
-                    symWidth = box.symWidth,
-                    symHeight = box.symHeight
-                )
-
-                var croppedBitmap: Bitmap? = null
-                var rotatedBitmap: Bitmap? = null
-                try {
-                    croppedBitmap = Bitmap.createBitmap(bitmap, finalStartX, finalStartY, finalCropW, finalCropH)
-
-                    rotatedBitmap = if (abs(box.angle) > 1f) {
-                        val matrix = Matrix().apply {
-                            postRotate(-box.angle, finalCropW / 2f, finalCropH / 2f)
-                        }
-                        Bitmap.createBitmap(croppedBitmap, 0, 0, finalCropW, finalCropH, matrix, true)
-                    } else {
-                        croppedBitmap
-                    }
-
-                    val croppedInput = InputImage.fromBitmap(rotatedBitmap, 0)
-                    val paddleText = paddleRecognizer.recognize(croppedInput)
-
-                    if (paddleText.isNotBlank()) {
-                        results.add(HybridResult(paddleText.trim(), adjustedBox))
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "خطأ أثناء معالجة القصة الهجينة للصندوق", e)
-                } finally {
-                    if (rotatedBitmap != croppedBitmap) rotatedBitmap?.recycle()
-                    croppedBitmap?.recycle()
                 }
+                
+                // تنظيف الذاكرة
+                if (croppedData.rotated != croppedData.cropped) {
+                    croppedData.rotated.recycle()
+                }
+                croppedData.cropped.recycle()
             }
 
             return results
         } catch (e: Exception) {
             Log.e(TAG, "فشل في تشغيل النظام الهجين", e)
             return emptyList()
+        }
+    }
+
+    private data class CropResult(
+        val cropped: Bitmap,
+        val rotated: Bitmap,
+        val adjustedBox: HybridBox
+    )
+
+    private fun cropAndRotateBox(bitmap: Bitmap, box: HybridBox): CropResult? {
+        val startX = max(0, box.x)
+        val startY = max(0, box.y)
+        val endX = min(bitmap.width, box.x + box.width)
+        val endY = min(bitmap.height, box.y + box.height)
+
+        val cropW = endX - startX
+        val cropH = endY - startY
+        if (cropW < 10 || cropH < 10) return null
+
+        // توسيع الصندوق بنسبة 10%
+        val padX = (cropW * 0.10f).toInt()
+        val padY = (cropH * 0.10f).toInt()
+
+        val finalStartX = max(0, startX - padX)
+        val finalStartY = max(0, startY - padY)
+        val finalEndX = min(bitmap.width, endX + padX)
+        val finalEndY = min(bitmap.height, endY + padY)
+
+        val finalCropW = finalEndX - finalStartX
+        val finalCropH = finalEndY - finalStartY
+        if (finalCropW < 10 || finalCropH < 10) return null
+
+        val adjustedBox = HybridBox(
+            x = finalStartX,
+            y = finalStartY,
+            width = finalCropW,
+            height = finalCropH,
+            angle = box.angle,
+            symWidth = box.symWidth,
+            symHeight = box.symHeight
+        )
+
+        return try {
+            val cropped = Bitmap.createBitmap(bitmap, finalStartX, finalStartY, finalCropW, finalCropH)
+            val rotated = if (abs(box.angle) > 1f) {
+                val matrix = Matrix().apply {
+                    postRotate(-box.angle, finalCropW / 2f, finalCropH / 2f)
+                }
+                Bitmap.createBitmap(cropped, 0, 0, finalCropW, finalCropH, matrix, true)
+            } else {
+                cropped
+            }
+            CropResult(cropped, rotated, adjustedBox)
+        } catch (e: Exception) {
+            Log.e(TAG, "خطأ في قص الصندوق", e)
+            null
+        }
+    }
+
+    private fun runPaddleOnCrop(bitmap: Bitmap): String {
+        return try {
+            val input = InputImage.fromBitmap(bitmap, 0)
+            paddleRecognizer.recognize(input)
+        } catch (e: Exception) {
+            Log.e(TAG, "خطأ في تشغيل Paddle", e)
+            ""
         }
     }
 
