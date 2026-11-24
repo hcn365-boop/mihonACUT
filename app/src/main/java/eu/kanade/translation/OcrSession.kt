@@ -8,9 +8,9 @@ import eu.kanade.translation.recognizer.HybridTextRecognizer
 import eu.kanade.translation.recognizer.MlKitTextRecognizer
 import eu.kanade.translation.recognizer.PaddleTextRecognizer
 import eu.kanade.translation.recognizer.TextRecognizerLanguage
+import java.io.Closeable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.io.Closeable
 
 class OcrSession(
     private val context: Context,
@@ -43,7 +43,6 @@ class OcrSession(
         isRtl = language == TextRecognizerLanguage.JAPANESE || language == TextRecognizerLanguage.KOREAN,
         mlKit = if (effectiveMode == OcrMode.PADDLE) null else this::runMlKit,
         paddle = if (effectiveMode == OcrMode.MLKIT) null else this::runPaddle,
-        hybrid = if (effectiveMode == OcrMode.HYBRID) this::runHybrid else null,
         context = context,
         recognizerLanguage = language,
     )
@@ -62,7 +61,7 @@ class OcrSession(
         }
     }
 
-    private suspend fun runHybrid(image: InputImage): List<HybridTextRecognizer.HybridResult> {
+    suspend fun runHybrid(image: InputImage): List<HybridTextRecognizer.HybridResult> {
         return withContext(Dispatchers.Default) {
             hybridEngine.value.recognizeWithBoxes(image)
         }
