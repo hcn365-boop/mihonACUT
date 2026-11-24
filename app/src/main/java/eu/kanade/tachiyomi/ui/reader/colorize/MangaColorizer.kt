@@ -4,6 +4,7 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.graphics.Bitmap
+import android.os.SystemClock
 import java.io.Closeable
 import java.io.File
 import java.nio.FloatBuffer
@@ -63,13 +64,25 @@ class MangaColorizer(
         }
     }
 
-    fun predict(input: Bitmap): Chroma = Mats().use { m ->
-        val rgba = m.mat()
-        toMat(input, rgba)
-        predictFromRgba(m, rgba)
+    private inline fun <T> measureStep(name: String, block: () -> T): T {
+        val startMs = SystemClock.elapsedRealtime()
+        return try {
+            block()
+        } finally {
+            val elapsedMs = SystemClock.elapsedRealtime() - startMs
+            logcat(LogPriority.DEBUG) { "[Perf] MangaColorizer.$name took ${elapsedMs}ms" }
+        }
     }
 
-    internal fun predictFromRgba(m: Mats, rgba: Mat): Chroma {
+    fun predict(input: Bitmap): Chroma = measureStep("predict(${input.width}x${input.height})") {
+        Mats().use { m ->
+            val rgba = m.mat()
+            toMat(input, rgba)
+            predictFromRgba(m, rgba)
+        }
+    }
+
+    internal fun predictFromRgba(m: Mats, rgba: Mat): Chroma = measureStep("predictFromRgba(${rgba.cols()}x${rgba.rows()})") {
         val gray = m.mat()
         Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
         val small = m.mat()
@@ -81,7 +94,9 @@ class MangaColorizer(
         small.get(0, 0, modelInputBuffer)
         m.free(small)
 
-        runModel(modelInputBuffer, modelOutputBuffer)
+        measureStep("onnx.runModel") {
+            runModel(modelInputBuffer, modelOutputBuffer)
+        }
 
         val planes = ArrayList<Mat>(3)
         for (c in 0 until 3) {
@@ -100,7 +115,7 @@ class MangaColorizer(
         Core.min(merged, ONE_SCALAR_3, merged)
 
         merged.get(0, 0, chromaOutBuffer)
-        return Chroma(chromaOutBuffer.copyOf())
+        Chroma(chromaOutBuffer.copyOf())
     }
 
     /**
@@ -114,10 +129,12 @@ class MangaColorizer(
      */
     fun render(input: Bitmap, chroma: Chroma, intensity: Float = 1f): Bitmap {
         require(intensity in 0f..1.2f) { "intensity must be within 0..1.2" }
-        return Mats().use { m ->
-            val rgba = m.mat()
-            toMat(input, rgba)
-            renderFromRgba(m, rgba, input.width, input.height, chroma, intensity)
+        return measureStep("render(${input.width}x${input.height}, intensity=$intensity)") {
+            Mats().use { m ->
+                val rgba = m.mat()
+                toMat(input, rgba)
+                renderFromRgba(m, rgba, input.width, input.height, chroma, intensity)
+            }
         }
     }
 
@@ -130,137 +147,139 @@ class MangaColorizer(
         intensity: Float = 1f,
     ): Bitmap {
         require(intensity in 0f..1.2f) { "intensity must be within 0..1.2" }
-        val fullSize = Size(width.toDouble(), height.toDouble())
+        return measureStep("renderFromRgba(${width}x${height}, intensity=$intensity)") {
+            val fullSize = Size(width.toDouble(), height.toDouble())
 
-        // Original luminance (Rec.601), full size, computed directly from RGBA without extra RGB8 copy.
-        val rgb = m.mat()
-        Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB)
-        rgb.convertTo(rgb, CvType.CV_32FC3, 1.0 / 255.0)
+            // Original luminance (Rec.601), full size, computed directly from RGBA without extra RGB8 copy.
+            val rgb = m.mat()
+            Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB)
+            rgb.convertTo(rgb, CvType.CV_32FC3, 1.0 / 255.0)
 
-        val guideY = m.mat()
-        luma(m, rgb, guideY)
+            val guideY = m.mat()
+            luma(m, rgb, guideY)
 
-        // Model color and luminance at model resolution.
-        val modelRgb = m.mat(SIDE, SIDE, CvType.CV_32FC3)
-        modelRgb.put(0, 0, chroma.rgb)
-        val modelY = m.mat()
-        luma(m, modelRgb, modelY)
+            // Model color and luminance at model resolution.
+            val modelRgb = m.mat(SIDE, SIDE, CvType.CV_32FC3)
+            modelRgb.put(0, 0, chroma.rgb)
+            val modelY = m.mat()
+            luma(m, modelRgb, modelY)
 
-        // Upscale model color and luminance directly to page size.
-        val fullRgb = m.mat()
-        Imgproc.resize(modelRgb, fullRgb, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
-        m.free(modelRgb)
+            // Upscale model color and luminance directly to page size.
+            val fullRgb = m.mat()
+            Imgproc.resize(modelRgb, fullRgb, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
+            m.free(modelRgb)
 
-        val fullY = m.mat()
-        Imgproc.resize(modelY, fullY, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
-        m.free(modelY)
+            val fullY = m.mat()
+            Imgproc.resize(modelY, fullY, fullSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
+            m.free(modelY)
 
-        // Saturation: scale chroma around upscaled model luminance, before normalizing.
-        val colorY3 = m.mat()
-        Core.merge(listOf(fullY, fullY, fullY), colorY3)
+            // Saturation: scale chroma around upscaled model luminance, before normalizing.
+            val colorY3 = m.mat()
+            Core.merge(listOf(fullY, fullY, fullY), colorY3)
 
-        val satColor = m.mat()
-        Core.subtract(fullRgb, colorY3, satColor)
-        m.free(fullRgb)
+            val satColor = m.mat()
+            Core.subtract(fullRgb, colorY3, satColor)
+            m.free(fullRgb)
 
-        val intensityScalar = Scalar(intensity.toDouble(), intensity.toDouble(), intensity.toDouble())
-        Core.multiply(satColor, intensityScalar, satColor)
-        Core.add(satColor, colorY3, satColor)
-        Core.max(satColor, ZERO_SCALAR_3, satColor)
-        Core.min(satColor, ONE_SCALAR_3, satColor)
+            val intensityScalar = Scalar(intensity.toDouble(), intensity.toDouble(), intensity.toDouble())
+            Core.multiply(satColor, intensityScalar, satColor)
+            Core.add(satColor, colorY3, satColor)
+            Core.max(satColor, ZERO_SCALAR_3, satColor)
+            Core.min(satColor, ONE_SCALAR_3, satColor)
 
-        // Normalize to luminance 1 so only the hue/saturation remains.
-        val satY = m.mat()
-        luma(m, satColor, satY)
-        Core.max(satY, Y_EPS_SCALAR_1, satY)
+            // Normalize to luminance 1 so only the hue/saturation remains.
+            val satY = m.mat()
+            luma(m, satColor, satY)
+            Core.max(satY, Y_EPS_SCALAR_1, satY)
 
-        val satY3 = m.mat()
-        Core.merge(listOf(satY, satY, satY), satY3)
-        m.free(satY)
+            val satY3 = m.mat()
+            Core.merge(listOf(satY, satY, satY), satY3)
+            m.free(satY)
 
-        val hue = rgb // Reuse `rgb` Mat for normalized hue.
-        Core.divide(satColor, satY3, hue)
-        m.free(satColor)
-        m.free(satY3)
+            val hue = rgb // Reuse `rgb` Mat for normalized hue.
+            Core.divide(satColor, satY3, hue)
+            m.free(satColor)
+            m.free(satY3)
 
-        // 2. Model lighting (upscaled from 512x512).
-        val light = fullY // Reuse `fullY` Mat for model lighting.
-        Core.max(light, LIGHT_FLOOR_SCALAR_1, light)
+            // 2. Model lighting (upscaled from 512x512).
+            val light = fullY // Reuse `fullY` Mat for model lighting.
+            Core.max(light, LIGHT_FLOOR_SCALAR_1, light)
 
-        // 3. Detail ratio from original luminance vs local blur.
-        val lowGuide = m.mat()
-        Imgproc.blur(guideY, lowGuide, BLUR_KERNEL_SIZE)
-        Core.max(lowGuide, LIGHT_FLOOR_SCALAR_1, lowGuide)
+            // 3. Detail ratio from original luminance vs local blur.
+            val lowGuide = m.mat()
+            Imgproc.blur(guideY, lowGuide, BLUR_KERNEL_SIZE)
+            Core.max(lowGuide, LIGHT_FLOOR_SCALAR_1, lowGuide)
 
-        val detail = m.mat()
-        Core.divide(guideY, lowGuide, detail)
-        m.free(lowGuide)
+            val detail = m.mat()
+            Core.divide(guideY, lowGuide, detail)
+            m.free(lowGuide)
 
-        Core.min(detail, ONE_SCALAR_1, detail)
-        Core.max(detail, ZERO_SCALAR_1, detail)
+            Core.min(detail, ONE_SCALAR_1, detail)
+            Core.max(detail, ZERO_SCALAR_1, detail)
 
-        val detailShaped = m.mat()
-        Core.pow(detail, DETAIL_STRENGTH.toDouble(), detailShaped)
-        m.free(detail)
+            val detailShaped = m.mat()
+            Core.pow(detail, DETAIL_STRENGTH.toDouble(), detailShaped)
+            m.free(detail)
 
-        // 4. Weight model lighting by original luminance guideY so dark text/strokes
-        //    are not blurred by low-res upscaled `light`.
-        val darkMask = m.mat()
-        Core.min(guideY, ONE_SCALAR_1, darkMask)
-        Core.max(darkMask, ZERO_SCALAR_1, darkMask)
+            // 4. Weight model lighting by original luminance guideY so dark text/strokes
+            //    are not blurred by low-res upscaled `light`.
+            val darkMask = m.mat()
+            Core.min(guideY, ONE_SCALAR_1, darkMask)
+            Core.max(darkMask, ZERO_SCALAR_1, darkMask)
 
-        // lightWithDetail = light * detailShaped (reusing `light` buffer)
-        Core.multiply(light, detailShaped, light)
+            // lightWithDetail = light * detailShaped (reusing `light` buffer)
+            Core.multiply(light, detailShaped, light)
 
-        // sharpGuideWithDetail = guideY * detailShaped (reusing `detailShaped` buffer)
-        Core.multiply(guideY, detailShaped, detailShaped)
-        m.free(guideY)
+            // sharpGuideWithDetail = guideY * detailShaped (reusing `detailShaped` buffer)
+            Core.multiply(guideY, detailShaped, detailShaped)
+            m.free(guideY)
 
-        // invMask = 1.0 - darkMask (reusing `colorY3` buffer)
-        val invMask = colorY3
-        Core.multiply(darkMask, NEG_ONE_SCALAR_1, invMask)
-        Core.add(invMask, ONE_SCALAR_1, invMask)
+            // invMask = 1.0 - darkMask (reusing `colorY3` buffer)
+            val invMask = colorY3
+            Core.multiply(darkMask, NEG_ONE_SCALAR_1, invMask)
+            Core.add(invMask, ONE_SCALAR_1, invMask)
 
-        // partLight = light * darkMask (reusing `light` buffer)
-        Core.multiply(light, darkMask, light)
-        m.free(darkMask)
+            // partLight = light * darkMask (reusing `light` buffer)
+            Core.multiply(light, darkMask, light)
+            m.free(darkMask)
 
-        // partSharp = sharpGuideWithDetail * invMask (reusing `detailShaped` buffer)
-        Core.multiply(detailShaped, invMask, detailShaped)
-        m.free(invMask)
+            // partSharp = sharpGuideWithDetail * invMask (reusing `detailShaped` buffer)
+            Core.multiply(detailShaped, invMask, detailShaped)
+            m.free(invMask)
 
-        // finalY = partLight + partSharp (reusing `light` buffer)
-        val finalY = light
-        Core.add(light, detailShaped, finalY)
-        m.free(detailShaped)
+            // finalY = partLight + partSharp (reusing `light` buffer)
+            val finalY = light
+            Core.add(light, detailShaped, finalY)
+            m.free(detailShaped)
 
-        val finalY3 = m.mat()
-        Core.merge(listOf(finalY, finalY, finalY), finalY3)
-        m.free(finalY)
+            val finalY3 = m.mat()
+            Core.merge(listOf(finalY, finalY, finalY), finalY3)
+            m.free(finalY)
 
-        val result = m.mat()
-        Core.multiply(hue, finalY3, result)
-        m.free(hue)
-        m.free(finalY3)
-        Core.max(result, ZERO_SCALAR_3, result)
-        Core.min(result, ONE_SCALAR_3, result)
+            val result = m.mat()
+            Core.multiply(hue, finalY3, result)
+            m.free(hue)
+            m.free(finalY3)
+            Core.max(result, ZERO_SCALAR_3, result)
+            Core.min(result, ONE_SCALAR_3, result)
 
-        val out8 = m.mat()
-        result.convertTo(out8, CvType.CV_8UC3, 255.0)
-        m.free(result)
+            val out8 = m.mat()
+            result.convertTo(out8, CvType.CV_8UC3, 255.0)
+            m.free(result)
 
-        val out = m.mat()
-        Imgproc.cvtColor(out8, out, Imgproc.COLOR_RGB2RGBA)
-        m.free(out8)
+            val out = m.mat()
+            Imgproc.cvtColor(out8, out, Imgproc.COLOR_RGB2RGBA)
+            m.free(out8)
 
-        val alpha = m.mat()
-        Core.extractChannel(rgba, alpha, 3)
-        Core.insertChannel(alpha, out, 3)
-        m.free(alpha)
+            val alpha = m.mat()
+            Core.extractChannel(rgba, alpha, 3)
+            Core.insertChannel(alpha, out, 3)
+            m.free(alpha)
 
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        Utils.matToBitmap(out, bitmap)
-        return bitmap
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(out, bitmap)
+            bitmap
+        }
     }
 
     override fun close() {
