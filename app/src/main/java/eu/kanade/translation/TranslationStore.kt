@@ -20,14 +20,14 @@ import java.security.MessageDigest
  */
 object TranslationStore {
 
-        enum class Kind(val id: Int) {
+    enum class Kind(val id: Int) {
         OCR(0),
         TRANSLATED(1),
 
         /** The language the OCR of a page was run with, as a plain name. */
         LANGUAGE(2),
-        }
-        
+    }
+
     private const val DATABASE = "translations.db"
     private const val TABLE = "pages"
 
@@ -42,10 +42,14 @@ object TranslationStore {
                 "CREATE TABLE $TABLE (name TEXT NOT NULL, kind INTEGER NOT NULL, data TEXT NOT NULL, " +
                     "updated INTEGER NOT NULL, manga INTEGER NOT NULL DEFAULT -1, PRIMARY KEY (name, kind))",
             )
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_${TABLE}_manga ON $TABLE(manga)")
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            if (oldVersion < 2) db.execSQL("ALTER TABLE $TABLE ADD COLUMN manga INTEGER NOT NULL DEFAULT -1")
+            if (oldVersion < 2) {
+                db.execSQL("ALTER TABLE $TABLE ADD COLUMN manga INTEGER NOT NULL DEFAULT -1")
+            }
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_${TABLE}_manga ON $TABLE(manga)")
         }
     }
 
@@ -70,7 +74,7 @@ object TranslationStore {
         ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null } ?: return null
         return try {
             json.decodeFromString(PageTranslation.serializer(), data)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             // A damaged row is removed so the page is processed again.
             db.delete(TABLE, "name = ? AND kind = ?", arrayOf(name, kind.id.toString()))
             null
@@ -104,7 +108,7 @@ object TranslationStore {
         }
         database(context).insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
-    
+
     /** Saves many pages in one transaction: much faster than one save after another. */
     fun saveAll(context: Context, kind: Kind, pages: Map<String, PageTranslation>, manga: Long = AiConfig.mangaId) {
         if (pages.isEmpty()) return
@@ -112,14 +116,14 @@ object TranslationStore {
         db.beginTransaction()
         try {
             val now = System.currentTimeMillis()
+            val values = ContentValues()
             for ((name, page) in pages) {
-                val values = ContentValues().apply {
-                    put("name", name)
-                    put("kind", kind.id)
-                    put("manga", manga)
-                    put("data", json.encodeToString(PageTranslation.serializer(), page))
-                    put("updated", now)
-                }
+                values.clear()
+                values.put("name", name)
+                values.put("kind", kind.id)
+                values.put("manga", manga)
+                values.put("data", json.encodeToString(PageTranslation.serializer(), page))
+                values.put("updated", now)
                 db.insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
             }
             db.setTransactionSuccessful()
@@ -140,7 +144,11 @@ object TranslationStore {
         db.beginTransaction()
         try {
             for (hash in hashes) {
-                deleted += db.delete(TABLE, "name LIKE ? OR name LIKE ?", arrayOf("$hash%", "post_$hash%"))
+                deleted += db.delete(
+                    TABLE,
+                    "name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\'",
+                    arrayOf("${escapeLike(hash)}%", "post_${escapeLike(hash)}%"),
+                )
             }
             db.setTransactionSuccessful()
         } finally {
@@ -148,6 +156,9 @@ object TranslationStore {
         }
         return deleted
     }
+
+    private fun escapeLike(value: String): String =
+        value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     /**
      * Deletes everything saved while reading or processing one manga. Rows saved before this existed have no
@@ -164,4 +175,10 @@ object TranslationStore {
     }
 
     fun sizeBytes(context: Context): Long = context.getDatabasePath(DATABASE).length()
+
+    @Synchronized
+    fun close() {
+        helper?.close()
+        helper = null
+    }
 }
