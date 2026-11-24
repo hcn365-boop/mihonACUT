@@ -6,6 +6,12 @@ import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
 import android.content.Context
 import android.graphics.Bitmap
+import java.io.Closeable
+import java.io.File
+import java.nio.FloatBuffer
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
@@ -14,12 +20,6 @@ import org.opencv.core.Mat
 import org.opencv.core.Rect
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
-import java.io.Closeable
-import java.io.File
-import java.nio.FloatBuffer
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.roundToInt
 
 /**
  * Anime4K "AI" upscaler: runs an ACNet ONNX model (1 channel in, 1 channel out, 2x) on the luminance
@@ -133,9 +133,13 @@ class Anime4kUpscaler(
         m.free(cr)
         m.free(cb)
 
-        val out = m.mat()
-        Imgproc.cvtColor(merged, out, Imgproc.COLOR_YCrCb2RGBA)
+        val rgbOut = m.mat()
+        Imgproc.cvtColor(merged, rgbOut, Imgproc.COLOR_YCrCb2RGB)
         m.free(merged)
+
+        val out = m.mat()
+        Imgproc.cvtColor(rgbOut, out, Imgproc.COLOR_RGB2RGBA)
+        m.free(rgbOut)
 
         val bitmap = Bitmap.createBitmap(out.cols(), out.rows(), Bitmap.Config.ARGB_8888)
         Utils.matToBitmap(out, bitmap)
