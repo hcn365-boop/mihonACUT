@@ -14,11 +14,6 @@ import eu.kanade.translation.model.TranslationBlock
 import kotlin.math.max
 import kotlin.math.min
 
-/**
- * Draws the translation of a page into its bitmap using a two-step strategy:
- * 1. Erases/covers all original text boxes across the entire page first using bubble-like shapes.
- * 2. Draws all translated texts over the cleaned bubbles second, with safe inner padding.
- */
 object PageTranslationRenderer {
 
     private const val MIN_BOX_PX = 6f
@@ -38,16 +33,15 @@ object PageTranslationRenderer {
         val validBlocks = page.blocks.filter { it.translation.isNotBlank() }
         if (validBlocks.isEmpty()) return output
 
-        // ==========================================
-        // الخطوة الأولى: مسح وطمس كل الفقاعات في الصفحة أولاً
-        // ==========================================
-        for (block in validBlocks) {
-            eraseOriginalText(output, canvas, block, scale)
+        val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = BUBBLE_COLOR
         }
 
-        // ==========================================
-        // الخطوة الثانية: طباعة كل النصوص المترجمة فوق الفقاعات النظيفة ثانياً
-        // ==========================================
+        for (block in validBlocks) {
+            eraseOriginalText(output, canvas, block, scale, fillPaint)
+        }
+
         for (block in validBlocks) {
             drawTranslatedText(canvas, block, scale, typeface)
         }
@@ -55,19 +49,18 @@ object PageTranslationRenderer {
         return output
     }
 
-    /** الخطوة 1: رسم شكل فقاعي بيضاوي/دائري الحواف لتغطية النص الأصلي */
-    private fun eraseOriginalText(bitmap: Bitmap, canvas: Canvas, block: TranslationBlock, scale: Float) {
+    private fun eraseOriginalText(
+        bitmap: Bitmap,
+        canvas: Canvas,
+        block: TranslationBlock,
+        scale: Float,
+        fillPaint: Paint,
+    ) {
         val metrics = calculateBoxCoordinates(bitmap, block, scale)
         if (metrics.width < MIN_BOX_PX || metrics.height < MIN_BOX_PX) return
 
         val rect = RectF(metrics.left, metrics.top, metrics.right, metrics.bottom)
-        // استدارة عالية (تصل إلى نصف أصغر ضلع) لتبدو كفقاعة/شكل بيضاوي بدلاً من مستطيل حاد
         val radius = min(metrics.width, metrics.height) * 0.48f
-
-        val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.FILL
-            color = BUBBLE_COLOR
-        }
 
         val hasRotation = block.angle > 0f && block.angle <= VERTICAL_ANGLE
         if (hasRotation) {
@@ -80,9 +73,7 @@ object PageTranslationRenderer {
         }
     }
 
-    /** الخطوة 2: حساب حجم النص المناسب وطباعته داخل الفقاعة مع هوامش آمنة من الحواف المنحنية */
     private fun drawTranslatedText(canvas: Canvas, block: TranslationBlock, scale: Float, typeface: Typeface) {
-        // هامش داخلي أوسع قليلاً من 1% ليحترم انحناء زوايا الفقاعة
         val paddingX = block.width * scale * 0.08f
         val paddingY = block.height * scale * 0.08f
 
@@ -116,11 +107,10 @@ object PageTranslationRenderer {
         val right: Float,
         val bottom: Float,
         val width: Float,
-        val height: Float
+        val height: Float,
     )
 
     private fun calculateBoxCoordinates(bitmap: Bitmap, block: TranslationBlock, scale: Float): BoxMetrics {
-        // مساحة مسح الخلفية مع هامش متوازن حول النص الأصلي
         val padX = block.symWidth * 1.6f
         val padY = block.symHeight * 1.2f
         val left = max((block.x - padX / 2) * scale, 0f)
@@ -132,10 +122,6 @@ object PageTranslationRenderer {
         return BoxMetrics(left, top, right, bottom, width, height)
     }
 
-    /**
-     * خوارزمية البحث الثنائي الذكية لحجم الخط مع قياس دقيق لعرض الكلمات
-     * لضمان ملاءمة النص داخل الارتفاع والعرض دون كسر الكلمات.
-     */
     private fun fitText(text: String, paint: TextPaint, width: Int, height: Int): StaticLayout {
         var low = MIN_TEXT_PX
         var high = max(low, min(height, MAX_TEXT_PX))
@@ -161,30 +147,27 @@ object PageTranslationRenderer {
         return layout(finalFormattedText, paint, width)
     }
 
-    /**
-     * خوارزمية الكسر المسبق للأسطر (Word-Bound Wrapping Algorithm):
-     * تقوم بفحص الكلمات بناءً على الفراغات، وإذا تبين أن الكلمة التالية ستقطع حافة
-     * عرض الفقاعة، يتم فصلها مسبقاً بنزول سطر تلقائي (\n) لحمايتها من التقطيع.
-     */
     private fun formatTextToPreventCutting(text: String, paint: TextPaint, maxLineWidth: Int): String {
         if (maxLineWidth <= 0) return text
 
-        val words = text.split(Regex("(?<=\\s)|(?=\\s)"))
-        val lineBuilder = StringBuilder()
+        val words = text.split(" ")
+        val lineBuilder = StringBuilder(text.length)
         val currentLine = StringBuilder()
 
         for (word in words) {
-            val testLine = currentLine.toString() + word
-            if (paint.measureText(testLine) > maxLineWidth) {
-                if (currentLine.isNotEmpty()) {
-                    lineBuilder.append(currentLine.toString().trim()).append("\n")
-                    currentLine.clear()
-                }
+            if (word.isEmpty()) continue
+            val candidate = if (currentLine.isEmpty()) word else "${currentLine} $word"
+            if (paint.measureText(candidate) > maxLineWidth && currentLine.isNotEmpty()) {
+                lineBuilder.append(currentLine).append('\n')
+                currentLine.clear()
+                currentLine.append(word)
+            } else {
+                if (currentLine.isNotEmpty()) currentLine.append(' ')
+                currentLine.append(word)
             }
-            currentLine.append(word)
         }
         if (currentLine.isNotEmpty()) {
-            lineBuilder.append(currentLine.toString().trim())
+            lineBuilder.append(currentLine)
         }
 
         return lineBuilder.toString()
