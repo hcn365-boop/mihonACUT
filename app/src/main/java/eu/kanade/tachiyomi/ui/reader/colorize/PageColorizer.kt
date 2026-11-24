@@ -13,8 +13,12 @@ import eu.kanade.translation.PageTranslationRenderer
 import eu.kanade.translation.PageTranslationService
 import eu.kanade.translation.TranslationStore
 import eu.kanade.translation.model.PageTranslation
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import logcat.LogPriority
@@ -38,6 +42,11 @@ import kotlin.math.roundToInt
  */
 object PageColorizer {
 
+    sealed interface DisplayResult {
+        class DirectBitmap(val bitmap: Bitmap) : DisplayResult
+        class Source(val source: BufferedSource) : DisplayResult
+    }
+
     private const val MODEL_DIR = "colorizer"
     private const val COLORIZER_FILE = "v6_generator.onnx"
     private const val UPSCALER_FILE = "anime4k_acnet.onnx"
@@ -47,6 +56,8 @@ object PageColorizer {
     private const val CHROMA_SIZE = 512 * 512
     private const val MAX_CHROMA_CACHE_BYTES = 256L * 1024 * 1024
     private const val JPEG_QUALITY = 95
+
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // Separate locks so upscaling, active colorization, and background prefetch do not block each other unnecessarily.
     private val upscaleMutex = Mutex()
@@ -121,7 +132,7 @@ object PageColorizer {
 
     suspend fun process(context: Context, source: BufferedSource): BufferedSource {
         return try {
-            run(context.applicationContext, source, display = true) ?: source
+            run(context.applicationContext, source, display = true)?.source ?: source
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
@@ -130,14 +141,25 @@ object PageColorizer {
         }
     }
 
+    suspend fun processForDisplay(context: Context, source: BufferedSource): DisplayResult {
+        return try {
+            run(context.applicationContext, source, display = true) ?: DisplayResult.Source(source)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            logcat(LogPriority.ERROR, e)
+            DisplayResult.Source(source)
+        }
+    }
+
     suspend fun processToBytes(context: Context, source: BufferedSource): ByteArray? {
         val result = run(context.applicationContext, source, display = true) ?: return null
-        return result.readByteArray()
+        return result.source.readByteArray()
     }
 
     suspend fun processImagesToBytes(context: Context, source: BufferedSource): ByteArray? {
         val result = run(context.applicationContext, source, display = false, translate = false) ?: return null
-        return result.readByteArray()
+        return result.source.readByteArray()
     }
 
     fun contentHash(bytes: ByteArray): String = hash(bytes)
@@ -167,12 +189,24 @@ object PageColorizer {
         }
     }
 
+    private class RunOutcome(
+        val displayResult: DisplayResult?,
+        val retainedBitmap: Bitmap? = null,
+    ) {
+        val source: BufferedSource?
+            get() = when (val r = displayResult) {
+                is DisplayResult.Source -> r.source
+                is DisplayResult.DirectBitmap -> Buffer().write(encode(r.bitmap, r.bitmap.hasAlpha()))
+                null -> null
+            }
+    }
+
     private suspend fun run(
         context: Context,
         source: BufferedSource,
         display: Boolean,
         translate: Boolean = true,
-    ): BufferedSource? = coroutineScope {
+    ): RunOutcome? = coroutineScope {
         val totalStartMs = SystemClock.elapsedRealtime()
         logcat(LogPriority.DEBUG) { "[Perf] START -> PageColorizer.run(display=$display, translate=$translate)" }
 
@@ -182,9 +216,10 @@ object PageColorizer {
                 val originalHash = logStep("postProcess.hash") { hash(original) }
                 PostProcessStore.lookup(context, originalHash)?.let { found ->
                     logcat(LogPriority.DEBUG) { "[Perf] CACHE HIT -> PostProcessStore(hash=$originalHash)" }
-                    return@coroutineScope logStep("postProcess.compose(hash=$originalHash)") {
+                    val composed = logStep("postProcess.compose(hash=$originalHash)") {
                         PostRead.compose(context, originalHash, original, found)
                     }
+                    return@coroutineScope RunOutcome(composed?.let { DisplayResult.Source(it) })
                 }
             }
 
@@ -251,7 +286,7 @@ object PageColorizer {
                 }
                 if (cached != null) {
                     logcat(LogPriority.DEBUG) { "[Perf] CACHE HIT -> finalPage(name=$finalName)" }
-                    return@coroutineScope cached
+                    return@coroutineScope RunOutcome(DisplayResult.Source(cached))
                 }
             }
 
@@ -266,6 +301,7 @@ object PageColorizer {
 
             var currentBitmap: Bitmap? = upscaledBitmap
             var ownsCurrentBitmap = upscaledBitmap != null
+            var retainedBitmapForCaller: Bitmap? = null
 
             try {
                 // Helper to obtain a Bitmap for OCR/Colorization without re-decoding when upscaledBitmap is already in memory.
@@ -373,41 +409,77 @@ object PageColorizer {
                 try {
                     val activeBitmap = coloredBitmap ?: currentBitmap
                     if (translationConfig == null || translationDeferred == null) {
-                        return@coroutineScope when {
+                        if (display && activeBitmap != null && !activeBitmap.isRecycled) {
+                            retainedBitmapForCaller = activeBitmap
+                            return@coroutineScope RunOutcome(
+                                displayResult = DisplayResult.DirectBitmap(activeBitmap),
+                                retainedBitmap = activeBitmap,
+                            )
+                        }
+                        val src = when {
                             coloredBytes != null -> Buffer().write(coloredBytes)
                             activeBitmap != null -> Buffer().write(encode(activeBitmap, activeBitmap.hasAlpha()))
                             else -> null
                         }
+                        return@coroutineScope RunOutcome(src?.let { DisplayResult.Source(it) })
                     }
 
                     // Apply translation after colorization finishes (awaits only if translation is still running).
                     val translatedPage = logStep("4.awaitTranslation(hash=$imageHash)") {
                         translationDeferred.await()
-                    } ?: return@coroutineScope when {
-                        coloredBytes != null -> Buffer().write(coloredBytes)
-                        activeBitmap != null -> Buffer().write(encode(activeBitmap, activeBitmap.hasAlpha()))
-                        else -> Buffer().write(bytes)
+                    }
+                    if (translatedPage == null) {
+                        if (display && activeBitmap != null && !activeBitmap.isRecycled) {
+                            retainedBitmapForCaller = activeBitmap
+                            return@coroutineScope RunOutcome(
+                                displayResult = DisplayResult.DirectBitmap(activeBitmap),
+                                retainedBitmap = activeBitmap,
+                            )
+                        }
+                        val src = when {
+                            coloredBytes != null -> Buffer().write(coloredBytes)
+                            activeBitmap != null -> Buffer().write(encode(activeBitmap, activeBitmap.hasAlpha()))
+                            else -> Buffer().write(bytes)
+                        }
+                        return@coroutineScope RunOutcome(DisplayResult.Source(src))
                     }
 
-                    return@coroutineScope logStep("5.drawTranslation(hash=$imageHash)") {
-                        drawTranslationFromBitmap(
+                    val drawnOutcome = logStep("5.drawTranslation(hash=$imageHash)") {
+                        drawTranslationOutcome(
                             context = context,
                             config = translationConfig,
                             translatedPage = translatedPage,
                             targetBitmap = activeBitmap,
                             fallbackBytes = coloredBytes ?: bytes,
                             finalName = finalName!!,
+                            retainBitmapForDisplay = display,
                         )
-                    } ?: when {
+                    }
+                    if (drawnOutcome != null) {
+                        retainedBitmapForCaller = drawnOutcome.retainedBitmap
+                        return@coroutineScope drawnOutcome
+                    }
+
+                    if (display && activeBitmap != null && !activeBitmap.isRecycled) {
+                        retainedBitmapForCaller = activeBitmap
+                        return@coroutineScope RunOutcome(
+                            displayResult = DisplayResult.DirectBitmap(activeBitmap),
+                            retainedBitmap = activeBitmap,
+                        )
+                    }
+                    val fallbackSrc = when {
                         coloredBytes != null -> Buffer().write(coloredBytes)
                         activeBitmap != null -> Buffer().write(encode(activeBitmap, activeBitmap.hasAlpha()))
                         else -> Buffer().write(bytes)
                     }
+                    return@coroutineScope RunOutcome(DisplayResult.Source(fallbackSrc))
                 } finally {
-                    coloredBitmap?.recycle()
+                    if (coloredBitmap != null && coloredBitmap !== retainedBitmapForCaller) {
+                        coloredBitmap.recycle()
+                    }
                 }
             } finally {
-                if (ownsCurrentBitmap) {
+                if (ownsCurrentBitmap && currentBitmap != null && currentBitmap !== retainedBitmapForCaller) {
                     currentBitmap?.recycle()
                 }
             }
@@ -614,14 +686,15 @@ object PageColorizer {
         return output
     }
 
-    private fun drawTranslationFromBitmap(
+    private fun drawTranslationOutcome(
         context: Context,
         config: TranslationConfig,
         translatedPage: PageTranslation,
         targetBitmap: Bitmap?,
         fallbackBytes: ByteArray,
         finalName: String,
-    ): BufferedSource? {
+        retainBitmapForDisplay: Boolean,
+    ): RunOutcome? {
         val decodedFallback = if (targetBitmap == null || targetBitmap.isRecycled) {
             logStep("5a.decodeTarget") { decode(fallbackBytes) } ?: return null
         } else {
@@ -629,19 +702,41 @@ object PageColorizer {
         }
         val target = targetBitmap ?: decodedFallback!!
         var drawn: Bitmap? = null
+        var retained: Bitmap? = null
         try {
             val result = logStep("5b.renderer.render(blocks=${translatedPage.blocks.size})") {
                 PageTranslationRenderer.render(target, translatedPage, config.font.typeface(context))
             }
             if (result !== target) drawn = result
-            val encoded = logStep("5c.encodeTranslated") { encode(result, target.hasAlpha()) }
-            logStep("5d.saveFinalCache(name=$finalName)") {
-                runCatching { saveCachedPage(cacheFile(context, finalName), encoded) }
+
+            val appContext = context.applicationContext
+            val hasAlpha = target.hasAlpha()
+            val cacheTarget = cacheFile(appContext, finalName)
+            ioScope.launch {
+                runCatching {
+                    if (!result.isRecycled) {
+                        saveCachedPage(cacheTarget, encode(result, hasAlpha))
+                    }
+                }
             }
-            return Buffer().write(encoded)
+
+            if (retainBitmapForDisplay && !result.isRecycled) {
+                retained = result
+                return RunOutcome(
+                    displayResult = DisplayResult.DirectBitmap(result),
+                    retainedBitmap = result,
+                )
+            }
+
+            val encoded = logStep("5c.encodeTranslated") { encode(result, hasAlpha) }
+            return RunOutcome(DisplayResult.Source(Buffer().write(encoded)))
         } finally {
-            drawn?.recycle()
-            decodedFallback?.recycle()
+            if (drawn != null && drawn !== retained) {
+                drawn.recycle()
+            }
+            if (decodedFallback != null && decodedFallback !== retained) {
+                decodedFallback.recycle()
+            }
         }
     }
 
