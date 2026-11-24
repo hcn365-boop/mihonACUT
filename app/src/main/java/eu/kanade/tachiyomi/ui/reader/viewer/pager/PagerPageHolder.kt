@@ -1,14 +1,16 @@
 package eu.kanade.tachiyomi.ui.reader.viewer.pager
 
-import eu.kanade.tachiyomi.ui.reader.colorize.AiPrefetcher
-import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.drawable.Drawable
 import android.view.LayoutInflater
 import androidx.core.view.isVisible
 import eu.kanade.presentation.util.formattedMessage
 import eu.kanade.tachiyomi.databinding.ReaderErrorBinding
 import eu.kanade.tachiyomi.source.model.Page
+import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
+import eu.kanade.tachiyomi.ui.reader.colorize.AiPrefetcher
 import eu.kanade.tachiyomi.ui.reader.colorize.PageColorizer
 import eu.kanade.tachiyomi.ui.reader.model.InsertPage
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
@@ -140,6 +142,11 @@ class PagerPageHolder(
         removeErrorLayout()
     }
 
+    private sealed interface PreparedImage {
+        class DirectBitmap(val bitmap: Bitmap, val background: Drawable?) : PreparedImage
+        class Source(val source: BufferedSource, val isAnimated: Boolean, val background: Drawable?) : PreparedImage
+    }
+
     /**
      * Called when the page is ready.
      */
@@ -149,35 +156,73 @@ class PagerPageHolder(
         val streamFn = page.stream ?: return
 
         try {
-            val (source, isAnimated, background) = withIOContext {
-                val source = streamFn().use { stream ->
-                    val original = Buffer().readFrom(stream)
-                    val colored = if (AiConfig.anyEnabled) PageColorizer.process(context, original) else original
-                    process(page, colored)
-                }
-                val isAnimated = ImageUtil.isAnimatedAndSupported(source)
-                val background = if (!isAnimated && viewer.config.automaticBackground) {
-                    ImageUtil.chooseBackground(context, source.peek().inputStream())
+            val prepared = withIOContext {
+                val canUseDirectBitmap = AiConfig.anyEnabled &&
+                    !viewer.config.dualPageRotateToFit &&
+                    !viewer.config.dualPageSplit
+
+                val colorizerResult: PageColorizer.DisplayResult? = if (AiConfig.anyEnabled) {
+                    streamFn().use { stream ->
+                        val original = Buffer().readFrom(stream)
+                        PageColorizer.processForDisplay(context, original)
+                    }
                 } else {
                     null
                 }
-                Triple(source, isAnimated, background)
+
+                if (canUseDirectBitmap && colorizerResult is PageColorizer.DisplayResult.DirectBitmap) {
+                    val bmp = colorizerResult.bitmap
+                    if (!bmp.isRecycled) {
+                        return@withIOContext PreparedImage.DirectBitmap(bmp, background = null)
+                    }
+                }
+
+                val baseSource: BufferedSource = when (colorizerResult) {
+                    is PageColorizer.DisplayResult.Source -> colorizerResult.source
+                    is PageColorizer.DisplayResult.DirectBitmap -> {
+                        streamFn().use { stream ->
+                            Buffer().readFrom(stream)
+                        }
+                    }
+                    null -> {
+                        streamFn().use { stream ->
+                            Buffer().readFrom(stream)
+                        }
+                    }
+                }
+
+                val finalSource = process(page, baseSource)
+                val isAnimated = ImageUtil.isAnimatedAndSupported(finalSource)
+                val background = if (!isAnimated && viewer.config.automaticBackground) {
+                    ImageUtil.chooseBackground(context, finalSource.peek().inputStream())
+                } else {
+                    null
+                }
+                PreparedImage.Source(finalSource, isAnimated, background)
             }
+
             AiPrefetcher.onPageShown(context, page)
             withUIContext {
-                setImage(
-                    source,
-                    isAnimated,
-                    Config(
-                        zoomDuration = viewer.config.doubleTapAnimDuration,
-                        minimumScaleType = viewer.config.imageScaleType,
-                        cropBorders = viewer.config.imageCropBorders,
-                        zoomStartPosition = viewer.config.imageZoomType,
-                        landscapeZoom = viewer.config.landscapeZoom,
-                    ),
+                val imageConfig = Config(
+                    zoomDuration = viewer.config.doubleTapAnimDuration,
+                    minimumScaleType = viewer.config.imageScaleType,
+                    cropBorders = viewer.config.imageCropBorders,
+                    zoomStartPosition = viewer.config.imageZoomType,
+                    landscapeZoom = viewer.config.landscapeZoom,
                 )
-                if (!isAnimated) {
-                    pageBackground = background
+                when (prepared) {
+                    is PreparedImage.DirectBitmap -> {
+                        setImage(prepared.bitmap, imageConfig)
+                        if (prepared.background != null) {
+                            pageBackground = prepared.background
+                        }
+                    }
+                    is PreparedImage.Source -> {
+                        setImage(prepared.source, prepared.isAnimated, imageConfig)
+                        if (!prepared.isAnimated) {
+                            pageBackground = prepared.background
+                        }
+                    }
                 }
                 removeErrorLayout()
             }
