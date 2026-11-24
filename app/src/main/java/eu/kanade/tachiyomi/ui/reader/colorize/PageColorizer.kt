@@ -418,7 +418,7 @@ object PageColorizer {
                         }
                         val src = when {
                             coloredBytes != null -> Buffer().write(coloredBytes)
-                            activeBitmap != null -> Buffer().write(encode(activeBitmap, activeBitmap.hasAlpha()))
+                            activeBitmap != null -> Buffer().write(encode(activeBitmap, activeBitmap.hasAlpha(), "direct_no_tx"))
                             else -> null
                         }
                         return@coroutineScope RunOutcome(src?.let { DisplayResult.Source(it) })
@@ -438,7 +438,7 @@ object PageColorizer {
                         }
                         val src = when {
                             coloredBytes != null -> Buffer().write(coloredBytes)
-                            activeBitmap != null -> Buffer().write(encode(activeBitmap, activeBitmap.hasAlpha()))
+                            activeBitmap != null -> Buffer().write(encode(activeBitmap, activeBitmap.hasAlpha(), "tx_null"))
                             else -> Buffer().write(bytes)
                         }
                         return@coroutineScope RunOutcome(DisplayResult.Source(src))
@@ -469,7 +469,7 @@ object PageColorizer {
                     }
                     val fallbackSrc = when {
                         coloredBytes != null -> Buffer().write(coloredBytes)
-                        activeBitmap != null -> Buffer().write(encode(activeBitmap, activeBitmap.hasAlpha()))
+                        activeBitmap != null -> Buffer().write(encode(activeBitmap, activeBitmap.hasAlpha(), "tx_fallback"))
                         else -> Buffer().write(bytes)
                     }
                     return@coroutineScope RunOutcome(DisplayResult.Source(fallbackSrc))
@@ -645,7 +645,9 @@ object PageColorizer {
             throw e
         }
 
-        val encoded = logStep("3j.encodeColored(hash=$imageHash)") { encode(processed, sourceBitmap.hasAlpha()) }
+        val encoded = logStep("3j.encodeColored(hash=$imageHash)") {
+            encode(processed, sourceBitmap.hasAlpha(), "colorizeOnly")
+        }
         logStep("3k.saveColorCache(name=$baseName)") {
             runCatching { saveCachedPage(file, encoded) }
         }
@@ -715,7 +717,8 @@ object PageColorizer {
             ioScope.launch {
                 runCatching {
                     if (!result.isRecycled) {
-                        saveCachedPage(cacheTarget, encode(result, hasAlpha))
+                        val bytes = encode(result, hasAlpha, "cacheFinalAsync")
+                        saveCachedPage(cacheTarget, bytes)
                     }
                 }
             }
@@ -728,7 +731,7 @@ object PageColorizer {
                 )
             }
 
-            val encoded = logStep("5c.encodeTranslated") { encode(result, hasAlpha) }
+            val encoded = logStep("5c.encodeTranslated") { encode(result, hasAlpha, "drawTranslation") }
             return RunOutcome(DisplayResult.Source(Buffer().write(encoded)))
         } finally {
             if (drawn != null && drawn !== retained) {
@@ -783,11 +786,16 @@ object PageColorizer {
 
     private fun decode(bytes: ByteArray): Bitmap? = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 
-    private fun encode(bitmap: Bitmap, hasAlpha: Boolean): ByteArray {
+    private fun encode(bitmap: Bitmap, hasAlpha: Boolean, tag: String = "encode"): ByteArray {
+        val startMs = SystemClock.elapsedRealtime()
         val format = if (hasAlpha) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
         val output = ByteArrayOutputStream()
         bitmap.compress(format, JPEG_QUALITY, output)
-        return output.toByteArray()
+        val bytes = output.toByteArray()
+        logcat(LogPriority.DEBUG) {
+            "[Perf] encode($tag, ${bitmap.width}x${bitmap.height}, fmt=$format) took ${SystemClock.elapsedRealtime() - startMs}ms (${bytes.size / 1024} KB)"
+        }
+        return bytes
     }
 
     @Volatile
