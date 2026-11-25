@@ -2,6 +2,7 @@ package eu.kanade.translation
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
@@ -13,6 +14,7 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 import logcat.LogPriority
@@ -47,7 +49,7 @@ class PageTextExtractor(
         val paddingFactor = AiConfig.translateCollisionPadding
         val page = PageTranslation(imgWidth = bitmap.width.toFloat(), imgHeight = bitmap.height.toFloat())
 
-        // تحديد ما إذا كان الوضع الحالي هو Hybrid لزيادة معامل السماحية للدمج
+        // تحديد ما إذا كان الوضع الحالي هو Hybrid لزيادة معامل السماحية للدمج وتعطيل حل التصادمات[span_2](start_span)[span_2](end_span)
         val isHybridMode = (mode == OcrMode.HYBRID)
 
         when (mode) {
@@ -59,7 +61,7 @@ class PageTextExtractor(
                     imgWidth = bitmap.width.toFloat(),
                     imgHeight = bitmap.height.toFloat(),
                     collisionPaddingFactor = paddingFactor,
-                    isHybrid = isHybridMode,
+                    isHybrid = false,
                 )
             }
             OcrMode.PADDLE -> {
@@ -70,66 +72,108 @@ class PageTextExtractor(
                     imgWidth = bitmap.width.toFloat(),
                     imgHeight = bitmap.height.toFloat(),
                     collisionPaddingFactor = paddingFactor,
-                    isHybrid = isHybridMode,
+                    isHybrid = false,
                 )
             }
             OcrMode.HYBRID -> {
+                // 1. تشغيل ML Kit ودمج الكتل بدون حل التصادمات حتى تبقى أماكنها كما هي[span_3](start_span)[span_3](end_span)
+                val mlBoxes = mlKitBoxes(image)
+                if (mlBoxes.isEmpty()) return null
+
+                val mergedMlBlocks = TextBlockMerger.merge(
+                    blocks = mlBoxes.map { it.toBlock() },
+                    imgWidth = bitmap.width.toFloat(),
+                    imgHeight = bitmap.height.toFloat(),
+                    collisionPaddingFactor = paddingFactor,
+                    isHybrid = isHybridMode,
+                )
+                if (mergedMlBlocks.isEmpty()) return null
+
+                // 2. إرسال الكتل المدمجة (بمكانها الأصلي) إلى Hybrid/Paddle بعد قص كل منطقة[span_4](start_span)[span_4](end_span)
                 val ctx = context
                 if (ctx != null) {
+                    val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
                     try {
-                        val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
-                        val hybridResults = hybridRecognizer.recognizeWithBoxes(image)
-                        hybridRecognizer.close()
-
-                        if (hybridResults.isEmpty()) return null
-
-                        val rawTranslationBlocks = hybridResults.map { result ->
-                            TranslationBlock(
-                                text = result.text,
-                                width = result.box.width.toFloat(),
-                                height = result.box.height.toFloat(),
-                                symWidth = result.box.symWidth,
-                                symHeight = result.box.symHeight,
-                                angle = result.box.angle,
-                                x = result.box.x.toFloat(),
-                                y = result.box.y.toFloat(),
+                        page.blocks = mergedMlBlocks.mapNotNull { block ->
+                            val recognizedText = recognizeBlockCrop(
+                                bitmap = bitmap,
+                                block = block,
+                                recognizeCrop = { cropImage -> hybridRecognizer.recognize(cropImage) },
                             )
-                        }
-
-                        page.blocks = TextBlockMerger.merge(
-                            blocks = rawTranslationBlocks,
-                            imgWidth = bitmap.width.toFloat(),
-                            imgHeight = bitmap.height.toFloat(),
-                            collisionPaddingFactor = paddingFactor,
-                            isHybrid = isHybridMode,
-                        )
+                            if (recognizedText.isNotBlank()) {
+                                block.copy(text = recognizedText.trim())
+                            } else {
+                                null
+                            }
+                        }.toMutableList()
                     } catch (e: Exception) {
-                        logcat(LogPriority.ERROR, e) { "Hybrid processing failed, falling back to ML Kit" }
-                        val boxes = mlKitBoxes(image)
-                        if (boxes.isEmpty()) return null
-                        page.blocks = TextBlockMerger.merge(
-                            blocks = boxes.map { it.toBlock() },
-                            imgWidth = bitmap.width.toFloat(),
-                            imgHeight = bitmap.height.toFloat(),
-                            collisionPaddingFactor = paddingFactor,
-                            isHybrid = isHybridMode,
-                        )
+                        logcat(LogPriority.ERROR, e) { "Hybrid processing failed, falling back to ML Kit merged blocks" }
+                        page.blocks = mergedMlBlocks
+                    } finally {
+                        hybridRecognizer.close()
                     }
                 } else {
-                    val boxes = mlKitBoxes(image)
-                    if (boxes.isEmpty()) return null
-                    page.blocks = TextBlockMerger.merge(
-                        blocks = boxes.map { it.toBlock() },
-                        imgWidth = bitmap.width.toFloat(),
-                        imgHeight = bitmap.height.toFloat(),
-                        collisionPaddingFactor = paddingFactor,
-                        isHybrid = isHybridMode,
-                    )
+                    page.blocks = mergedMlBlocks.mapNotNull { block ->
+                        val recognizedText = recognizeBlockCrop(
+                            bitmap = bitmap,
+                            block = block,
+                            recognizeCrop = { cropImage ->
+                                paddleBoxes(cropImage).joinToString("\n") { it.text.trim() }
+                            },
+                        )
+                        if (recognizedText.isNotBlank()) {
+                            block.copy(text = recognizedText.trim())
+                        } else {
+                            null
+                        }
+                    }.toMutableList()
                 }
             }
         }
 
         return page.takeIf { it.blocks.isNotEmpty() }
+    }
+
+    private suspend fun recognizeBlockCrop(
+        bitmap: Bitmap,
+        block: TranslationBlock,
+        recognizeCrop: suspend (InputImage) -> String,
+    ): String {
+        val startX = max(0, block.x.roundToInt())
+        val startY = max(0, block.y.roundToInt())
+        val endX = min(bitmap.width, (block.x + block.width).roundToInt())
+        val endY = min(bitmap.height, (block.y + block.height).roundToInt())
+
+        val cropW = endX - startX
+        val cropH = endY - startY
+        if (cropW < 4 || cropH < 4) return block.text
+
+        var cropped: Bitmap? = null
+        var rotated: Bitmap? = null
+        return try {
+            cropped = Bitmap.createBitmap(bitmap, startX, startY, cropW, cropH)
+            rotated = if (abs(block.angle) > 1f) {
+                val matrix = Matrix().apply {
+                    postRotate(-block.angle, cropW / 2f, cropH / 2f)
+                }
+                Bitmap.createBitmap(cropped, 0, 0, cropW, cropH, matrix, true)
+            } else {
+                cropped
+            }
+
+            val cropInput = InputImage.fromBitmap(rotated, 0)
+            recognizeCrop(cropInput)
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e) { "Failed to crop/recognize merged block at (${block.x}, ${block.y})" }
+            block.text
+        } finally {
+            if (rotated != null && rotated !== cropped && !rotated.isRecycled) {
+                rotated.recycle()
+            }
+            if (cropped != null && !cropped.isRecycled) {
+                cropped.recycle()
+            }
+        }
     }
 
     private suspend fun mlKitBoxes(image: InputImage): List<OcrBox> {
@@ -216,7 +260,7 @@ internal object TextBlockMerger {
 
                 for (j in i + 1 until currentBlocks.size) {
                     if (visited[j]) continue
-                    // تمرير مؤشر الـ Hybrid لدالة الفحص والدمج
+                    // تمرير مؤشر الـ Hybrid لدالة الفحص والدمج[span_5](start_span)[span_5](end_span)
                     if (shouldMergeTextBlock(currentMerged, currentBlocks[j], isHybrid)) {
                         currentMerged = mergeTextBlock(currentMerged, currentBlocks[j], isWebtoon)
                         visited[j] = true
@@ -265,7 +309,10 @@ internal object TextBlockMerger {
             )
         }.toMutableList()
 
-        resolveCollisions(expandedBlocks, imgWidth, imgHeight)
+        // إيقاف حل التصادمات في وضع Hybrid للحفاظ على مواقع الفقاعات الأصلية[span_6](start_span)[span_6](end_span)
+        if (!isHybrid) {
+            resolveCollisions(expandedBlocks, imgWidth, imgHeight)
+        }
         return expandedBlocks
     }
 
@@ -291,13 +338,13 @@ internal object TextBlockMerger {
 
                     val areaA = max(1f, a.width * a.height)
                     val areaB = max(1f, b.width * b.height)
-                    // الكتلة الأصغر تتحمل نسبة أكبر من الإزاحة، والكتلة الأكبر تتحمل نسبة أقل.
+                    // الكتلة الأصغر تتحمل نسبة أكبر من الإزاحة، والكتلة الأكبر تتحمل نسبة أقل[span_7](start_span)[span_7](end_span)
                     val invA = 1f / areaA
                     val invB = 1f / areaB
                     val shareA = (invA / (invA + invB)).coerceIn(0.2f, 0.8f)
                     val shareB = 1f - shareA
 
-                    val candidates = buildSeparationCandidates(a, b, shareA, shareB, imgWidth, imgHeight)
+                    val candidates = buildSeparationCandidates(a, b, shareA, shareB, imgWidth, imgHeight, blocks)
                     val best = candidates.minWithOrNull(
                         compareBy<PairMoveCandidate> { it.otherCollisions }
                             .thenBy { it.totalDisplacement },
@@ -308,7 +355,7 @@ internal object TextBlockMerger {
                         blocks[j] = b.copy(x = best.bx, y = best.by)
                     }
 
-                    // إذا ظل التصادم قائماً بين a و b (مثلاً بسبب حدود الصورة أو تكدس الكتل)، نقلص حجم الأصغر تدريجياً.
+                    // إذا ظل التصادم قائماً بين a و b (مثلاً بسبب حدود الصورة أو تكدس الكتل)، نقلص حجم الأصغر تدريجياً[span_8](start_span)[span_8](end_span)
                     if (isOverlapping(blocks[i], blocks[j])) {
                         val smallerIdx = if (areaA <= areaB) i else j
                         val smaller = blocks[smallerIdx]
@@ -344,19 +391,19 @@ internal object TextBlockMerger {
         val cxB = b.x + b.width / 2f
         val cyB = b.y + b.height / 2f
 
-        // مقدار التداخل الأفقي والعمودي بين الكتلتين
+        // مقدار التداخل الأفقي والعمودي بين الكتلتين[span_9](start_span)[span_9](end_span)
         val overlapX = max(0f, min(a.x + a.width, b.x + b.width) - max(a.x, b.x))
         val overlapY = max(0f, min(a.y + a.height, b.y + b.height) - max(a.y, b.y))
 
-        // اتجاه الفصل الأساسي يبعد المراكز عن بعضهما (لا يقربهما أبداً)
+        // اتجاه الفصل الأساسي يبعد المراكز عن بعضهما (لا يقربهما أبداً)[span_10](start_span)[span_10](end_span)
         val signX = when {
-            cxA < cxB -> -1f // a يسار b -> a يذهب لليسار و b يذهب لليمين
-            cxA > cxB -> 1f  // a يمين b -> a يذهب لليمين و b يذهب لليسار
+            cxA < cxB -> -1f
+            cxA > cxB -> 1f
             else -> if (a.x <= b.x) -1f else 1f
         }
         val signY = when {
-            cyA < cyB -> -1f // a أعلى b -> a يذهب للأعلى و b يذهب للأسفل
-            cyA > cyB -> 1f  // a أسفل b -> a يذهب للأسفل و b يذهب للأعلى
+            cyA < cyB -> -1f
+            cyA > cyB -> 1f
             else -> if (a.y <= b.y) -1f else 1f
         }
 
@@ -376,22 +423,15 @@ internal object TextBlockMerger {
         }
 
         if (preferHorizontal) {
-            // فصل أفقي موزع بين الكتلتين
             addPair(signX * sepX * shareA, 0f, -signX * sepX * shareB, 0f)
-            // فصل عمودي موزع كبديل
             addPair(0f, signY * sepY * shareA, 0f, -signY * sepY * shareB)
-            // فصل قطري موزع
             addPair(signX * sepX * shareA * 0.7f, signY * sepY * shareA * 0.7f, -signX * sepX * shareB * 0.7f, -signY * sepY * shareB * 0.7f)
         } else {
-            // فصل عمودي موزع بين الكتلتين
             addPair(0f, signY * sepY * shareA, 0f, -signY * sepY * shareB)
-            // فصل أفقي موزع كبديل
             addPair(signX * sepX * shareA, 0f, -signX * sepX * shareB, 0f)
-            // فصل قطري موزع
             addPair(signX * sepX * shareA * 0.7f, signY * sepY * shareA * 0.7f, -signX * sepX * shareB * 0.7f, -signY * sepY * shareB * 0.7f)
         }
 
-        // إذا كانت إحدى الكتلتين مائلة، نضيف فصلاً على محور زاويتها مع إبعاد المراكز
         val avgAngle = (a.angle + b.angle) / 2f
         if (abs(avgAngle) > 20f && abs(avgAngle) < 160f) {
             val rad = Math.toRadians(avgAngle.toDouble())
@@ -494,10 +534,10 @@ internal object TextBlockMerger {
         val sH = max(r1.symHeight, max(r2.symHeight, 12f))
         val sW = max(r1.symWidth, max(r2.symWidth, 12f))
 
-        // زيادة معاملات السماحية للمسافات (الفجوات) إذا كان وضع الـ Hybrid مفعلاً
+        // زيادة معاملات السماحية للمسافات (الفجوات) إذا كان وضع الـ Hybrid مفعلاً[span_11](start_span)[span_11](end_span)
         val gapMultiplier = 1.2f
-        val maxAllowedGapX = sW * gapMultiplier // المسافة الأفقية تبقى طبيعية
-        val maxAllowedGapY = if (isHybrid) sH * 1.5f else sH * gapMultiplier // زيادة المسافة العمودية فقط عند تفعيل Hybrid
+        val maxAllowedGapX = sW * gapMultiplier
+        val maxAllowedGapY = if (isHybrid) sH * 1.5f else sH * gapMultiplier
 
         val yOverlap = max(0f, min(r1Bottom, r2Bottom) - max(r1.y, r2.y))
         val xOverlap = max(0f, min(r1Right, r2Right) - max(r1.x, r2.x))
