@@ -11,15 +11,20 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.unit.dp
+import cafe.adriel.voyager.navigator.LocalNavigator
+import cafe.adriel.voyager.navigator.currentOrThrow
 import eu.kanade.presentation.components.AppBar
 import eu.kanade.presentation.components.AppBarActions
 import eu.kanade.presentation.components.AppBarTitle
 import eu.kanade.presentation.components.DownloadDropdownMenu
 import eu.kanade.presentation.manga.DownloadAction
+import eu.kanade.presentation.more.settings.screen.AiSettingsNav
+import eu.kanade.presentation.more.settings.screen.SettingsAiScreen
 import mihon.icons.materialsymbols.MaterialSymbols
 import mihon.icons.materialsymbols.rounded.Download
 import mihon.icons.materialsymbols.rounded.FilterList
 import mihon.icons.materialsymbols.rounded.FlipToBack
+import mihon.icons.materialsymbols.rounded.Palette
 import mihon.icons.materialsymbols.rounded.SelectAll
 import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.i18n.stringResource
@@ -48,6 +53,7 @@ fun MangaToolbar(
     backgroundAlphaProvider: () -> Float,
     modifier: Modifier = Modifier,
 ) {
+    val navigator = LocalNavigator.currentOrThrow
     val isActionMode = actionModeCounter > 0
     AppBar(
         titleContent = {
@@ -108,6 +114,16 @@ fun MangaToolbar(
                             icon = MaterialSymbols.Rounded.FilterList,
                             iconTint = filterTint,
                             onClick = onClickFilter,
+                        ),
+                    )
+                    add(
+                        AppBar.Action(
+                            title = "Batch translation settings",
+                            icon = MaterialSymbols.Rounded.Palette,
+                            onClick = {
+                                AiSettingsNav.initialTab = AiSettingsNav.BATCH
+                                navigator.push(SettingsAiScreen)
+                            },
                         ),
                     )
                     add(
