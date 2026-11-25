@@ -305,15 +305,18 @@ object PostProcessManager {
                     )
                 }
                 if (translated.isNotEmpty()) {
+                    // The copies the reader draws from go to the app's storage in one transaction, in every case.
+                    TranslationStore.saveAll(
+                        context,
+                        TranslationStore.Kind.TRANSLATED,
+                        translated.mapKeys { PostRead.translationName(it.key) },
+                    )
                     if (inFolder) {
-                        val file = PostTranslationFiles.writeChapter(chapterDir, translated)
+                        // And the chapter file: the rows of all its pages (text, language and these copies).
+                        val hashes = records.flatMap { listOf(it.originalHash, it.readHash) }.distinct()
+                        val rows = TranslationStore.exportForHashes(context, hashes)
+                        val file = PostTranslationFiles.writeRows(chapterDir, rows)
                         PostProcessStore.setChapterTranslationUri(context, request.chapterId, file.uri.toString())
-                    } else {
-                        TranslationStore.saveAll(
-                            context,
-                            TranslationStore.Kind.TRANSLATED,
-                            translated.mapKeys { PostRead.translationName(it.key) },
-                        )
                     }
                 }
             }
