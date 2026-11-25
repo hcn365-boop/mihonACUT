@@ -12,6 +12,7 @@ import okio.Buffer
 import okio.BufferedSource
 import tachiyomi.core.common.util.system.logcat
 import java.io.ByteArrayOutputStream
+import java.io.File
 
 /**
  * What the reader shows for a page that batch processing handled. The processed image has no text; the
@@ -47,23 +48,63 @@ object PostRead {
             // goes to the app's storage in one transaction. Reading it again for each page would be slow.
             val uri = PostProcessStore.translationUriForPage(context, originalHash)
             if (uri != null && imported.add(uri)) {
-                val all = PostTranslationFiles.readChapter(context, uri)
-                if (all != null) {
-                    TranslationStore.saveAll(
-                        context,
-                        TranslationStore.Kind.TRANSLATED,
-                        all.mapKeys { translationName(it.key) },
-                    )
-                    saved = all[originalHash]
+                val rows = PostTranslationFiles.readRows(context, uri)
+                if (rows != null) {
+                    TranslationStore.importRows(context, rows)
+                    saved = TranslationStore.load(context, TranslationStore.Kind.TRANSLATED, name)
                 }
             }
         }
         val translation = saved?.takeIf { it.blocks.isNotEmpty() }
 
         if (translation == null) return processed?.let { Buffer().write(it) }
-        val drawn = drawOn(context, processed ?: original, translation)
+
+        // Drawing means decoding a big image, drawing the text and encoding it again: far too slow to repeat
+        // every time the page appears. The result is kept, and a new key is made whenever the translation, the
+        // image, the font or the padding changes.
+        val base = processed ?: original
+        val font = AiConfig.translation?.font ?: TranslationFont.SYSTEM
+        val key = buildString {
+            append(originalHash)
+            append('_').append(base.size)
+            append('_').append(translation.blocks.size)
+            append('_').append(translation.blocks.joinToString("|") { it.translation }.hashCode())
+            append('_').append(font.name)
+            append('_').append((AiConfig.translateCollisionPadding * 100).toInt())
+        }
+        readCached(context, key)?.let { return Buffer().write(it) }
+
+        val drawn = drawOn(context, base, translation)
             ?: return processed?.let { Buffer().write(it) }
+        saveCached(context, key, drawn)
         return Buffer().write(drawn)
+    }
+
+    private fun cacheDir(context: Context): File = File(context.cacheDir, "post_read")
+
+    private fun readCached(context: Context, key: String): ByteArray? {
+        val file = File(cacheDir(context), key)
+        if (!file.isFile || file.length() == 0L) return null
+        file.setLastModified(System.currentTimeMillis())
+        return file.readBytes()
+    }
+
+    private fun saveCached(context: Context, key: String, bytes: ByteArray) {
+        runCatching {
+            val dir = cacheDir(context)
+            dir.mkdirs()
+            val temp = File(dir, "$key.${System.nanoTime()}.tmp")
+            temp.writeBytes(bytes)
+            temp.renameTo(File(dir, key))
+            // The oldest pages go first once the folder is bigger than the cache size of the settings.
+            val files = dir.listFiles()?.filter { !it.name.endsWith(".tmp") }?.sortedBy { it.lastModified() } ?: return
+            var total = files.sumOf { it.length() }
+            for (file in files) {
+                if (total <= AiConfig.cacheBytes) break
+                total -= file.length()
+                file.delete()
+            }
+        }
     }
 
     /** Draws the translation on the image, or returns null if that cannot be done. */
