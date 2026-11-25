@@ -6,8 +6,8 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
 import eu.kanade.translation.model.PageTranslation
-import kotlinx.serialization.json.Json
 import java.security.MessageDigest
+import kotlinx.serialization.json.Json
 
 /**
  * Keeps what was read and translated from each page, in one SQLite database in the app's private
@@ -144,10 +144,11 @@ object TranslationStore {
         db.beginTransaction()
         try {
             for (hash in hashes) {
+                val escaped = escapeLike(hash)
                 deleted += db.delete(
                     TABLE,
                     "name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\'",
-                    arrayOf("${escapeLike(hash)}%", "post_${escapeLike(hash)}%"),
+                    arrayOf("$escaped%", "post_$escaped%"),
                 )
             }
             db.setTransactionSuccessful()
@@ -167,6 +168,50 @@ object TranslationStore {
      */
     fun deleteForManga(context: Context, mangaId: Long): Int =
         database(context).delete(TABLE, "manga = ?", arrayOf(mangaId.toString()))
+
+    /**
+     * Every saved row of the pages with these fingerprints (their text, their language and the batch copies),
+     * as "kind|name" to the stored text. It is what is written next to a chapter.
+     */
+    fun exportForHashes(context: Context, hashes: Collection<String>): Map<String, String> {
+        val rows = LinkedHashMap<String, String>()
+        if (hashes.isEmpty()) return rows
+        val db = database(context)
+        for (hash in hashes) {
+            val escaped = escapeLike(hash)
+            db.rawQuery(
+                "SELECT name, kind, data FROM $TABLE WHERE name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\'",
+                arrayOf("$escaped%", "post_$escaped%"),
+            ).use { cursor ->
+                while (cursor.moveToNext()) rows["${cursor.getInt(1)}|${cursor.getString(0)}"] = cursor.getString(2)
+            }
+        }
+        return rows
+    }
+
+    /** Adds rows made by [exportForHashes], in one transaction. A row already here is kept: it is newer. */
+    fun importRows(context: Context, rows: Map<String, String>, manga: Long = AiConfig.mangaId) {
+        if (rows.isEmpty()) return
+        val db = database(context)
+        db.beginTransaction()
+        try {
+            val now = System.currentTimeMillis()
+            val values = ContentValues()
+            for ((key, data) in rows) {
+                val kind = key.substringBefore('|').toIntOrNull() ?: continue
+                values.clear()
+                values.put("name", key.substringAfter('|'))
+                values.put("kind", kind)
+                values.put("manga", manga)
+                values.put("data", data)
+                values.put("updated", now)
+                db.insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_IGNORE)
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
 
     /** Deletes everything of one kind, or of both kinds when [kind] is null. */
     fun clear(context: Context, kind: Kind? = null) {
