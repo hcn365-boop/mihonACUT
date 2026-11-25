@@ -20,6 +20,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import cafe.adriel.voyager.navigator.LocalNavigator
 import cafe.adriel.voyager.navigator.currentOrThrow
 import eu.kanade.presentation.components.AppBar
 import eu.kanade.presentation.reader.settings.BatchSettings
@@ -46,12 +47,13 @@ object SettingsAiScreen : Screen() {
 
     @Composable
     override fun Content() {
-        val backPress = LocalBackPress.currentOrThrow
+        val navigator = LocalNavigator.currentOrThrow
+        val backPress = LocalBackPress.current ?: navigator::pop
         val context = LocalContext.current
         val prefs = remember { AiPrefs(context.appGraph.readerPreferences, null) }
         val base = remember { context.appGraph.readerPreferences }
         val topBarState = rememberTopAppBarState()
-        var selected by remember { mutableIntStateOf(0) }
+        var selected by remember { mutableIntStateOf(AiSettingsNav.takeInitialTab()) }
         var confirmReset by remember { mutableStateOf(false) }
 
         Scaffold(
