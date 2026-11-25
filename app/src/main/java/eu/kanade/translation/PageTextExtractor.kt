@@ -49,7 +49,7 @@ class PageTextExtractor(
         val paddingFactor = AiConfig.translateCollisionPadding
         val page = PageTranslation(imgWidth = bitmap.width.toFloat(), imgHeight = bitmap.height.toFloat())
 
-        // تحديد ما إذا كان الوضع الحالي هو Hybrid لزيادة معامل السماحية للدمج وتعطيل حل التصادمات[span_2](start_span)[span_2](end_span)
+        // تحديد ما إذا كان الوضع الحالي هو Hybrid لزيادة معامل السماحية للدمج وتأجيل حل التصادمات إلى ما بعد القص[span_1](start_span)[span_1](end_span)
         val isHybridMode = (mode == OcrMode.HYBRID)
 
         when (mode) {
@@ -62,6 +62,7 @@ class PageTextExtractor(
                     imgHeight = bitmap.height.toFloat(),
                     collisionPaddingFactor = paddingFactor,
                     isHybrid = false,
+                    resolveCollisionsEnabled = true,
                 )
             }
             OcrMode.PADDLE -> {
@@ -73,10 +74,11 @@ class PageTextExtractor(
                     imgHeight = bitmap.height.toFloat(),
                     collisionPaddingFactor = paddingFactor,
                     isHybrid = false,
+                    resolveCollisionsEnabled = true,
                 )
             }
             OcrMode.HYBRID -> {
-                // 1. تشغيل ML Kit ودمج الكتل بدون حل التصادمات حتى تبقى أماكنها كما هي[span_3](start_span)[span_3](end_span)
+                // 1. تشغيل ML Kit ودمج الكتل بدون حل التصادمات حتى تبقى أماكنها كما هي أثناء القص[span_2](start_span)[span_2](end_span)
                 val mlBoxes = mlKitBoxes(image)
                 if (mlBoxes.isEmpty()) return null
 
@@ -86,15 +88,16 @@ class PageTextExtractor(
                     imgHeight = bitmap.height.toFloat(),
                     collisionPaddingFactor = paddingFactor,
                     isHybrid = isHybridMode,
+                    resolveCollisionsEnabled = false,
                 )
                 if (mergedMlBlocks.isEmpty()) return null
 
-                // 2. إرسال الكتل المدمجة (بمكانها الأصلي) إلى Hybrid/Paddle بعد قص كل منطقة[span_4](start_span)[span_4](end_span)
+                // 2. إرسال الكتل المدمجة (بمكانها الأصلي) إلى Hybrid/Paddle بعد قص كل منطقة[span_3](start_span)[span_3](end_span)
                 val ctx = context
-                if (ctx != null) {
+                val recognizedBlocks = if (ctx != null) {
                     val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
                     try {
-                        page.blocks = mergedMlBlocks.mapNotNull { block ->
+                        mergedMlBlocks.mapNotNull { block ->
                             val recognizedText = recognizeBlockCrop(
                                 bitmap = bitmap,
                                 block = block,
@@ -108,12 +111,12 @@ class PageTextExtractor(
                         }.toMutableList()
                     } catch (e: Exception) {
                         logcat(LogPriority.ERROR, e) { "Hybrid processing failed, falling back to ML Kit merged blocks" }
-                        page.blocks = mergedMlBlocks
+                        mergedMlBlocks
                     } finally {
                         hybridRecognizer.close()
                     }
                 } else {
-                    page.blocks = mergedMlBlocks.mapNotNull { block ->
+                    mergedMlBlocks.mapNotNull { block ->
                         val recognizedText = recognizeBlockCrop(
                             bitmap = bitmap,
                             block = block,
@@ -128,6 +131,16 @@ class PageTextExtractor(
                         }
                     }.toMutableList()
                 }
+
+                // 3. تشغيل إصلاح التصادمات كدالة مستقلة قبل النتيجة النهائية لوضع Hybrid[span_4](start_span)[span_4](end_span)
+                if (recognizedBlocks.isNotEmpty()) {
+                    TextBlockMerger.resolveCollisions(
+                        blocks = recognizedBlocks,
+                        imgWidth = bitmap.width.toFloat(),
+                        imgHeight = bitmap.height.toFloat(),
+                    )
+                }
+                page.blocks = recognizedBlocks
             }
         }
 
@@ -230,6 +243,7 @@ internal object TextBlockMerger {
         imgHeight: Float,
         collisionPaddingFactor: Float = 1.3f,
         isHybrid: Boolean = false,
+        resolveCollisionsEnabled: Boolean = true,
     ): MutableList<TranslationBlock> {
         if (blocks.isEmpty()) return mutableListOf()
 
@@ -309,8 +323,7 @@ internal object TextBlockMerger {
             )
         }.toMutableList()
 
-        // إيقاف حل التصادمات في وضع Hybrid للحفاظ على مواقع الفقاعات الأصلية[span_6](start_span)[span_6](end_span)
-        if (!isHybrid) {
+        if (resolveCollisionsEnabled) {
             resolveCollisions(expandedBlocks, imgWidth, imgHeight)
         }
         return expandedBlocks
@@ -325,7 +338,7 @@ internal object TextBlockMerger {
         val totalDisplacement: Float,
     )
 
-    private fun resolveCollisions(blocks: MutableList<TranslationBlock>, imgWidth: Float, imgHeight: Float) {
+    internal fun resolveCollisions(blocks: MutableList<TranslationBlock>, imgWidth: Float, imgHeight: Float) {
         val iterations = 8
         for (step in 0 until iterations) {
             var collisionsResolved = 0
@@ -338,7 +351,7 @@ internal object TextBlockMerger {
 
                     val areaA = max(1f, a.width * a.height)
                     val areaB = max(1f, b.width * b.height)
-                    // الكتلة الأصغر تتحمل نسبة أكبر من الإزاحة، والكتلة الأكبر تتحمل نسبة أقل[span_7](start_span)[span_7](end_span)
+                    // الكتلة الأصغر تتحمل نسبة أكبر من الإزاحة، والكتلة الأكبر تتحمل نسبة أقل[span_6](start_span)[span_6](end_span)
                     val invA = 1f / areaA
                     val invB = 1f / areaB
                     val shareA = (invA / (invA + invB)).coerceIn(0.2f, 0.8f)
@@ -355,7 +368,7 @@ internal object TextBlockMerger {
                         blocks[j] = b.copy(x = best.bx, y = best.by)
                     }
 
-                    // إذا ظل التصادم قائماً بين a و b (مثلاً بسبب حدود الصورة أو تكدس الكتل)، نقلص حجم الأصغر تدريجياً[span_8](start_span)[span_8](end_span)
+                    // إذا ظل التصادم قائماً بين a و b (مثلاً بسبب حدود الصورة أو تكدس الكتل)، نقلص حجم الأصغر تدريجياً[span_7](start_span)[span_7](end_span)
                     if (isOverlapping(blocks[i], blocks[j])) {
                         val smallerIdx = if (areaA <= areaB) i else j
                         val smaller = blocks[smallerIdx]
@@ -391,11 +404,11 @@ internal object TextBlockMerger {
         val cxB = b.x + b.width / 2f
         val cyB = b.y + b.height / 2f
 
-        // مقدار التداخل الأفقي والعمودي بين الكتلتين[span_9](start_span)[span_9](end_span)
+        // مقدار التداخل الأفقي والعمودي بين الكتلتين[span_8](start_span)[span_8](end_span)
         val overlapX = max(0f, min(a.x + a.width, b.x + b.width) - max(a.x, b.x))
         val overlapY = max(0f, min(a.y + a.height, b.y + b.height) - max(a.y, b.y))
 
-        // اتجاه الفصل الأساسي يبعد المراكز عن بعضهما (لا يقربهما أبداً)[span_10](start_span)[span_10](end_span)
+        // اتجاه الفصل الأساسي يبعد المراكز عن بعضهما (لا يقربهما أبداً)[span_9](start_span)[span_9](end_span)
         val signX = when {
             cxA < cxB -> -1f
             cxA > cxB -> 1f
@@ -534,7 +547,7 @@ internal object TextBlockMerger {
         val sH = max(r1.symHeight, max(r2.symHeight, 12f))
         val sW = max(r1.symWidth, max(r2.symWidth, 12f))
 
-        // زيادة معاملات السماحية للمسافات (الفجوات) إذا كان وضع الـ Hybrid مفعلاً[span_11](start_span)[span_11](end_span)
+        // زيادة معاملات السماحية للمسافات (الفجوات) إذا كان وضع الـ Hybrid مفعلاً[span_10](start_span)[span_10](end_span)
         val gapMultiplier = 1.2f
         val maxAllowedGapX = sW * gapMultiplier
         val maxAllowedGapY = if (isHybrid) sH * 1.5f else sH * gapMultiplier
