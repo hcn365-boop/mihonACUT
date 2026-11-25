@@ -8,6 +8,7 @@ import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.os.SystemClock
+import eu.kanade.translation.ChapterTranslationFile
 import eu.kanade.translation.MangaTranslationContext
 import eu.kanade.translation.PageTranslationRenderer
 import eu.kanade.translation.PageTranslationService
@@ -270,6 +271,7 @@ object PageColorizer {
             }
 
             val imageHash = logStep("hashImage") { hash(bytes) }
+            if (translationConfig != null) ChapterTranslationFile.noteSeen(imageHash)
             val shrinkSide = if (doShrink) normalize else 0
             val baseName = baseName(context, imageHash, if (doColor) intensity else -1f, doUpscale, shrinkSide, colorModel, samActive(context))
             val effective = translationConfig?.effectiveSettings()
