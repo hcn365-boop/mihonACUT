@@ -1,14 +1,6 @@
 package eu.kanade.tachiyomi.ui.reader.colorize
 
 import android.graphics.Bitmap
-import org.opencv.android.OpenCVLoader
-import org.opencv.android.Utils
-import org.opencv.core.BorderTypes
-import org.opencv.core.CvType
-import org.opencv.core.Mat
-import org.opencv.core.Point
-import org.opencv.core.Size
-import org.opencv.imgproc.Imgproc
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -17,6 +9,14 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
+import org.opencv.android.OpenCVLoader
+import org.opencv.android.Utils
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.Point
+import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
 
 /** Making pages smaller using Lanczos2 (a = 2) via OpenCV for sharp manga line-art preservation. */
 internal object PageResizer {
@@ -127,7 +127,7 @@ internal object PageResizer {
                 kernelY,
                 Point(-1.0, -1.0),
                 0.0,
-                BorderTypes.BORDER_REPLICATE,
+                Core.BORDER_REPLICATE,
             )
             Imgproc.resize(filtered, dst, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
         } finally {
