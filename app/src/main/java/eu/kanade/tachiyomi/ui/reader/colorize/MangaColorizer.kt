@@ -86,7 +86,7 @@ class MangaColorizer(
         val gray = m.mat()
         Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
         val small = m.mat()
-        Imgproc.resize(gray, small, SIDE_SIZE, 0.0, 0.0, Imgproc.INTER_AREA)
+        PageResizer.resizeMatLanczos2(gray, small, SIDE, SIDE)
         m.free(gray)
 
         // Model input range is [-1, 1].
@@ -368,7 +368,6 @@ class MangaColorizer(
     private companion object {
         const val SIDE = 512
         const val PLANE = SIDE * SIDE
-        val SIDE_SIZE = Size(SIDE.toDouble(), SIDE.toDouble())
 
         const val INPUT_IMAGE = "L_bw"
         const val INPUT_SAM0 = "sam_level0"
