@@ -11,20 +11,26 @@ import android.text.StaticLayout
 import android.text.TextPaint
 import eu.kanade.translation.model.PageTranslation
 import eu.kanade.translation.model.TranslationBlock
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
 object PageTranslationRenderer {
 
     private const val MIN_BOX_PX = 6f
-    private const val MIN_TEXT_PX = 8
-    private const val MAX_TEXT_PX = 200
+    private const val MIN_TEXT_PX = 10
+    private const val MAX_TEXT_PX = 220
     private const val BUBBLE_COLOR = Color.WHITE
 
     /** Blocks whose box is tilted more than this are treated as vertical and drawn straight. */
     private const val VERTICAL_ANGLE = 85f
 
-    fun render(source: Bitmap, page: PageTranslation, typeface: Typeface = Typeface.DEFAULT): Bitmap {
+    fun render(
+        source: Bitmap,
+        page: PageTranslation,
+        typeface: Typeface = Typeface.DEFAULT,
+        boldText: Boolean = true,
+    ): Bitmap {
         if (page.imgWidth <= 0f || page.blocks.none { it.translation.isNotBlank() }) return source
         val output = source.copy(Bitmap.Config.ARGB_8888, true) ?: return source
         val canvas = Canvas(output)
@@ -43,7 +49,7 @@ object PageTranslationRenderer {
         }
 
         for (block in validBlocks) {
-            drawTranslatedText(canvas, block, scale, typeface)
+            drawTranslatedText(canvas, block, scale, typeface, boldText)
         }
 
         return output
@@ -62,7 +68,7 @@ object PageTranslationRenderer {
         val rect = RectF(metrics.left, metrics.top, metrics.right, metrics.bottom)
         val radius = min(metrics.width, metrics.height) * 0.48f
 
-        val hasRotation = block.angle > 0f && block.angle <= VERTICAL_ANGLE
+        val hasRotation = abs(block.angle) > 0f && abs(block.angle) <= VERTICAL_ANGLE
         if (hasRotation) {
             canvas.save()
             canvas.rotate(block.angle, rect.centerX(), rect.centerY())
@@ -73,9 +79,15 @@ object PageTranslationRenderer {
         }
     }
 
-    private fun drawTranslatedText(canvas: Canvas, block: TranslationBlock, scale: Float, typeface: Typeface) {
-        val paddingX = block.width * scale * 0.02f
-        val paddingY = block.height * scale * 0.02f
+    private fun drawTranslatedText(
+        canvas: Canvas,
+        block: TranslationBlock,
+        scale: Float,
+        typeface: Typeface,
+        boldText: Boolean,
+    ) {
+        val paddingX = block.width * scale * 0.03f
+        val paddingY = block.height * scale * 0.03f
 
         val left = max(block.x * scale + paddingX, 0f)
         val top = max(block.y * scale + paddingY, 0f)
@@ -86,16 +98,17 @@ object PageTranslationRenderer {
         val height = bottom - top
         if (width < MIN_BOX_PX || height < MIN_BOX_PX) return
 
-        val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        val paint = TextPaint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
             this.typeface = typeface
+            this.isFakeBoldText = boldText
             color = Color.BLACK
         }
 
         val layout = fitText(block.translation, paint, width.toInt(), height.toInt())
 
         canvas.save()
-        canvas.translate(left + width / 2, top + height / 2)
-        if (block.angle <= VERTICAL_ANGLE) canvas.rotate(block.angle)
+        canvas.translate(left + width / 2f, top + height / 2f)
+        if (abs(block.angle) <= VERTICAL_ANGLE) canvas.rotate(block.angle)
         canvas.translate(-layout.width / 2f, -layout.height / 2f)
         layout.draw(canvas)
         canvas.restore()
@@ -123,39 +136,55 @@ object PageTranslationRenderer {
     }
 
     private fun fitText(text: String, paint: TextPaint, width: Int, height: Int): StaticLayout {
-        var low = MIN_TEXT_PX
-        var high = max(low, min(height, MAX_TEXT_PX))
-        var best = low
+        val low = MIN_TEXT_PX
+        val high = max(low, min(height, MAX_TEXT_PX))
+        var bestSize = low
+        var bestLayout: StaticLayout? = null
 
-        while (low <= high) {
-            val mid = (low + high) / 2
+        var currentLow = low
+        var currentHigh = high
+
+        while (currentLow <= currentHigh) {
+            val mid = (currentLow + currentHigh) / 2
             paint.textSize = mid.toFloat()
 
             val formattedText = formatTextToPreventCutting(text, paint, width)
             val currentLayout = layout(formattedText, paint, width)
 
-            if (currentLayout.height <= height) {
-                best = mid
-                low = mid + 1
+            val fitsWidth = (0 until currentLayout.lineCount).all { lineIdx ->
+                currentLayout.getLineWidth(lineIdx) <= width.toFloat()
+            }
+            val fitsHeight = currentLayout.height <= height
+
+            if (fitsHeight && fitsWidth) {
+                bestSize = mid
+                bestLayout = currentLayout
+                currentLow = mid + 1
             } else {
-                high = mid - 1
+                currentHigh = mid - 1
             }
         }
 
-        paint.textSize = best.toFloat()
-        val finalFormattedText = formatTextToPreventCutting(text, paint, width)
-        return layout(finalFormattedText, paint, width)
+        if (bestLayout != null) {
+            paint.textSize = bestSize.toFloat()
+            return bestLayout
+        }
+
+        paint.textSize = low.toFloat()
+        return layout(formatTextToPreventCutting(text, paint, width), paint, width)
     }
 
     private fun formatTextToPreventCutting(text: String, paint: TextPaint, maxLineWidth: Int): String {
         if (maxLineWidth <= 0) return text
 
-        val words = text.split(" ")
-        val lineBuilder = StringBuilder(text.length)
+        val normalized = text.replace('\n', ' ').trim()
+        val words = normalized.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (words.isEmpty()) return ""
+
+        val lineBuilder = StringBuilder(normalized.length)
         val currentLine = StringBuilder()
 
         for (word in words) {
-            if (word.isEmpty()) continue
             val candidate = if (currentLine.isEmpty()) word else "${currentLine} $word"
             if (paint.measureText(candidate) > maxLineWidth && currentLine.isNotEmpty()) {
                 lineBuilder.append(currentLine).append('\n')
@@ -177,6 +206,7 @@ object PageTranslationRenderer {
         StaticLayout.Builder.obtain(text, 0, text.length, paint, max(width, 1))
             .setAlignment(Layout.Alignment.ALIGN_CENTER)
             .setIncludePad(false)
+            .setLineSpacing(0f, 1.08f)
             .setBreakStrategy(StaticLayout.BREAK_STRATEGY_BALANCED)
             .build()
 }
