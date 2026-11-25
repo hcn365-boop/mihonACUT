@@ -69,6 +69,7 @@ object TranslationCleaner {
     /** The chapter files are read again when a page needs them, and the pages on screen are drawn again. */
     private fun reloadPages() {
         PostRead.forgetImports()
+        ChapterTranslationFile.forget()
         AiConfig.requestReload()
     }
 }
