@@ -9,6 +9,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.createSavedStateHandle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.CreationExtras
+import com.hippo.unifile.UniFile
 import dev.zacsweers.metro.AppScope
 import dev.zacsweers.metro.Assisted
 import dev.zacsweers.metro.AssistedFactory
@@ -56,9 +57,14 @@ import eu.kanade.tachiyomi.util.editCover
 import eu.kanade.tachiyomi.util.lang.byteSize
 import eu.kanade.tachiyomi.util.storage.DiskUtil
 import eu.kanade.tachiyomi.util.storage.cacheImageDir
+import eu.kanade.translation.ChapterTranslationFile
 import eu.kanade.translation.MangaTranslationContext
+import java.util.Date
+import kotlin.time.Clock
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -92,8 +98,6 @@ import tachiyomi.domain.manga.model.Manga
 import tachiyomi.domain.source.service.SourceManager
 import tachiyomi.source.local.image.LocalCoverManager
 import tachiyomi.source.local.isLocal
-import java.util.Date
-import kotlin.time.Clock
 
 /**
  * Presenter used by the activity to perform background operations.
@@ -306,6 +310,7 @@ class ReaderViewModel(
 
     override fun onCleared() {
         val currentChapters = state.value.viewerChapters
+        saveChapterTranslations(currentChapters?.currChapter)
         if (currentChapters != null) {
             currentChapters.unref()
             chapterToDownload?.let {
@@ -313,6 +318,33 @@ class ReaderViewModel(
             }
         }
         MangaTranslationContext.currentChapterPages = null
+    }
+
+    /** The download folder of a chapter, or null when it is not downloaded as a folder. */
+    private fun chapterFolder(chapter: ReaderChapter): UniFile? {
+        val manga = manga ?: return null
+        val source = source ?: return null
+        val dbChapter = chapter.chapter
+        return downloadProvider.findChapterDir(dbChapter.name, dbChapter.scanlator, dbChapter.url, manga.title, source)
+            ?.takeIf { it.isDirectory }
+    }
+
+    /** Translations kept next to the chapter (only when the user chose it): loaded when it opens. */
+    private suspend fun loadChapterTranslations(chapter: ReaderChapter) {
+        if (!readerPreferences.postTranslationInFolder.get()) return
+        val folder = chapterFolder(chapter) ?: return
+        withIOContext { ChapterTranslationFile.load(context, folder) }
+    }
+
+    /** ... and saved when it is left. The work does not depend on the pages, so it can go on after the reader closes. */
+    private fun saveChapterTranslations(chapter: ReaderChapter?) {
+        if (chapter == null || !readerPreferences.postTranslationInFolder.get()) return
+        val folder = chapterFolder(chapter) ?: return
+        val mangaId = manga?.id ?: return
+        val chapterId = chapter.chapter.id ?: return
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            runCatching { ChapterTranslationFile.saveSeen(context, folder, chapterId, mangaId) }
+        }
     }
 
     /**
@@ -366,6 +398,7 @@ class ReaderViewModel(
         chapter: ReaderChapter,
     ): ViewerChapters {
         loader.loadChapter(chapter)
+        loadChapterTranslations(chapter)
 
         val chapterPos = chapterList.indexOf(chapter)
         val newChapters = ViewerChapters(
@@ -374,6 +407,7 @@ class ReaderViewModel(
             chapterList.getOrNull(chapterPos + 1),
         )
 
+        val previous = state.value.viewerChapters?.currChapter
         withUIContext {
             mutableState.update {
                 // Add new references first to avoid unnecessary recycling
@@ -386,6 +420,9 @@ class ReaderViewModel(
                     bookmarked = newChapters.currChapter.chapter.bookmark,
                 )
             }
+        }
+        if (previous != newChapters.currChapter) {
+            saveChapterTranslations(previous)
         }
         return newChapters
     }
@@ -470,6 +507,7 @@ class ReaderViewModel(
         try {
             logcat { "Preloading ${chapter.chapter.url}" }
             loader.loadChapter(chapter)
+            loadChapterTranslations(chapter)
         } catch (e: Throwable) {
             if (e is CancellationException) {
                 throw e
