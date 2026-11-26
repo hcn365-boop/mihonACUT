@@ -3,11 +3,13 @@ package eu.kanade.tachiyomi.ui.reader.colorize
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
+import ai.onnxruntime.TensorInfo
 import android.graphics.Bitmap
 import android.os.SystemClock
 import java.io.Closeable
 import java.io.File
 import java.nio.FloatBuffer
+import kotlin.math.roundToInt
 import logcat.LogPriority
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
@@ -22,10 +24,9 @@ import tachiyomi.core.common.util.system.logcat
 /**
  * Runs the Manga Light V6 generator (v6_generator.onnx) on a page.
  *
- * Two steps so the expensive part can be cached:
- *  - [predict] runs the model once and returns the predicted RGB at model resolution (small).
- *  - [render] uses model hue/lighting while weighting model lighting by original luminance
- *    so dark text and fine strokes do not inherit low-resolution upscaled lighting blur.
+ * Dynamically scales input dimensions to preserve aspect ratio within [MIN_SIDE..MAX_SIDE]
+ * (aligned to multiples of [STRIDE]) when the ONNX model supports dynamic spatial shapes,
+ * falling back to 512x512 if the model requires fixed spatial dimensions.
  *
  * Not thread safe: call it from one coroutine at a time.
  */
@@ -35,20 +36,23 @@ class MangaColorizer(
     threads: Int = 0,
     private val guide: SamFeatures? = null,
 ) : Closeable {
-    /** Predicted RGB at 512x512, interleaved (R,G,B per pixel), values in [0, 1]. About 3 MB per page. */
-    class Chroma(val rgb: FloatArray)
+    /**
+     * Predicted RGB at inference resolution ([width] x [height]),
+     * interleaved (R,G,B per pixel), values in [0, 1].
+     */
+    class Chroma(
+        val width: Int,
+        val height: Int,
+        val rgb: FloatArray,
+    )
 
     private val env = OrtEnvironment.getEnvironment()
     private val session: OrtSession
+    private val supportsDynamicSize: Boolean
 
     private val zeroSam0: FloatArray? = if (guide?.level0 == null) FloatArray(256 * 64 * 64) else null
     private val zeroSam1: FloatArray? = if (guide?.level1 == null) FloatArray(256 * 32 * 32) else null
     private val zeroWd14 = FloatArray(1024)
-
-    // Reusable buffers for 512x512 inference to avoid repeated allocations across pages.
-    private val modelInputBuffer = FloatArray(PLANE)
-    private val modelOutputBuffer = FloatArray(3 * PLANE)
-    private val chromaOutBuffer = FloatArray(3 * PLANE)
 
     // Reusable 1x3 Rec.601 luminance kernel.
     private val lumaWeights = floatArrayOf(0.299f, 0.587f, 0.114f)
@@ -61,6 +65,13 @@ class MangaColorizer(
             val message = "Not a Manga Light V6 generator: inputs=${session.inputNames}, outputs=${session.outputNames}"
             session.close()
             error(message)
+        }
+        val imageInfo = session.inputInfo[INPUT_IMAGE]?.info as? TensorInfo
+        val shape = imageInfo?.shape
+        // Check if H and W dimensions in [N, C, H, W] are dynamic (<= 0)
+        supportsDynamicSize = shape != null && shape.size == 4 && shape[2] <= 0L && shape[3] <= 0L
+        logcat(LogPriority.DEBUG) {
+            "[Perf] MangaColorizer initialized: inputShape=${shape?.joinToString()}, dynamicSize=$supportsDynamicSize"
         }
     }
 
@@ -82,54 +93,56 @@ class MangaColorizer(
         }
     }
 
-    internal fun predictFromRgba(m: Mats, rgba: Mat): Chroma = measureStep("predictFromRgba(${rgba.cols()}x${rgba.rows()})") {
-        val gray = m.mat()
-        Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
-        val small = m.mat()
-        PageResizer.resizeMatLanczos2(gray, small, SIDE, SIDE)
-        m.free(gray)
+    internal fun predictFromRgba(m: Mats, rgba: Mat): Chroma =
+        measureStep("predictFromRgba(${rgba.cols()}x${rgba.rows()})") {
+            val (inferW, inferH) = computeInferenceSize(rgba.cols(), rgba.rows(), supportsDynamicSize)
+            val plane = inferW * inferH
 
-        // Model input range is [-1, 1].
-        small.convertTo(small, CvType.CV_32F, 1.0 / 127.5, -1.0)
-        small.get(0, 0, modelInputBuffer)
-        m.free(small)
+            val gray = m.mat()
+            Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+            val small = m.mat()
+            PageResizer.resizeMatLanczos2(gray, small, inferW, inferH)
+            m.free(gray)
 
-        measureStep("onnx.runModel") {
-            runModel(modelInputBuffer, modelOutputBuffer)
+            // Model input range is [-1, 1].
+            small.convertTo(small, CvType.CV_32F, 1.0 / 127.5, -1.0)
+            val modelInputBuffer = FloatArray(plane)
+            small.get(0, 0, modelInputBuffer)
+            m.free(small)
+
+            val modelOutputBuffer = FloatArray(3 * plane)
+            measureStep("onnx.runModel(${inferW}x${inferH})") {
+                runModel(modelInputBuffer, inferW, inferH, modelOutputBuffer)
+            }
+
+            val planes = ArrayList<Mat>(3)
+            for (c in 0 until 3) {
+                val planeMat = m.mat(inferH, inferW, CvType.CV_32F)
+                val start = c * plane
+                planeMat.put(0, 0, modelOutputBuffer.copyOfRange(start, start + plane))
+                planes.add(planeMat)
+            }
+            val merged = m.mat(inferH, inferW, CvType.CV_32FC3)
+            Core.merge(planes, merged)
+            planes.forEach { m.free(it) }
+
+            // Model output range is [-1, 1]; bring it to [0, 1] and clamp.
+            merged.convertTo(merged, CvType.CV_32FC3, 0.5, 0.5)
+            Core.max(merged, ZERO_SCALAR_3, merged)
+            Core.min(merged, ONE_SCALAR_3, merged)
+
+            val chromaOutBuffer = FloatArray(3 * plane)
+            merged.get(0, 0, chromaOutBuffer)
+            Chroma(inferW, inferH, chromaOutBuffer)
         }
-
-        val planes = ArrayList<Mat>(3)
-        for (c in 0 until 3) {
-            val planeMat = m.mat(SIDE, SIDE, CvType.CV_32F)
-            val start = c * PLANE
-            planeMat.put(0, 0, modelOutputBuffer.copyOfRange(start, start + PLANE))
-            planes.add(planeMat)
-        }
-        val merged = m.mat(SIDE, SIDE, CvType.CV_32FC3)
-        Core.merge(planes, merged)
-        planes.forEach { m.free(it) }
-
-        // Model output range is [-1, 1]; bring it to [0, 1] and clamp.
-        merged.convertTo(merged, CvType.CV_32FC3, 0.5, 0.5)
-        Core.max(merged, ZERO_SCALAR_3, merged)
-        Core.min(merged, ONE_SCALAR_3, merged)
-
-        merged.get(0, 0, chromaOutBuffer)
-        Chroma(chromaOutBuffer.copyOf())
-    }
 
     /**
      * Builds the colored page while reducing low-resolution upscaled lighting blur on text and sharp lines.
-     *  1. Hue: upscaled model color normalized to luminance 1 after saturation.
-     *  2. Light: upscaled model luminance with floor applied.
-     *  3. Detail: local contrast ratio of original luminance relative to its blur.
-     *  4. Final luminance weights model lighting by original luminance [guideY] so dark strokes/text
-     *     retain crisp original luminance while brighter/mid areas use model lighting + detail.
      * Alpha is preserved.
      */
     fun render(input: Bitmap, chroma: Chroma, intensity: Float = 1f): Bitmap {
         require(intensity in 0f..1.2f) { "intensity must be within 0..1.2" }
-        return measureStep("render(${input.width}x${input.height}, intensity=$intensity)") {
+        return measureStep("render(${input.width}x${input.height}, chroma=${chroma.width}x${chroma.height}, intensity=$intensity)") {
             Mats().use { m ->
                 val rgba = m.mat()
                 toMat(input, rgba)
@@ -147,7 +160,10 @@ class MangaColorizer(
         intensity: Float = 1f,
     ): Bitmap {
         require(intensity in 0f..1.2f) { "intensity must be within 0..1.2" }
-        return measureStep("renderFromRgba(${width}x${height}, intensity=$intensity)") {
+        require(chroma.width > 0 && chroma.height > 0 && chroma.rgb.size == chroma.width * chroma.height * 3) {
+            "Invalid chroma dimensions ${chroma.width}x${chroma.height} for buffer size ${chroma.rgb.size}"
+        }
+        return measureStep("renderFromRgba(${width}x${height}, chroma=${chroma.width}x${chroma.height}, intensity=$intensity)") {
             val fullSize = Size(width.toDouble(), height.toDouble())
 
             // Original luminance (Rec.601), full size, computed directly from RGBA without extra RGB8 copy.
@@ -158,8 +174,8 @@ class MangaColorizer(
             val guideY = m.mat()
             luma(m, rgb, guideY)
 
-            // Model color and luminance at model resolution.
-            val modelRgb = m.mat(SIDE, SIDE, CvType.CV_32FC3)
+            // Model color and luminance at dynamic model resolution (rows = height, cols = width).
+            val modelRgb = m.mat(chroma.height, chroma.width, CvType.CV_32FC3)
             modelRgb.put(0, 0, chroma.rgb)
             val modelY = m.mat()
             luma(m, modelRgb, modelY)
@@ -201,7 +217,7 @@ class MangaColorizer(
             m.free(satColor)
             m.free(satY3)
 
-            // 2. Model lighting (upscaled from 512x512).
+            // 2. Model lighting (upscaled from model inference resolution).
             val light = fullY // Reuse `fullY` Mat for model lighting.
             Core.max(light, LIGHT_FLOOR_SCALAR_1, light)
 
@@ -286,25 +302,26 @@ class MangaColorizer(
         session.close()
     }
 
-    /** Runs the ONNX model and writes 3 consecutive 512x512 planes (R, G, B) in [-1, 1] into [outValues]. */
-    private fun runModel(image: FloatArray, outValues: FloatArray) {
+    /** Runs the ONNX model and writes 3 consecutive [inferW]x[inferH] planes (R, G, B) in [-1, 1] into [outValues]. */
+    private fun runModel(image: FloatArray, inferW: Int, inferH: Int, outValues: FloatArray) {
+        val plane = inferW * inferH
         val tensors = ArrayList<OnnxTensor>(4)
         try {
             fun tensor(data: FloatArray, vararg shape: Long): OnnxTensor =
                 OnnxTensor.createTensor(env, FloatBuffer.wrap(data), shape).also { tensors.add(it) }
 
             val inputs = mapOf(
-                INPUT_IMAGE to tensor(image, 1, 1, SIDE.toLong(), SIDE.toLong()),
+                INPUT_IMAGE to tensor(image, 1, 1, inferH.toLong(), inferW.toLong()),
                 INPUT_SAM0 to tensor(guide?.level0 ?: zeroSam0!!, 1, 256, 64, 64),
                 INPUT_SAM1 to tensor(guide?.level1 ?: zeroSam1!!, 1, 256, 32, 32),
                 INPUT_WD14 to tensor(zeroWd14, 1, 1024),
             )
             session.run(inputs).use { result ->
                 val output = result[0] as OnnxTensor
-                val expected = longArrayOf(1, 3, SIDE.toLong(), SIDE.toLong())
+                val expected = longArrayOf(1, 3, inferH.toLong(), inferW.toLong())
                 if (!output.info.shape.contentEquals(expected)) {
                     logcat(LogPriority.ERROR) {
-                        "SAM encoder: unexpected shapes or failed to output expected shape (got ${output.info.shape.joinToString()})"
+                        "MangaColorizer: unexpected output shape (got ${output.info.shape.joinToString()}, expected ${expected.joinToString()})"
                     }
                 }
                 require(output.info.shape.contentEquals(expected)) {
@@ -312,10 +329,10 @@ class MangaColorizer(
                 }
                 val buf = output.floatBuffer
                 buf.rewind()
-                buf.get(outValues, 0, 3 * PLANE)
+                buf.get(outValues, 0, 3 * plane)
             }
         } catch (e: Throwable) {
-            logcat(LogPriority.ERROR, e) { "SAM encoder: failed to process features" }
+            logcat(LogPriority.ERROR, e) { "MangaColorizer: failed to run model at ${inferW}x${inferH}" }
             throw e
         } finally {
             tensors.forEach { it.close() }
@@ -365,19 +382,56 @@ class MangaColorizer(
         }
     }
 
-    private companion object {
-        const val SIDE = 512
-        const val PLANE = SIDE * SIDE
+    companion object {
+        const val MIN_SIDE = 512
+        const val MAX_SIDE = 768
+        const val STRIDE = 64
 
-        const val INPUT_IMAGE = "L_bw"
-        const val INPUT_SAM0 = "sam_level0"
-        const val INPUT_SAM1 = "sam_level1"
-        const val INPUT_WD14 = "wd14_embedding"
-        const val OUTPUT_RGB = "rgb_pred"
+        /**
+         * Computes aspect-ratio-preserving dimensions within [MIN_SIDE..MAX_SIDE],
+         * snapped to multiples of [STRIDE] (64) to match U-Net downsampling strides.
+         * Falls back to 512x512 if the ONNX graph has static spatial dimensions.
+         */
+        fun computeInferenceSize(srcWidth: Int, srcHeight: Int, dynamic: Boolean = true): Pair<Int, Int> {
+            if (!dynamic || srcWidth <= 0 || srcHeight <= 0) {
+                return MIN_SIDE to MIN_SIDE
+            }
+            val aspect = srcWidth.toDouble() / srcHeight.toDouble()
+            var targetW: Double
+            var targetH: Double
 
-        const val LIGHT_RADIUS = 16
-        const val LIGHT_FLOOR = 0.1
-        const val Y_EPS = 1e-3
+            if (aspect >= 1.0) {
+                // Landscape or square: anchor shorter side (height) to MIN_SIDE, cap longer side (width) at MAX_SIDE
+                targetH = MIN_SIDE.toDouble()
+                targetW = targetH * aspect
+                if (targetW > MAX_SIDE) {
+                    targetW = MAX_SIDE.toDouble()
+                    targetH = targetW / aspect
+                }
+            } else {
+                // Portrait: anchor shorter side (width) to MIN_SIDE, cap longer side (height) at MAX_SIDE
+                targetW = MIN_SIDE.toDouble()
+                targetH = targetW / aspect
+                if (targetH > MAX_SIDE) {
+                    targetH = MAX_SIDE.toDouble()
+                    targetW = targetH * aspect
+                }
+            }
+
+            val snappedW = ((targetW / STRIDE).roundToInt() * STRIDE).coerceIn(MIN_SIDE, MAX_SIDE)
+            val snappedH = ((targetH / STRIDE).roundToInt() * STRIDE).coerceIn(MIN_SIDE, MAX_SIDE)
+            return snappedW to snappedH
+        }
+
+        private const val INPUT_IMAGE = "L_bw"
+        private const val INPUT_SAM0 = "sam_level0"
+        private const val INPUT_SAM1 = "sam_level1"
+        private const val INPUT_WD14 = "wd14_embedding"
+        private const val OUTPUT_RGB = "rgb_pred"
+
+        private const val LIGHT_RADIUS = 16
+        private const val LIGHT_FLOOR = 0.1
+        private const val Y_EPS = 1e-3
 
         val BLUR_KERNEL_SIZE = Size(2.0 * LIGHT_RADIUS + 1.0, 2.0 * LIGHT_RADIUS + 1.0)
         val ZERO_SCALAR_1 = Scalar(0.0)
