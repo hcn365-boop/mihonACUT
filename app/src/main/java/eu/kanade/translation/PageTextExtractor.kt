@@ -2,7 +2,11 @@ package eu.kanade.translation
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
+import android.graphics.Paint
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
@@ -43,18 +47,15 @@ class PageTextExtractor(
 ) {
 
     suspend fun extract(bitmap: Bitmap): PageTranslation? {
-        val image = InputImage.fromBitmap(bitmap, 0)
         logcat(LogPriority.ERROR) { ">>> OCR branch selected: mode=$mode <<<" }
 
         val paddingFactor = AiConfig.translateCollisionPadding
         val page = PageTranslation(imgWidth = bitmap.width.toFloat(), imgHeight = bitmap.height.toFloat())
-
-        // تحديد ما إذا كان الوضع الحالي هو Hybrid لزيادة معامل السماحية للدمج وتأجيل حل التصادمات إلى ما بعد القص[span_1](start_span)[span_1](end_span)
         val isHybridMode = (mode == OcrMode.HYBRID)
 
         when (mode) {
             OcrMode.MLKIT -> {
-                val boxes = mlKitBoxes(image)
+                val boxes = extractMlKitBoxesWithFilter(bitmap)
                 if (boxes.isEmpty()) return null
                 page.blocks = TextBlockMerger.merge(
                     blocks = boxes.map { it.toBlock() },
@@ -66,6 +67,7 @@ class PageTextExtractor(
                 )
             }
             OcrMode.PADDLE -> {
+                val image = InputImage.fromBitmap(bitmap, 0)
                 val boxes = paddleBoxes(image)
                 if (boxes.isEmpty()) return null
                 page.blocks = TextBlockMerger.merge(
@@ -78,8 +80,8 @@ class PageTextExtractor(
                 )
             }
             OcrMode.HYBRID -> {
-                // 1. تشغيل ML Kit ودمج الكتل بدون حل التصادمات حتى تبقى أماكنها كما هي أثناء القص[span_2](start_span)[span_2](end_span)
-                val mlBoxes = mlKitBoxes(image)
+                // 1. تشغيل ML Kit على نسخة رمادية معتدلة التباين ودمج الكتل بدون حل التصادمات حتى تبقى أماكنها كما هي أثناء القص
+                val mlBoxes = extractMlKitBoxesWithFilter(bitmap)
                 if (mlBoxes.isEmpty()) return null
 
                 val mergedMlBlocks = TextBlockMerger.merge(
@@ -92,7 +94,7 @@ class PageTextExtractor(
                 )
                 if (mergedMlBlocks.isEmpty()) return null
 
-                // 2. إرسال الكتل المدمجة (بمكانها الأصلي) إلى Hybrid/Paddle بعد قص كل منطقة[span_3](start_span)[span_3](end_span)
+                // 2. إرسال الكتل المدمجة (بمكانها الأصلي) إلى Hybrid/Paddle بعد قص كل منطقة من الصورة الأصلية
                 val ctx = context
                 val recognizedBlocks = if (ctx != null) {
                     val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
@@ -132,7 +134,7 @@ class PageTextExtractor(
                     }.toMutableList()
                 }
 
-                // 3. تشغيل إصلاح التصادمات كدالة مستقلة قبل النتيجة النهائية لوضع Hybrid[span_4](start_span)[span_4](end_span)
+                // 3. تشغيل إصلاح التصادمات كدالة مستقلة قبل النتيجة النهائية لوضع Hybrid
                 if (recognizedBlocks.isNotEmpty()) {
                     TextBlockMerger.resolveCollisions(
                         blocks = recognizedBlocks,
@@ -145,6 +147,53 @@ class PageTextExtractor(
         }
 
         return page.takeIf { it.blocks.isNotEmpty() }
+    }
+
+    private suspend fun extractMlKitBoxesWithFilter(original: Bitmap): List<OcrBox> {
+        val filteredBitmap = createOcrGrayscaleFilterBitmap(original)
+        return try {
+            val filteredImage = InputImage.fromBitmap(filteredBitmap, 0)
+            mlKitBoxes(filteredImage)
+        } finally {
+            if (filteredBitmap !== original && !filteredBitmap.isRecycled) {
+                filteredBitmap.recycle()
+            }
+        }
+    }
+
+    /**
+     * فلتر رمادي معتدل التباين بدون تكبير لتحسين قراءة النصوص في ML Kit
+     * مع الحفاظ على حواف الحروف الدقيقة ومنع تكسرها أو تغيير الإحداثيات.
+     */
+    private fun createOcrGrayscaleFilterBitmap(original: Bitmap): Bitmap {
+        val config = original.config ?: Bitmap.Config.ARGB_8888
+        val output = Bitmap.createBitmap(original.width, original.height, config)
+
+        val grayMatrix = ColorMatrix().apply {
+            setSaturation(0f)
+        }
+
+        val contrast = 1.35f
+        val translate = -38f
+        val contrastMatrix = ColorMatrix(
+            floatArrayOf(
+                contrast, 0f, 0f, 0f, translate,
+                0f, contrast, 0f, 0f, translate,
+                0f, 0f, contrast, 0f, translate,
+                0f, 0f, 0f, 1f, 0f,
+            ),
+        )
+
+        grayMatrix.postConcat(contrastMatrix)
+
+        val paint = Paint().apply {
+            isAntiAlias = true
+            isFilterBitmap = true
+            colorFilter = ColorMatrixColorFilter(grayMatrix)
+        }
+
+        Canvas(output).drawBitmap(original, 0f, 0f, paint)
+        return output
     }
 
     private suspend fun recognizeBlockCrop(
@@ -235,7 +284,7 @@ class PageTextExtractor(
 
 internal object TextBlockMerger {
     private val urlPattern = Regex("(?i)(https?://\\S+|www\\.\\S+|\\S+\\.(com|net|org|io|me|cc|tv|info))")
-    private val symbolsFilterPattern = Regex("""[_~•°^@#$&|\\-]""")
+    private val symbolsFilterPattern = Regex("""[_~•°^@#$&|\-]""")
 
     fun merge(
         blocks: List<TranslationBlock>,
@@ -274,7 +323,6 @@ internal object TextBlockMerger {
 
                 for (j in i + 1 until currentBlocks.size) {
                     if (visited[j]) continue
-                    // تمرير مؤشر الـ Hybrid لدالة الفحص والدمج[span_5](start_span)[span_5](end_span)
                     if (shouldMergeTextBlock(currentMerged, currentBlocks[j], isHybrid)) {
                         currentMerged = mergeTextBlock(currentMerged, currentBlocks[j], isWebtoon)
                         visited[j] = true
@@ -351,7 +399,6 @@ internal object TextBlockMerger {
 
                     val areaA = max(1f, a.width * a.height)
                     val areaB = max(1f, b.width * b.height)
-                    // الكتلة الأصغر تتحمل نسبة أكبر من الإزاحة، والكتلة الأكبر تتحمل نسبة أقل[span_6](start_span)[span_6](end_span)
                     val invA = 1f / areaA
                     val invB = 1f / areaB
                     val shareA = (invA / (invA + invB)).coerceIn(0.2f, 0.8f)
@@ -368,7 +415,6 @@ internal object TextBlockMerger {
                         blocks[j] = b.copy(x = best.bx, y = best.by)
                     }
 
-                    // إذا ظل التصادم قائماً بين a و b (مثلاً بسبب حدود الصورة أو تكدس الكتل)، نقلص حجم الأصغر تدريجياً[span_7](start_span)[span_7](end_span)
                     if (isOverlapping(blocks[i], blocks[j])) {
                         val smallerIdx = if (areaA <= areaB) i else j
                         val smaller = blocks[smallerIdx]
@@ -404,11 +450,9 @@ internal object TextBlockMerger {
         val cxB = b.x + b.width / 2f
         val cyB = b.y + b.height / 2f
 
-        // مقدار التداخل الأفقي والعمودي بين الكتلتين[span_8](start_span)[span_8](end_span)
         val overlapX = max(0f, min(a.x + a.width, b.x + b.width) - max(a.x, b.x))
         val overlapY = max(0f, min(a.y + a.height, b.y + b.height) - max(a.y, b.y))
 
-        // اتجاه الفصل الأساسي يبعد المراكز عن بعضهما (لا يقربهما أبداً)[span_9](start_span)[span_9](end_span)
         val signX = when {
             cxA < cxB -> -1f
             cxA > cxB -> 1f
@@ -547,7 +591,6 @@ internal object TextBlockMerger {
         val sH = max(r1.symHeight, max(r2.symHeight, 12f))
         val sW = max(r1.symWidth, max(r2.symWidth, 12f))
 
-        // زيادة معاملات السماحية للمسافات (الفجوات) إذا كان وضع الـ Hybrid مفعلاً[span_10](start_span)[span_10](end_span)
         val gapMultiplier = 1.2f
         val maxAllowedGapX = sW * gapMultiplier
         val maxAllowedGapY = if (isHybrid) sH * 2.0f else sH * gapMultiplier
