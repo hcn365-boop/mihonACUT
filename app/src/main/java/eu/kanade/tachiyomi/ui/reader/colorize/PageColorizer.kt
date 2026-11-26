@@ -54,7 +54,7 @@ object PageColorizer {
     private const val CHROMA_CACHE_DIR = "colorizer_cache"
     private const val PAGE_CACHE_DIR = "ai_pages"
 
-    private const val CHROMA_SIZE = 512 * 512
+    private const val CHROMA_HEADER_BYTES = 2 * Int.SIZE_BYTES
     private const val MAX_CHROMA_CACHE_BYTES = 256L * 1024 * 1024
     private const val JPEG_QUALITY = 95
 
@@ -912,22 +912,33 @@ object PageColorizer {
     }
 
     private fun chromaFile(context: Context, imageHash: String, model: File): File =
-        File(File(context.cacheDir, CHROMA_CACHE_DIR), imageHash + "_" + model.length() + (if (samActive(context)) "_sam" else ""))
+        File(File(context.cacheDir, CHROMA_CACHE_DIR), imageHash + "_" + model.length() + (if (samActive(context)) "_sam" else "") + "_v2")
 
     private fun loadChroma(file: File): MangaColorizer.Chroma? {
         if (!file.isFile) return null
         val bytes = file.readBytes()
-        if (bytes.size != CHROMA_SIZE * 3 * Float.SIZE_BYTES) return null
+        if (bytes.size <= CHROMA_HEADER_BYTES) return null
+        val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        val w = buffer.int
+        val h = buffer.int
+        if (w <= 0 || h <= 0) return null
+        val expectedFloatCount = w.toLong() * h.toLong() * 3L
+        if (expectedFloatCount > Int.MAX_VALUE) return null
+        val expectedBytes = CHROMA_HEADER_BYTES + expectedFloatCount * Float.SIZE_BYTES
+        if (bytes.size.toLong() != expectedBytes) return null
         file.setLastModified(System.currentTimeMillis())
-        val rgb = FloatArray(CHROMA_SIZE * 3)
-        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(rgb)
-        return MangaColorizer.Chroma(rgb)
+        val rgb = FloatArray(expectedFloatCount.toInt())
+        buffer.asFloatBuffer().get(rgb)
+        return MangaColorizer.Chroma(w, h, rgb)
     }
 
     private fun saveChroma(context: Context, file: File, chroma: MangaColorizer.Chroma) {
         val dir = file.parentFile ?: return
         dir.mkdirs()
-        val buffer = ByteBuffer.allocate(CHROMA_SIZE * 3 * Float.SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+        val payloadBytes = CHROMA_HEADER_BYTES + chroma.rgb.size * Float.SIZE_BYTES
+        val buffer = ByteBuffer.allocate(payloadBytes).order(ByteOrder.LITTLE_ENDIAN)
+        buffer.putInt(chroma.width)
+        buffer.putInt(chroma.height)
         buffer.asFloatBuffer().put(chroma.rgb)
         val temp = File(dir, "${file.name}.${System.nanoTime()}.tmp")
         temp.writeBytes(buffer.array())
