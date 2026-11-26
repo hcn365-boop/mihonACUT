@@ -550,7 +550,7 @@ internal object TextBlockMerger {
         // زيادة معاملات السماحية للمسافات (الفجوات) إذا كان وضع الـ Hybrid مفعلاً[span_10](start_span)[span_10](end_span)
         val gapMultiplier = 1.2f
         val maxAllowedGapX = sW * gapMultiplier
-        val maxAllowedGapY = if (isHybrid) sH * 1.5f else sH * gapMultiplier
+        val maxAllowedGapY = if (isHybrid) sH * 2.0f else sH * gapMultiplier
 
         val yOverlap = max(0f, min(r1Bottom, r2Bottom) - max(r1.y, r2.y))
         val xOverlap = max(0f, min(r1Right, r2Right) - max(r1.x, r2.x))
