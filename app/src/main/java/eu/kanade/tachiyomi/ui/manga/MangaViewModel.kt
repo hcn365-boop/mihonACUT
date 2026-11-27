@@ -33,6 +33,7 @@ import eu.kanade.domain.track.model.AutoTrackState
 import eu.kanade.domain.track.service.TrackPreferences
 import eu.kanade.presentation.manga.DownloadAction
 import eu.kanade.presentation.manga.components.ChapterDownloadAction
+import eu.kanade.presentation.manga.components.ChapterProcessAction
 import eu.kanade.presentation.util.formattedMessage
 import eu.kanade.tachiyomi.data.cache.CoverCache
 import eu.kanade.tachiyomi.data.download.DownloadCache
@@ -91,8 +92,6 @@ import tachiyomi.domain.track.interactor.GetTracks
 import tachiyomi.i18n.MR
 import tachiyomi.source.local.isLocal
 import kotlin.math.floor
-import eu.kanade.presentation.manga.components.ChapterProcessAction
-
 
 @AssistedInject
 class MangaViewModel(
@@ -290,6 +289,37 @@ class MangaViewModel(
                             sourceLang = successState.source.lang,
                             chapterDir = chapterDir,
                         ),
+                    )
+                }
+            }
+        }
+    }
+
+    /** Called by the translation button next to a chapter: translates the downloaded pages alone. */
+    fun translateChapter(chapterId: Long, action: ChapterProcessAction) {
+        when (action) {
+            ChapterProcessAction.CANCEL -> PostProcessManager.cancel(chapterId, translationOnly = true)
+            ChapterProcessAction.DELETE -> PostProcessManager.deleteTranslations(context, chapterId)
+            ChapterProcessAction.START -> {
+                val successState = successState ?: return
+                val chapter = successState.chapters.firstOrNull { it.id == chapterId }?.chapter ?: return
+                viewModelScope.launchIO {
+                    val chapterDir = downloadManager.findChapterDir(successState.source, successState.manga, chapter)
+                    if (chapterDir == null || !chapterDir.isDirectory) {
+                        PostProcessManager.fail(chapter.id, translationOnly = true)
+                        return@launchIO
+                    }
+                    PostProcessManager.enqueue(
+                        context,
+                        readerPreferences,
+                        PostProcessManager.Request(
+                            chapterId = chapter.id,
+                            mangaId = successState.manga.id,
+                            mangaTitle = successState.manga.title,
+                            sourceLang = successState.source.lang,
+                            chapterDir = chapterDir,
+                        ),
+                        translationOnly = true,
                     )
                 }
             }
