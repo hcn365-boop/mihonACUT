@@ -6,7 +6,9 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import com.hippo.unifile.UniFile
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
+import eu.kanade.translation.ChapterTranslationFile
 import eu.kanade.translation.PageTranslationService
+import eu.kanade.translation.TranslationCleaner
 import eu.kanade.translation.TranslationStore
 import eu.kanade.translation.model.PageTranslation
 import kotlinx.coroutines.CoroutineScope
@@ -29,18 +31,21 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.cancellation.CancellationException
 
 /**
- * Processes downloaded chapters in advance, one chapter at a time, with the batch settings (the "Batch"
- * tab) and not the real-time ones.
+ * Processes downloaded chapters in advance, one job at a time, with the batch settings (the "Batch" tab) and
+ * not the real-time ones. There are two kinds of job, each with its own button next to the chapter:
+ * - the full processing: the image steps (colorize, clean, upscale) and then the translation;
+ * - the translation alone: only the text is read and translated, the pages are not touched. It is also the way to
+ *   translate again a chapter whose translation failed, without processing the images a second time.
  *
  * Three independent options (settings of the Batch tab):
  * - keep the original pages: the processed pages go to a "processed" folder next to them. When it is off, the
  *   processed page replaces the original (same name), and nothing can be undone;
  * - draw the translation into the images: permanent. When it is off, the translation is kept apart and drawn
  *   when the page is read;
- * - where the separate translation is kept: in the app's storage, or as json files in the chapter folder.
+ * - where the separate translation is kept: in the app's storage, or as one json file in the chapter folder.
  *
  * The images never wait for the translator: the text of many pages is collected and sent together while
- * the next images are being processed.
+ * the next images are being processed. A failure of the translation does not undo the images.
  */
 object PostProcessManager {
 
@@ -53,7 +58,12 @@ object PostProcessManager {
         val chapterDir: UniFile,
     )
 
-    private class Entry(val context: Context, val prefs: ReaderPreferences, val request: Request)
+    private class Entry(
+        val context: Context,
+        val prefs: ReaderPreferences,
+        val request: Request,
+        val translationOnly: Boolean,
+    )
 
     /** What is known about one page while its chapter is processed. */
     private class PageRecord(
@@ -70,12 +80,13 @@ object PostProcessManager {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val queue = Channel<Entry>(Channel.UNLIMITED)
-    private val cancelled = ConcurrentHashMap.newKeySet<Long>()
+    private val cancelled = ConcurrentHashMap.newKeySet<String>()
     private val lock = Any()
     private var worker: Job? = null
 
+    /** The job that runs now, as "F12" (full processing) or "T12" (translation alone) for chapter 12. */
     @Volatile
-    private var runningId = -1L
+    private var runningKey: String? = null
 
     @Volatile
     private var runningJob: Job? = null
@@ -84,17 +95,24 @@ object PostProcessManager {
     private var loaded = false
 
     private val _states = MutableStateFlow<Map<Long, ChapterProcessState>>(emptyMap())
+    private val _translationStates = MutableStateFlow<Map<Long, ChapterProcessState>>(emptyMap())
 
-    /** The state of every chapter that is queued, running, done or failed. Others are not processed. */
+    /** The state of every chapter whose full processing is queued, running, done or failed. */
     val states: StateFlow<Map<Long, ChapterProcessState>> = _states.asStateFlow()
 
-    private fun setState(chapterId: Long, state: ChapterProcessState) {
-        _states.update { current ->
+    /** The same for the translation alone. */
+    val translationStates: StateFlow<Map<Long, ChapterProcessState>> = _translationStates.asStateFlow()
+
+    private fun key(chapterId: Long, translationOnly: Boolean) = (if (translationOnly) "T" else "F") + chapterId
+
+    private fun setState(chapterId: Long, state: ChapterProcessState, translationOnly: Boolean = false) {
+        val flow = if (translationOnly) _translationStates else _states
+        flow.update { current ->
             if (state == ChapterProcessState.NotProcessed) current - chapterId else current + (chapterId to state)
         }
     }
 
-    /** Loads the chapters that were processed in earlier runs of the app. Safe to call often. */
+    /** Loads what was done in earlier runs of the app. Safe to call often. */
     fun ensureLoaded(context: Context) {
         if (loaded) return
         loaded = true
@@ -107,36 +125,45 @@ object PostProcessManager {
                     done.filter { it !in current }.associateWith { ChapterProcessState.Processed } +
                     final.filter { it !in current }.associateWith { ChapterProcessState.ProcessedFinal }
             }
+            val translated = PostProcessStore.chaptersWithTranslationState(context, PostProcessStore.TRANSLATION_DONE)
+            val failed = PostProcessStore.chaptersWithTranslationState(context, PostProcessStore.TRANSLATION_ERROR)
+            _translationStates.update { current ->
+                current +
+                    translated.filter { it !in current }.associateWith { ChapterProcessState.Processed } +
+                    failed.filter { it !in current }.associateWith { ChapterProcessState.Error }
+            }
         }
     }
 
-    fun enqueue(context: Context, prefs: ReaderPreferences, request: Request) {
+    fun enqueue(context: Context, prefs: ReaderPreferences, request: Request, translationOnly: Boolean = false) {
         val id = request.chapterId
-        when (_states.value[id]) {
+        val flow = if (translationOnly) _translationStates else _states
+        when (flow.value[id]) {
             is ChapterProcessState.Processing, ChapterProcessState.Queued -> return
             else -> Unit
         }
         // Cancelled a moment ago and its entry is still in the queue: let that entry run again.
-        if (cancelled.remove(id)) {
-            setState(id, ChapterProcessState.Queued)
+        if (cancelled.remove(key(id, translationOnly))) {
+            setState(id, ChapterProcessState.Queued, translationOnly)
             return
         }
-        setState(id, ChapterProcessState.Queued)
-        queue.trySend(Entry(context.applicationContext, prefs, request))
+        setState(id, ChapterProcessState.Queued, translationOnly)
+        queue.trySend(Entry(context.applicationContext, prefs, request, translationOnly))
         startWorker()
     }
 
     /** Shows the error state of a chapter that could not even be queued (for example a CBZ file). */
-    fun fail(chapterId: Long) {
-        setState(chapterId, ChapterProcessState.Error)
+    fun fail(chapterId: Long, translationOnly: Boolean = false) {
+        setState(chapterId, ChapterProcessState.Error, translationOnly)
     }
 
-    fun cancel(chapterId: Long) {
-        if (runningId == chapterId) {
+    fun cancel(chapterId: Long, translationOnly: Boolean = false) {
+        val flow = if (translationOnly) _translationStates else _states
+        if (runningKey == key(chapterId, translationOnly)) {
             runningJob?.cancel()
-        } else if (_states.value[chapterId] == ChapterProcessState.Queued) {
-            cancelled.add(chapterId)
-            setState(chapterId, ChapterProcessState.NotProcessed)
+        } else if (flow.value[chapterId] == ChapterProcessState.Queued) {
+            cancelled.add(key(chapterId, translationOnly))
+            setState(chapterId, ChapterProcessState.NotProcessed, translationOnly)
         }
     }
 
@@ -146,7 +173,28 @@ object PostProcessManager {
         if (_states.value[chapterId] == ChapterProcessState.ProcessedFinal) return
         scope.launch {
             clearResults(context.applicationContext, chapterId)
+            PostProcessStore.setTranslationState(context.applicationContext, chapterId, 0)
             setState(chapterId, ChapterProcessState.NotProcessed)
+            setState(chapterId, ChapterProcessState.NotProcessed, translationOnly = true)
+        }
+    }
+
+    /** Deletes only the translations that batch processing made for a chapter (the pages stay as they are). */
+    fun deleteTranslations(context: Context, chapterId: Long) {
+        val app = context.applicationContext
+        scope.launch {
+            val hashes = PostProcessStore.pageHashesOfChapter(app, chapterId).toSet()
+            TranslationStore.deleteForHashes(app, hashes)
+            TranslationCleaner.deleteCachedPages(app, hashes)
+            PostProcessStore.chapterTranslationUri(app, chapterId)?.let { uri ->
+                runCatching { UniFile.fromUri(app, Uri.parse(uri))?.delete() }
+                PostProcessStore.clearChapterTranslation(app, chapterId)
+            }
+            PostProcessStore.setTranslationState(app, chapterId, 0)
+            setState(chapterId, ChapterProcessState.NotProcessed, translationOnly = true)
+            eu.kanade.tachiyomi.ui.reader.colorize.PostRead.forgetImports()
+            ChapterTranslationFile.forget()
+            AiConfig.requestReload()
         }
     }
 
@@ -162,7 +210,7 @@ object PostProcessManager {
             if (worker?.isActive == true) return
             worker = scope.launch {
                 for (entry in queue) {
-                    if (cancelled.remove(entry.request.chapterId)) continue
+                    if (cancelled.remove(key(entry.request.chapterId, entry.translationOnly))) continue
                     run(entry)
                 }
             }
@@ -172,35 +220,46 @@ object PostProcessManager {
     private suspend fun run(entry: Entry) {
         val id = entry.request.chapterId
         val context = entry.context
+        val only = entry.translationOnly
         val keepOriginals = entry.prefs.postKeepOriginals.get()
         val job = scope.launch {
             try {
-                setState(id, ChapterProcessState.Processing(0f))
-                process(entry)
-                if (keepOriginals) {
-                    PostProcessStore.setChapter(context, id, PostProcessStore.STATE_PROCESSED)
-                    setState(id, ChapterProcessState.Processed)
+                setState(id, ChapterProcessState.Processing(0f), only)
+                if (only) {
+                    translateOnly(entry)
+                    PostProcessStore.setTranslationState(context, id, PostProcessStore.TRANSLATION_DONE)
+                    setState(id, ChapterProcessState.Processed, translationOnly = true)
                 } else {
-                    PostProcessStore.setChapter(context, id, PostProcessStore.STATE_FINAL)
-                    setState(id, ChapterProcessState.ProcessedFinal)
+                    process(entry)
+                    if (keepOriginals) {
+                        PostProcessStore.setChapter(context, id, PostProcessStore.STATE_PROCESSED)
+                        setState(id, ChapterProcessState.Processed)
+                    } else {
+                        PostProcessStore.setChapter(context, id, PostProcessStore.STATE_FINAL)
+                        setState(id, ChapterProcessState.ProcessedFinal)
+                    }
                 }
                 PostProcessStore.refresh(context)
             } catch (e: CancellationException) {
                 // With the originals replaced, the pages already done stay done: they cannot be undone.
-                if (keepOriginals) clearResults(context, id)
-                setState(id, ChapterProcessState.NotProcessed)
+                if (!only && keepOriginals) clearResults(context, id)
+                setState(id, ChapterProcessState.NotProcessed, only)
                 throw e
             } catch (e: Throwable) {
                 logcat(LogPriority.ERROR, e)
-                PostProcessStore.setChapter(context, id, PostProcessStore.STATE_ERROR)
-                setState(id, ChapterProcessState.Error)
+                if (only) {
+                    PostProcessStore.setTranslationState(context, id, PostProcessStore.TRANSLATION_ERROR)
+                } else {
+                    PostProcessStore.setChapter(context, id, PostProcessStore.STATE_ERROR)
+                }
+                setState(id, ChapterProcessState.Error, only)
             }
         }
-        runningId = id
+        runningKey = key(id, only)
         runningJob = job
         job.join()
         runningJob = null
-        runningId = -1L
+        runningKey = null
     }
 
     private suspend fun process(entry: Entry) {
@@ -260,6 +319,7 @@ object PostProcessManager {
 
                 // 2. The text: read it now and give it to the translation service, which sends the text of
                 // several pages together (the limits of the batch settings) and not one request per page.
+                // A failure here must not undo the images: it is reported on the translation button.
                 if (translation != null) {
                     var bitmap: Bitmap? = null
                     try {
@@ -271,6 +331,11 @@ object PostProcessManager {
                             translation.limits,
                         ) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size).also { bitmap = it } }
                         waiting.add(record to deferred)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        logcat(LogPriority.ERROR, e)
+                        PostProcessStore.setTranslationState(context, request.chapterId, PostProcessStore.TRANSLATION_ERROR)
                     } finally {
                         bitmap?.recycle()
                     }
@@ -284,42 +349,121 @@ object PostProcessManager {
             }
 
             // 3. Send what is still waiting, then wait for the translations of the chapter and put each one
-            // where the options say.
+            // where the options say. If this fails the images stay as they are, and the translation button
+            // shows the error, so the translation alone can be tried again.
             if (translation != null && waiting.isNotEmpty()) {
-                PageTranslationService.flushNow(translation.limits)
-                // The translations of the chapter are collected and saved ONCE at the end: one file, or one
-                // database transaction, and never one write per page.
-                val translated = LinkedHashMap<String, PageTranslation>()
-                waiting.forEachIndexed { index, (record, deferred) ->
-                    val page = deferred.await()
-                    if (page != null && page.blocks.isNotEmpty()) {
-                        if (inImages) {
-                            burn(context, request, chapterDir, keepOriginals, record, page)
-                        } else {
-                            translated[record.readHash] = page
+                try {
+                    PageTranslationService.flushNow(translation.limits)
+                    val translated = LinkedHashMap<String, PageTranslation>()
+                    waiting.forEachIndexed { index, (record, deferred) ->
+                        val page = deferred.await()
+                        if (page != null && page.blocks.isNotEmpty()) {
+                            if (inImages) {
+                                burn(context, request, chapterDir, keepOriginals, record, page)
+                            } else {
+                                translated[record.readHash] = page
+                            }
                         }
+                        setState(
+                            request.chapterId,
+                            ChapterProcessState.Processing(imageShare + (1f - imageShare) * (index + 1f) / waiting.size),
+                        )
                     }
-                    setState(
-                        request.chapterId,
-                        ChapterProcessState.Processing(imageShare + (1f - imageShare) * (index + 1f) / waiting.size),
-                    )
-                }
-                if (translated.isNotEmpty()) {
-                    // The copies the reader draws from go to the app's storage in one transaction, in every case.
-                    TranslationStore.saveAll(
-                        context,
-                        TranslationStore.Kind.TRANSLATED,
-                        translated.mapKeys { PostRead.translationName(it.key) },
-                    )
-                    if (inFolder) {
-                        // And the chapter file: the rows of all its pages (text, language and these copies).
-                        val hashes = records.flatMap { listOf(it.originalHash, it.readHash) }.distinct()
-                        val rows = TranslationStore.exportForHashes(context, hashes)
-                        val file = PostTranslationFiles.writeRows(chapterDir, rows)
-                        PostProcessStore.setChapterTranslationUri(context, request.chapterId, file.uri.toString())
-                    }
+                    saveSeparate(context, request, chapterDir, inFolder, translated, records.map { it.originalHash to it.readHash })
+                    PostProcessStore.setTranslationState(context, request.chapterId, PostProcessStore.TRANSLATION_DONE)
+                    setState(request.chapterId, ChapterProcessState.Processed, translationOnly = true)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logcat(LogPriority.ERROR, e)
+                    PostProcessStore.setTranslationState(context, request.chapterId, PostProcessStore.TRANSLATION_ERROR)
+                    setState(request.chapterId, ChapterProcessState.Error, translationOnly = true)
                 }
             }
+        }
+    }
+
+    /**
+     * The translation alone: the text of every page is read and translated, and the pages are not touched.
+     * The translation is always kept apart (never drawn into the images), where the options say.
+     */
+    private suspend fun translateOnly(entry: Entry) {
+        val request = entry.request
+        val context = entry.context
+        val inFolder = entry.prefs.postTranslationInFolder.get()
+
+        val chapterDir = request.chapterDir
+        val pages = listPages(chapterDir)
+        if (pages.isEmpty()) error("The chapter has no downloaded pages")
+
+        val snapshot = AiConfig.postSnapshot(entry.prefs, request.mangaId, request.mangaTitle, request.sourceLang)
+        AiConfig.withSnapshot(snapshot) {
+            val translation = AiConfig.translation
+                ?: error("Translation is turned off in the Batch settings")
+            PostProcessStore.registerChapter(context, request.chapterId, request.mangaId)
+
+            val waiting = ArrayList<Pair<String, Deferred<PageTranslation?>>>()
+            pages.forEachIndexed { index, uri ->
+                kotlin.coroutines.coroutineContext.ensureActive()
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: error("Cannot read the page $uri")
+                val hash = PageColorizer.contentHash(bytes)
+
+                // The reader looks a page up by its fingerprint: a page batch processing never saw is marked
+                // "leave as it is", so the reader finds it and draws the translation on it.
+                if (!PostProcessStore.hasPage(context, hash)) {
+                    PostProcessStore.savePage(context, request.chapterId, hash, "")
+                }
+
+                var bitmap: Bitmap? = null
+                try {
+                    val deferred = PageTranslationService.enqueueTracked(
+                        context,
+                        translation.effectiveSettings(),
+                        translation.ocrMode,
+                        hash,
+                        translation.limits,
+                    ) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size).also { bitmap = it } }
+                    waiting.add(hash to deferred)
+                } finally {
+                    bitmap?.recycle()
+                }
+                setState(request.chapterId, ChapterProcessState.Processing((index + 1f) / pages.size * 0.9f), true)
+            }
+
+            PageTranslationService.flushNow(translation.limits)
+            val translated = LinkedHashMap<String, PageTranslation>()
+            waiting.forEachIndexed { index, (hash, deferred) ->
+                val page = deferred.await()
+                if (page != null && page.blocks.isNotEmpty()) translated[hash] = page
+                setState(request.chapterId, ChapterProcessState.Processing(0.9f + 0.1f * (index + 1f) / waiting.size), true)
+            }
+            saveSeparate(context, request, chapterDir, inFolder, translated, waiting.map { it.first to it.first })
+        }
+    }
+
+    /** Puts the translations of a chapter, kept apart from the images, where the options say. */
+    private fun saveSeparate(
+        context: Context,
+        request: Request,
+        chapterDir: UniFile,
+        inFolder: Boolean,
+        translated: Map<String, PageTranslation>,
+        hashes: List<Pair<String, String>>,
+    ) {
+        if (translated.isEmpty()) return
+        // The copies the reader draws from go to the app's storage in one transaction, in every case.
+        TranslationStore.saveAll(
+            context,
+            TranslationStore.Kind.TRANSLATED,
+            translated.mapKeys { PostRead.translationName(it.key) },
+        )
+        if (inFolder) {
+            // And the chapter file: the rows of all its pages (text, language and these copies).
+            val all = hashes.flatMap { listOf(it.first, it.second) }.distinct()
+            val rows = TranslationStore.exportForHashes(context, all)
+            val file = PostTranslationFiles.writeRows(chapterDir, rows)
+            PostProcessStore.setChapterTranslationUri(context, request.chapterId, file.uri.toString())
         }
     }
 
