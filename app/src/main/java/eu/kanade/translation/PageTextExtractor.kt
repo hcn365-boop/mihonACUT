@@ -80,7 +80,7 @@ class PageTextExtractor(
                 )
             }
             OcrMode.HYBRID -> {
-                // 1. ML Kit على الصورة الكاملة (بعد فلتر رمادي) ودمج الكتل بدون حل التصادمات
+                // 1. تشغيل ML Kit على نسخة رمادية معتدلة التباين ودمج الكتل بدون حل التصادمات حتى تبقى أماكنها كما هي أثناء القص
                 val mlBoxes = extractMlKitBoxesWithFilter(bitmap)
                 if (mlBoxes.isEmpty()) return null
 
@@ -94,7 +94,7 @@ class PageTextExtractor(
                 )
                 if (mergedMlBlocks.isEmpty()) return null
 
-                // 2. إرسال الكتل المدمجة (بمكانها الأصلي) إلى Hybrid/Paddle بعد قص كل منطقة
+                // 2. إرسال الكتل المدمجة (بمكانها الأصلي) إلى Hybrid/Paddle بعد قص كل منطقة من الصورة الأصلية
                 val ctx = context
                 val recognizedBlocks = if (ctx != null) {
                     val hybridRecognizer = HybridTextRecognizer(ctx, recognizerLanguage)
@@ -108,11 +108,7 @@ class PageTextExtractor(
                             if (recognizedText.isNotBlank()) {
                                 block.copy(text = recognizedText.trim())
                             } else {
-                                // ✅ إصلاح: لا تحذف الفقاعة، احتفظ بنص MLKit الأصلي الذي نجح في الوضع الخام
-                                logcat(LogPriority.WARN) {
-                                    "Hybrid returned blank for block at (${block.x}, ${block.y}), keeping original MLKit text"
-                                }
-                                block
+                                null
                             }
                         }.toMutableList()
                     } catch (e: Exception) {
@@ -133,16 +129,12 @@ class PageTextExtractor(
                         if (recognizedText.isNotBlank()) {
                             block.copy(text = recognizedText.trim())
                         } else {
-                            // ✅ إصلاح: احتفظ بالبلوك بنص MLKit الأصلي
-                            logcat(LogPriority.WARN) {
-                                "Paddle fallback returned blank for block at (${block.x}, ${block.y}), keeping original MLKit text"
-                            }
-                            block
+                            null
                         }
                     }.toMutableList()
                 }
 
-                // 3. حل التصادمات كدالة مستقلة قبل النتيجة النهائية
+                // 3. تشغيل إصلاح التصادمات كدالة مستقلة قبل النتيجة النهائية لوضع Hybrid
                 if (recognizedBlocks.isNotEmpty()) {
                     TextBlockMerger.resolveCollisions(
                         blocks = recognizedBlocks,
@@ -169,6 +161,10 @@ class PageTextExtractor(
         }
     }
 
+    /**
+     * فلتر رمادي معتدل التباين بدون تكبير لتحسين قراءة النصوص في ML Kit
+     * مع الحفاظ على حواف الحروف الدقيقة ومنع تكسرها أو تغيير الإحداثيات.
+     */
     private fun createOcrGrayscaleFilterBitmap(original: Bitmap): Bitmap {
         val config = original.config ?: Bitmap.Config.ARGB_8888
         val output = Bitmap.createBitmap(original.width, original.height, config)
