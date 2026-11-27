@@ -77,6 +77,7 @@ class MangaScreen(
         val context = LocalContext.current
         LaunchedEffect(Unit) { PostProcessManager.ensureLoaded(context) }
         val processStates by PostProcessManager.states.collectAsStateWithLifecycle()
+        val translateStates by PostProcessManager.translationStates.collectAsStateWithLifecycle()
         val haptic = LocalHapticFeedback.current
         val scope = rememberCoroutineScope()
         val viewModel =
@@ -118,6 +119,8 @@ class MangaScreen(
             onDownloadChapter = viewModel::runChapterDownloadActions.takeIf { !successState.source.isLocalOrStub() },
             processStates = processStates,
             onProcessChapter = viewModel::processChapter.takeIf { !successState.source.isLocalOrStub() },
+            translateStates = translateStates,
+            onTranslateChapter = viewModel::translateChapter.takeIf { !successState.source.isLocalOrStub() },
             onAddToLibraryClicked = {
                 viewModel.toggleFavorite()
                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
