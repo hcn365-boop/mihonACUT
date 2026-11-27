@@ -26,6 +26,10 @@ object PostProcessStore {
     /** The chapter is being processed. */
     const val STATE_RUNNING = 0
     const val STATE_PROCESSED = 1
+
+    /** The translation of a chapter (a state kept apart from the one of its images). */
+    const val TRANSLATION_DONE = 1
+    const val TRANSLATION_ERROR = 2
     const val STATE_ERROR = 2
 
     /** Processed with the original pages replaced. */
@@ -145,6 +149,30 @@ object PostProcessStore {
         db(context).rawQuery("SELECT chapter FROM pages WHERE hash = ?", arrayOf(hash))
             .use { if (it.moveToFirst()) it.getLong(0) else null }
 
+    fun setTranslationState(context: Context, chapterId: Long, state: Int) {
+        val values = ContentValues().apply { put("translation_state", state) }
+        val updated = db(context).update("chapters", values, "chapter = ?", arrayOf(chapterId.toString()))
+        if (updated == 0) {
+            values.put("chapter", chapterId)
+            values.put("state", STATE_RUNNING)
+            values.put("updated", System.currentTimeMillis())
+            db(context).insert("chapters", null, values)
+        }
+    }
+
+    fun chaptersWithTranslationState(context: Context, state: Int): Set<Long> =
+        db(context).rawQuery("SELECT chapter FROM chapters WHERE translation_state = ?", arrayOf(state.toString()))
+            .use { cursor -> buildSet { while (cursor.moveToNext()) add(cursor.getLong(0)) } }
+
+    /** True when batch processing already knows this page (processed, or marked "leave as it is"). */
+    fun hasPage(context: Context, hash: String): Boolean =
+        db(context).rawQuery("SELECT 1 FROM pages WHERE hash = ?", arrayOf(hash)).use { it.moveToFirst() }
+
+    /** The fingerprints of the pages of a chapter that batch processing knows. */
+    fun pageHashesOfChapter(context: Context, chapterId: Long): List<String> =
+        db(context).rawQuery("SELECT hash FROM pages WHERE chapter = ?", arrayOf(chapterId.toString()))
+            .use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getString(0)) } }
+
     fun chaptersWithState(context: Context, state: Int): Set<Long> =
         db(context).rawQuery("SELECT chapter FROM chapters WHERE state = ?", arrayOf(state.toString()))
             .use { cursor -> buildSet { while (cursor.moveToNext()) add(cursor.getLong(0)) } }
@@ -173,18 +201,19 @@ object PostProcessStore {
         refresh(context)
     }
 
-    private class Helper(context: Context) : SQLiteOpenHelper(context, "post_process.db", null, 4) {
+    private class Helper(context: Context) : SQLiteOpenHelper(context, "post_process.db", null, 5) {
         override fun onCreate(db: SQLiteDatabase) {
             db.execSQL("CREATE TABLE pages (hash TEXT PRIMARY KEY, chapter INTEGER NOT NULL, uri TEXT NOT NULL)")
             db.execSQL("CREATE INDEX pages_chapter ON pages (chapter)")
             db.execSQL(
-                "CREATE TABLE chapters (chapter INTEGER PRIMARY KEY, state INTEGER NOT NULL, updated INTEGER NOT NULL, translation TEXT, manga INTEGER NOT NULL DEFAULT -1)",
+                "CREATE TABLE chapters (chapter INTEGER PRIMARY KEY, state INTEGER NOT NULL, updated INTEGER NOT NULL, translation TEXT, manga INTEGER NOT NULL DEFAULT -1, translation_state INTEGER NOT NULL DEFAULT 0)",
             )
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
             if (oldVersion < 3) db.execSQL("ALTER TABLE chapters ADD COLUMN translation TEXT")
             if (oldVersion < 4) db.execSQL("ALTER TABLE chapters ADD COLUMN manga INTEGER NOT NULL DEFAULT -1")
+            if (oldVersion < 5) db.execSQL("ALTER TABLE chapters ADD COLUMN translation_state INTEGER NOT NULL DEFAULT 0")
         }
     }
 }
