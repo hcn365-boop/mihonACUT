@@ -6,8 +6,8 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import eu.kanade.tachiyomi.ui.reader.colorize.AiConfig
 import eu.kanade.translation.model.PageTranslation
-import java.security.MessageDigest
 import kotlinx.serialization.json.Json
+import java.security.MessageDigest
 
 /**
  * Keeps what was read and translated from each page, in one SQLite database in the app's private
@@ -20,14 +20,14 @@ import kotlinx.serialization.json.Json
  */
 object TranslationStore {
 
-    enum class Kind(val id: Int) {
+        enum class Kind(val id: Int) {
         OCR(0),
         TRANSLATED(1),
 
         /** The language the OCR of a page was run with, as a plain name. */
         LANGUAGE(2),
-    }
-
+        }
+        
     private const val DATABASE = "translations.db"
     private const val TABLE = "pages"
 
@@ -42,14 +42,10 @@ object TranslationStore {
                 "CREATE TABLE $TABLE (name TEXT NOT NULL, kind INTEGER NOT NULL, data TEXT NOT NULL, " +
                     "updated INTEGER NOT NULL, manga INTEGER NOT NULL DEFAULT -1, PRIMARY KEY (name, kind))",
             )
-            db.execSQL("CREATE INDEX IF NOT EXISTS idx_${TABLE}_manga ON $TABLE(manga)")
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            if (oldVersion < 2) {
-                db.execSQL("ALTER TABLE $TABLE ADD COLUMN manga INTEGER NOT NULL DEFAULT -1")
-            }
-            db.execSQL("CREATE INDEX IF NOT EXISTS idx_${TABLE}_manga ON $TABLE(manga)")
+            if (oldVersion < 2) db.execSQL("ALTER TABLE $TABLE ADD COLUMN manga INTEGER NOT NULL DEFAULT -1")
         }
     }
 
@@ -74,7 +70,7 @@ object TranslationStore {
         ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null } ?: return null
         return try {
             json.decodeFromString(PageTranslation.serializer(), data)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             // A damaged row is removed so the page is processed again.
             db.delete(TABLE, "name = ? AND kind = ?", arrayOf(name, kind.id.toString()))
             null
@@ -108,7 +104,7 @@ object TranslationStore {
         }
         database(context).insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
     }
-
+    
     /** Saves many pages in one transaction: much faster than one save after another. */
     fun saveAll(context: Context, kind: Kind, pages: Map<String, PageTranslation>, manga: Long = AiConfig.mangaId) {
         if (pages.isEmpty()) return
@@ -116,14 +112,14 @@ object TranslationStore {
         db.beginTransaction()
         try {
             val now = System.currentTimeMillis()
-            val values = ContentValues()
             for ((name, page) in pages) {
-                values.clear()
-                values.put("name", name)
-                values.put("kind", kind.id)
-                values.put("manga", manga)
-                values.put("data", json.encodeToString(PageTranslation.serializer(), page))
-                values.put("updated", now)
+                val values = ContentValues().apply {
+                    put("name", name)
+                    put("kind", kind.id)
+                    put("manga", manga)
+                    put("data", json.encodeToString(PageTranslation.serializer(), page))
+                    put("updated", now)
+                }
                 db.insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
             }
             db.setTransactionSuccessful()
@@ -144,12 +140,7 @@ object TranslationStore {
         db.beginTransaction()
         try {
             for (hash in hashes) {
-                val escaped = escapeLike(hash)
-                deleted += db.delete(
-                    TABLE,
-                    "name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\'",
-                    arrayOf("$escaped%", "post_$escaped%"),
-                )
+                deleted += db.delete(TABLE, "name LIKE ? OR name LIKE ?", arrayOf("$hash%", "post_$hash%"))
             }
             db.setTransactionSuccessful()
         } finally {
@@ -157,9 +148,6 @@ object TranslationStore {
         }
         return deleted
     }
-
-    private fun escapeLike(value: String): String =
-        value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     /**
      * Deletes everything saved while reading or processing one manga. Rows saved before this existed have no
@@ -175,13 +163,11 @@ object TranslationStore {
      */
     fun exportForHashes(context: Context, hashes: Collection<String>): Map<String, String> {
         val rows = LinkedHashMap<String, String>()
-        if (hashes.isEmpty()) return rows
         val db = database(context)
         for (hash in hashes) {
-            val escaped = escapeLike(hash)
             db.rawQuery(
-                "SELECT name, kind, data FROM $TABLE WHERE name LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\'",
-                arrayOf("$escaped%", "post_$escaped%"),
+                "SELECT name, kind, data FROM $TABLE WHERE name LIKE ? OR name LIKE ?",
+                arrayOf("$hash%", "post_$hash%"),
             ).use { cursor ->
                 while (cursor.moveToNext()) rows["${cursor.getInt(1)}|${cursor.getString(0)}"] = cursor.getString(2)
             }
@@ -196,15 +182,15 @@ object TranslationStore {
         db.beginTransaction()
         try {
             val now = System.currentTimeMillis()
-            val values = ContentValues()
             for ((key, data) in rows) {
                 val kind = key.substringBefore('|').toIntOrNull() ?: continue
-                values.clear()
-                values.put("name", key.substringAfter('|'))
-                values.put("kind", kind)
-                values.put("manga", manga)
-                values.put("data", data)
-                values.put("updated", now)
+                val values = ContentValues().apply {
+                    put("name", key.substringAfter('|'))
+                    put("kind", kind)
+                    put("manga", manga)
+                    put("data", data)
+                    put("updated", now)
+                }
                 db.insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_IGNORE)
             }
             db.setTransactionSuccessful()
@@ -213,6 +199,13 @@ object TranslationStore {
         }
     }
 
+    /** The fingerprints of the pages that have something saved for this manga (read before deleting). */
+    fun hashesForManga(context: Context, mangaId: Long): Set<String> =
+        database(context).rawQuery("SELECT name FROM $TABLE WHERE manga = ?", arrayOf(mangaId.toString()))
+            .use { cursor ->
+                buildSet { while (cursor.moveToNext()) add(cursor.getString(0).removePrefix("post_").take(64)) }
+            }
+
     /** Deletes everything of one kind, or of both kinds when [kind] is null. */
     fun clear(context: Context, kind: Kind? = null) {
         val db = database(context)
@@ -220,10 +213,4 @@ object TranslationStore {
     }
 
     fun sizeBytes(context: Context): Long = context.getDatabasePath(DATABASE).length()
-
-    @Synchronized
-    fun close() {
-        helper?.close()
-        helper = null
-    }
 }
