@@ -66,6 +66,8 @@ fun MangaChapterListItem(
     processStateProvider: () -> ChapterProcessState = { ChapterProcessState.NotProcessed },
     onProcessClick: ((ChapterProcessAction) -> Unit)? = null,
     onChapterSwipe: (LibraryPreferences.ChapterSwipeAction) -> Unit,
+    translateStateProvider: () -> ChapterProcessState = { ChapterProcessState.NotProcessed },
+    onTranslateClick: ((ChapterProcessAction) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val start = getSwipeAction(
@@ -183,6 +185,15 @@ fun MangaChapterListItem(
             )
 
             // Only a downloaded chapter has pages to process.
+            if (onTranslateClick != null && downloadStateProvider() == Download.State.DOWNLOADED) {
+                ChapterTranslateIndicator(
+                    enabled = true,
+                    modifier = Modifier.padding(start = 4.dp),
+                    stateProvider = translateStateProvider,
+                    onClick = onTranslateClick,
+                )
+            }
+
             if (onProcessClick != null && downloadStateProvider() == Download.State.DOWNLOADED) {
                 ChapterProcessIndicator(
                     enabled = true,
