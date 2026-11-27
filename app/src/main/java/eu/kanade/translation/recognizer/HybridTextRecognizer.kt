@@ -43,6 +43,7 @@ class HybridTextRecognizer(
         return results.joinToString("\n") { it.text }
     }
 
+    // دمج كل نتائج Paddle داخل صندوق ML Kit الواحد في فقاعة واحدة
     fun recognizeWithBoxes(image: InputImage): List<HybridResult> {
         val bitmap = image.bitmapInternal ?: return emptyList()
         val results = mutableListOf<HybridResult>()
@@ -102,22 +103,13 @@ class HybridTextRecognizer(
                     // تشغيل Paddle على المنطقة المقصوصة والمدوّرة
                     val paddleText = runPaddleOnCrop(croppedData.rotated)
 
-                    // ✅ إصلاح 1: لو فشل Paddle داخل هذا البلوك، ارجع لنص MLKit بدل حذف البلوك
-                    val finalText = if (paddleText.isNotBlank()) {
-                        paddleText.trim()
-                    } else {
-                        block.text.trim()
-                    }
-
-                    if (finalText.isNotBlank()) {
+                    if (paddleText.isNotBlank()) {
                         results.add(
                             HybridResult(
-                                text = finalText,
+                                text = paddleText.trim(),
                                 box = croppedData.adjustedBox,
                             ),
                         )
-                    } else {
-                        Log.d(tag, "Block at (${box.left}, ${box.top}) produced blank text, skipped")
                     }
                 } finally {
                     // تنظيف الذاكرة في جميع الحالات
@@ -130,55 +122,10 @@ class HybridTextRecognizer(
                 }
             }
 
-            // ✅ إصلاح 2 (الأهم): إذا فشل MLKit الداخلي تماماً ولم يجد أي بلوك،
-            // شغّل Paddle على القصّة كاملة بدل إرجاع emptyList() وحذف الفقاعة
-            if (results.isEmpty()) {
-                Log.d(tag, "MLKit internal found no blocks, falling back to Paddle on full crop")
-                val fallbackText = runPaddleOnCrop(bitmap)
-                if (fallbackText.isNotBlank()) {
-                    results.add(
-                        HybridResult(
-                            text = fallbackText.trim(),
-                            box = HybridBox(
-                                x = 0,
-                                y = 0,
-                                width = bitmap.width,
-                                height = bitmap.height,
-                                angle = 0f,
-                            ),
-                        ),
-                    )
-                } else {
-                    Log.w(tag, "Paddle fallback also returned blank text for full crop")
-                }
-            }
-
             return results
         } catch (e: Exception) {
             Log.e(tag, "فشل في تشغيل النظام الهجين", e)
-            // ✅ إصلاح 3: حتى لو انهار MLKit، جرّب Paddle على القصّة كاملة
-            return try {
-                val fallbackText = runPaddleOnCrop(bitmap)
-                if (fallbackText.isNotBlank()) {
-                    listOf(
-                        HybridResult(
-                            text = fallbackText.trim(),
-                            box = HybridBox(
-                                x = 0,
-                                y = 0,
-                                width = bitmap.width,
-                                height = bitmap.height,
-                                angle = 0f,
-                            ),
-                        ),
-                    )
-                } else {
-                    emptyList()
-                }
-            } catch (e2: Exception) {
-                Log.e(tag, "Paddle fallback also failed", e2)
-                emptyList()
-            }
+            return emptyList()
         }
     }
 
