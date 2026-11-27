@@ -86,13 +86,25 @@ object PageTranslationRenderer {
         typeface: Typeface,
         boldText: Boolean,
     ) {
+        val maxCanvasW = canvas.width.toFloat()
+        val maxCanvasH = canvas.height.toFloat()
+        if (maxCanvasW < MIN_BOX_PX || maxCanvasH < MIN_BOX_PX) return
+
         val paddingX = block.width * scale * 0.03f
         val paddingY = block.height * scale * 0.03f
 
-        val left = max(block.x * scale + paddingX, 0f)
-        val top = max(block.y * scale + paddingY, 0f)
-        val right = max(left + (block.width * scale) - (paddingX * 2), left + 10f)
-        val bottom = max(top + (block.height * scale) - (paddingY * 2), top + 10f)
+        val left = ((block.x + block.width) * scale - paddingX).coerceAtMost(maxCanvasW)
+            .let { rightCandidate ->
+                val rawLeft = max(block.x * scale + paddingX, 0f)
+                min(rawLeft, max(0f, rightCandidate - MIN_BOX_PX))
+            }
+        val top = ((block.y + block.height) * scale - paddingY).coerceAtMost(maxCanvasH)
+            .let { bottomCandidate ->
+                val rawTop = max(block.y * scale + paddingY, 0f)
+                min(rawTop, max(0f, bottomCandidate - MIN_BOX_PX))
+            }
+        val right = min(max((block.x + block.width) * scale - paddingX, left + MIN_BOX_PX), maxCanvasW)
+        val bottom = min(max((block.y + block.height) * scale - paddingY, top + MIN_BOX_PX), maxCanvasH)
 
         val width = right - left
         val height = bottom - top
@@ -126,12 +138,12 @@ object PageTranslationRenderer {
     private fun calculateBoxCoordinates(bitmap: Bitmap, block: TranslationBlock, scale: Float): BoxMetrics {
         val padX = block.symWidth * 1.6f
         val padY = block.symHeight * 1.2f
-        val left = max((block.x - padX / 2) * scale, 0f)
-        val top = max((block.y - padY / 2) * scale, 0f)
-        val right = min(left + (block.width + padX) * scale, bitmap.width.toFloat())
-        val bottom = min(top + (block.height + padY) * scale, bitmap.height.toFloat())
-        val width = right - left
-        val height = bottom - top
+        val left = max((block.x - padX / 2f) * scale, 0f)
+        val top = max((block.y - padY / 2f) * scale, 0f)
+        val right = min((block.x + block.width + padX / 2f) * scale, bitmap.width.toFloat())
+        val bottom = min((block.y + block.height + padY / 2f) * scale, bitmap.height.toFloat())
+        val width = max(0f, right - left)
+        val height = max(0f, bottom - top)
         return BoxMetrics(left, top, right, bottom, width, height)
     }
 
