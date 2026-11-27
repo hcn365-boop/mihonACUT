@@ -125,6 +125,8 @@ fun MangaScreen(
     // Batch processing of downloaded chapters
     processStates: Map<Long, ChapterProcessState> = emptyMap(),
     onProcessChapter: ((Long, ChapterProcessAction) -> Unit)? = null,
+    translateStates: Map<Long, ChapterProcessState> = emptyMap(),
+    onTranslateChapter: ((Long, ChapterProcessAction) -> Unit)? = null,
 
     // Chapter selection
     onChapterSelected: (ChapterList.Item, Boolean, Boolean) -> Unit,
@@ -150,6 +152,8 @@ fun MangaScreen(
             onDownloadChapter = onDownloadChapter,
             processStates = processStates,
             onProcessChapter = onProcessChapter,
+            translateStates = translateStates,
+            onTranslateChapter = onTranslateChapter,
             onAddToLibraryClicked = onAddToLibraryClicked,
             onWebViewClicked = onWebViewClicked,
             onWebViewLongClicked = onWebViewLongClicked,
@@ -188,6 +192,8 @@ fun MangaScreen(
             onDownloadChapter = onDownloadChapter,
             processStates = processStates,
             onProcessChapter = onProcessChapter,
+            translateStates = translateStates,
+            onTranslateChapter = onTranslateChapter,
             onAddToLibraryClicked = onAddToLibraryClicked,
             onWebViewClicked = onWebViewClicked,
             onWebViewLongClicked = onWebViewLongClicked,
@@ -229,6 +235,8 @@ private fun MangaScreenSmallImpl(
     onDownloadChapter: ((List<ChapterList.Item>, ChapterDownloadAction) -> Unit)?,
     processStates: Map<Long, ChapterProcessState>,
     onProcessChapter: ((Long, ChapterProcessAction) -> Unit)?,
+    translateStates: Map<Long, ChapterProcessState>,
+    onTranslateChapter: ((Long, ChapterProcessAction) -> Unit)?,
     onAddToLibraryClicked: () -> Unit,
     onWebViewClicked: (() -> Unit)?,
     onWebViewLongClicked: (() -> Unit)?,
@@ -454,6 +462,8 @@ private fun MangaScreenSmallImpl(
                         onDownloadChapter = onDownloadChapter,
                         processStates = processStates,
                         onProcessChapter = onProcessChapter,
+                        translateStates = translateStates,
+                        onTranslateChapter = onTranslateChapter,
                         onChapterSelected = onChapterSelected,
                         onChapterSwipe = onChapterSwipe,
                     )
@@ -475,6 +485,8 @@ fun MangaScreenLargeImpl(
     onDownloadChapter: ((List<ChapterList.Item>, ChapterDownloadAction) -> Unit)?,
     processStates: Map<Long, ChapterProcessState>,
     onProcessChapter: ((Long, ChapterProcessAction) -> Unit)?,
+    translateStates: Map<Long, ChapterProcessState>,
+    onTranslateChapter: ((Long, ChapterProcessAction) -> Unit)?,
     onAddToLibraryClicked: () -> Unit,
     onWebViewClicked: (() -> Unit)?,
     onWebViewLongClicked: (() -> Unit)?,
@@ -695,6 +707,8 @@ fun MangaScreenLargeImpl(
                                 onDownloadChapter = onDownloadChapter,
                                 processStates = processStates,
                                 onProcessChapter = onProcessChapter,
+                                translateStates = translateStates,
+                                onTranslateChapter = onTranslateChapter,
                                 onChapterSelected = onChapterSelected,
                                 onChapterSwipe = onChapterSwipe,
                             )
@@ -758,6 +772,8 @@ private fun LazyListScope.sharedChapterItems(
     onDownloadChapter: ((List<ChapterList.Item>, ChapterDownloadAction) -> Unit)?,
     processStates: Map<Long, ChapterProcessState>,
     onProcessChapter: ((Long, ChapterProcessAction) -> Unit)?,
+    translateStates: Map<Long, ChapterProcessState>,
+    onTranslateChapter: ((Long, ChapterProcessAction) -> Unit)?,
     onChapterSelected: (ChapterList.Item, Boolean, Boolean) -> Unit,
     onChapterSwipe: (ChapterList.Item, LibraryPreferences.ChapterSwipeAction) -> Unit,
 ) {
@@ -825,6 +841,12 @@ private fun LazyListScope.sharedChapterItems(
                     processStateProvider = { processStates[item.id] ?: ChapterProcessState.NotProcessed },
                     onProcessClick = if (onProcessChapter != null) {
                         { onProcessChapter(item.id, it) }
+                    } else {
+                        null
+                    },
+                    translateStateProvider = { translateStates[item.id] ?: ChapterProcessState.NotProcessed },
+                    onTranslateClick = if (onTranslateChapter != null) {
+                        { onTranslateChapter(item.id, it) }
                     } else {
                         null
                     },
