@@ -65,7 +65,7 @@ object PageColorizer {
     private const val DEFAULT_COLORIZE_FILTER_RED = 255
     private const val DEFAULT_COLORIZE_FILTER_GREEN = 255
     private const val DEFAULT_COLORIZE_FILTER_BLUE = 255
-    private const val DEFAULT_COLORIZE_FILTER_ALPHA = 100
+    private const val DEFAULT_COLORIZE_FILTER_ALPHA = 80
 
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
