@@ -3,10 +3,14 @@ package eu.kanade.tachiyomi.ui.reader.colorize
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.BlendMode
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.os.Build
 import android.os.SystemClock
 import eu.kanade.translation.ChapterTranslationFile
 import eu.kanade.translation.MangaTranslationContext
@@ -57,6 +61,11 @@ object PageColorizer {
     private const val CHROMA_HEADER_BYTES = 2 * Int.SIZE_BYTES
     private const val MAX_CHROMA_CACHE_BYTES = 256L * 1024 * 1024
     private const val JPEG_QUALITY = 95
+
+    private const val DEFAULT_COLORIZE_FILTER_RED = 255
+    private const val DEFAULT_COLORIZE_FILTER_GREEN = 255
+    private const val DEFAULT_COLORIZE_FILTER_BLUE = 255
+    private const val DEFAULT_COLORIZE_FILTER_ALPHA = 100
 
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -585,7 +594,7 @@ object PageColorizer {
 
     private class ColorizeResult(val bitmap: Bitmap, val encodedBytes: ByteArray)
 
-    /** Step 3: Colorize (and apply saturation if configured) without waiting for translation. */
+    /** Step 3: Colorize (and apply saturation + default colorize overlay filter) without waiting for translation. */
     private suspend fun colorizeOnlyBitmap(
         context: Context,
         sourceBitmap: Bitmap,
@@ -642,6 +651,13 @@ object PageColorizer {
                         if (saturated !== page) page.recycle()
                         page = saturated
                     }
+
+                    val filtered = logStep("3i2.applyColorizeDefaultOverlayFilter(hash=$imageHash)") {
+                        applyColorizeDefaultOverlayFilter(page)
+                    }
+                    if (filtered !== page) page.recycle()
+                    page = filtered
+
                     page
                 }
             }
@@ -695,6 +711,29 @@ object PageColorizer {
             )
         }
         canvas.drawBitmap(bitmap, 0f, 0f, paint)
+        return output
+    }
+
+    private fun applyColorizeDefaultOverlayFilter(bitmap: Bitmap): Bitmap {
+        val output = Bitmap.createBitmap(bitmap.width, bitmap.height, bitmap.config ?: Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+        canvas.drawBitmap(bitmap, 0f, 0f, null)
+
+        val overlayColor = Color.argb(
+            DEFAULT_COLORIZE_FILTER_ALPHA,
+            DEFAULT_COLORIZE_FILTER_RED,
+            DEFAULT_COLORIZE_FILTER_GREEN,
+            DEFAULT_COLORIZE_FILTER_BLUE,
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val paint = Paint().apply {
+                color = overlayColor
+                blendMode = BlendMode.OVERLAY
+            }
+            canvas.drawRect(0f, 0f, output.width.toFloat(), output.height.toFloat(), paint)
+        } else {
+            canvas.drawColor(overlayColor, PorterDuff.Mode.OVERLAY)
+        }
         return output
     }
 
@@ -888,9 +927,10 @@ object PageColorizer {
         sam: Boolean,
     ): String {
         val color = if (intensity < 0f) "n" else (intensity * 100).roundToInt().toString()
+        val overlayStamp = if (intensity < 0f) "" else "_ov$DEFAULT_COLORIZE_FILTER_ALPHA"
         val upscaleStamp = if (upscale) "${upscaleSignature()}_${AiConfig.upscaleMaxOutputPixels / 1_000_000}" else "n"
         val finalPassStamp = "_f${if (AiConfig.upscaleFinalPassEnabled) "1" else "0"}${if (AiConfig.upscaleFinalPassKeepSize) "k" else "g"}${AiConfig.upscaleFinalPassMaxPixels / 1_000_000}"
-        return "${imageHash}_c${color}${if (sam) "s" else ""}_${colorModel.length()}_u${upscaleStamp}_s$shrinkSide${finalPassStamp}_t${(AiConfig.saturation * 100).roundToInt()}"
+        return "${imageHash}_c${color}${overlayStamp}${if (sam) "s" else ""}_${colorModel.length()}_u${upscaleStamp}_s$shrinkSide${finalPassStamp}_t${(AiConfig.saturation * 100).roundToInt()}"
     }
 
     private fun cacheFile(context: Context, name: String): File = File(File(context.cacheDir, PAGE_CACHE_DIR), name)
