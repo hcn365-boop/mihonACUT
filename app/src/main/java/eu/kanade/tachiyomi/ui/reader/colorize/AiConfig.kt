@@ -51,21 +51,21 @@ class TranslationConfig(
 /** All the AI settings at one moment. Never changes after it is made. */
 class AiSnapshot(
     val colorizeEnabled: Boolean = false,
-    val colorizeUseSam: Boolean = false,
+    val colorizeUseSam: Boolean = true,
     /** 0 = no color, 1 = model color, up to 1.2 */
-    val colorizeIntensity: Float = 1f,
+    val colorizeIntensity: Float = 1.2f,
     val colorizeMaxPixels: Long = 12_000_000L,
     val upscaleEnabled: Boolean = false,
     val upscaleRestoreModel: String = "",
-    val upscaleMainModel: String = "Upscale_L",
+    val upscaleMainModel: String = "",
     val upscaleFinalPassEnabled: Boolean = false,
-    val upscaleFinalPassKeepSize: Boolean = true,
+    val upscaleFinalPassKeepSize: Boolean = false,
     val upscaleFinalPassMaxPixels: Long = 4_000_000L,
     val upscaleMaxPixels: Long = 3_000_000L,
     /** Upscaled pages bigger than this are scaled down: the viewer needs a full buffer per page. */
     val upscaleMaxOutputPixels: Long = 12_000_000L,
-    val upscaleNormalizeEnabled: Boolean = false,
-    val upscaleNormalizeSide: Int = 1080,
+    val upscaleNormalizeEnabled: Boolean = true,
+    val upscaleNormalizeSide: Int = 1279,
     /** Estimated memory one page may need while being processed. Bigger pages are left as they are. */
     val memoryBudgetBytes: Long = 1024L * 1024 * 1024,
     /** Disk cache of processed pages. */
@@ -83,7 +83,7 @@ class AiSnapshot(
     val translation: TranslationConfig? = null,
     val translateCollisionPadding: Float = 1.3f,
     /** 1 = colors as they are; more makes the colors of processed pages stronger. */
-    val saturation: Float = 1f,
+    val saturation: Float = 1.3f,
     /** The manga this snapshot is for, when it is not the one in [MangaTranslationContext] (post-download jobs). */
     val mangaTitle: String? = null,
     val mangaSourceLang: String? = null,
